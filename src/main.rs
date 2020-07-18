@@ -573,6 +573,15 @@ impl EmvConnection {
                         "exponent": "03"
                     }
                 }
+            },
+            "A000000004": {
+                "issuer": "MasterCard",
+                "certificates": {
+                    "FA": {
+                        "modulus": "A90FCD55AA2D5D9963E35ED0F440177699832F49C6BAB15CDAE5794BE93F934D4462D5D12762E48C38BA83D8445DEAA74195A301A102B2F114EADA0D180EE5E7A5C73E0C4E11F67A43DDAB5D55683B1474CC0627F44B8D3088A492FFAADAD4F42422D0E7013536C3C49AD3D0FAE96459B0F6B1B6056538A3D6D44640F94467B108867DEC40FAAECD740C00E2B7A8852D",
+                        "exponent": "03"
+                    }
+                }
             }
         }"#;
         let ca_data : HashMap<String, CertificateAuthority> = serde_json::from_str(ca_json_data).unwrap();
