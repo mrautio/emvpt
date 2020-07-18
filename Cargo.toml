@@ -1,7 +1,7 @@
 [package]
-name = "emvtest"
+name = "emvpt"
 version = "0.1.0"
-authors = ["mikar"]
+authors = ["Mika Rautio"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -22,3 +22,4 @@ rand = "0.7.3"
 # NOTE: mingw pre built binaries here: https://bintray.com/vszakats/generic/openssl
 openssl-sys = "0.9.58"
 openssl = "0.10.30"
+chrono = "0.4.13"
