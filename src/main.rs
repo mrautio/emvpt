@@ -233,7 +233,11 @@ impl EmvConnection {
                 "9F26": { "tag":"9F26", "name":"Application Cryptogram (AC)" },
                 "9F10": { "tag":"9F10", "name":"Issuer Application Data (IAD)" },
                 "82":   { "tag":"82", "name":"Application Interchange Profile (AIP)" },
-                "94":   { "tag":"94", "name":"Application File Locator (AFL)" }                
+                "94":   { "tag":"94", "name":"Application File Locator (AFL)" },
+                "9F35": { "tag":"9F35", "name":"Terminal Type" },
+                "9F45": { "tag":"9F45", "name":"Data Authentication Code" },
+                "9F4C": { "tag":"9F4C", "name":"ICC Dynamic Number" },
+                "9F34": { "tag":"9F34", "name":"Cardholder Verification Method (CVM) Results" }
             }"#;
 
         let emv_tags : HashMap<String, EmvTag> = serde_json::from_str(emv_definition_data).unwrap();
@@ -283,30 +287,6 @@ impl EmvConnection {
             return Err(());
         }
 
-        let tag_82_aip = self.get_tag_value("82").unwrap();
-
-        let aip_b1 : u8 = tag_82_aip[0];
-        // bit 0 = RFU
-        if get_bit!(aip_b1, 1) {
-            info!("SDA supported");
-        }
-        if get_bit!(aip_b1, 2) {
-            info!("DDA supported");
-        }
-        if get_bit!(aip_b1, 3) {
-            info!("Cardholder verification is supported");
-        }
-        if get_bit!(aip_b1, 4) {
-            info!("Terminal risk management is to be performed");
-        }
-        if get_bit!(aip_b1, 5) {
-            info!("Issuer authentication is supported");
-        }
-        // bit 6 = RFU
-        if get_bit!(aip_b1, 7) {
-            info!("CDA supported");
-        }
-
         let tag_94_afl = self.get_tag_value("94").unwrap().clone();
 
         info!("Read card AFL information:");
@@ -330,21 +310,152 @@ impl EmvConnection {
                     if data_authentication_records > 0 {
                         data_authentication_records -= 1;
 
-                        let data_authentication_data;
                         if short_file_identifier <= 10 {
-                            data_authentication_data = &data[3..];
+                            if let Value::Constructed(tag_70_tags) = parse_tlv(&data[..]).value() {
+                                for tag in tag_70_tags {
+                                    data_authentication.extend(tag.to_vec());
+                                }
+                            }
                         } else {
-                            data_authentication_data = &data[..];
+                            data_authentication.extend_from_slice(&data[..]);
                         }
-                        data_authentication.extend_from_slice(&data_authentication_data);
-
-                        trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication_data);
+                        
+                        trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication);
                     }
                 }
             }
         }
 
         debug!("AFL data authentication:\n{}", HexViewBuilder::new(&data_authentication).finish());
+
+        let tag_82_aip = self.get_tag_value("82").unwrap();
+
+        let auc_b1 : u8 = tag_82_aip[0];
+        // bit 7 = RFU
+        if get_bit!(auc_b1, 6) {
+            info!("SDA supported");
+        }
+        if get_bit!(auc_b1, 5) {
+            info!("DDA supported");
+        }
+        if get_bit!(auc_b1, 4) {
+            info!("Cardholder verification is supported");
+
+// 2020-07-18T22:09:33.408059800+03:00 DEBUG emvpt -  -8E: Cardholder Verification Method (CVM) List
+// 2020-07-18T22:09:33.409053800+03:00 DEBUG emvpt -  -data: [00, 00, 00, 00, 00, 00, 00, 00, 42, 01, 44, 03, 41, 03, 5E, 03, 42, 03, 1F, 03] = ........B.D.A.^.B...
+
+            let tag_8e_cvm_list = self.get_tag_value("8E").unwrap();
+            let amount1 = &tag_8e_cvm_list[0..4];
+            let amount2 = &tag_8e_cvm_list[4..8];
+
+            let tag_84_cvm_rules = &tag_8e_cvm_list[8..];
+            assert_eq!(tag_84_cvm_rules.len() % 2, 0);
+            for i in (0..tag_84_cvm_rules.len()).step_by(2) {
+                let cvm_rule = &tag_84_cvm_rules[i..i+2];
+                let cvm_code = cvm_rule[0];
+                let cvm_condition_code = cvm_rule[1];
+
+                info!("CVM rule: {}", i / 2);
+                // bit 7 = RFU
+                if get_bit!(cvm_code, 6) {
+                    info!("Apply succeeding CV Rule if this CVM is unsuccessful");
+                } else {
+                    info!("Fail cardholder verification if this CVM is unsuccessful");
+                }
+
+                let cvm_code = (cvm_code << 2) >> 2;
+                if cvm_code == 0b0000_0000 {
+                    info!("Fail CVM processing");
+                } else if cvm_code == 0b0000_0001 {
+                    info!("Plaintext PIN verification performed by ICC");
+                } else if cvm_code == 0b0000_0010 {
+                    info!("Enciphered PIN verified online");
+                } else if cvm_code == 0b0000_0011 {
+                    info!("Plaintext PIN verification performed by ICC and signature (paper)");
+                } else if cvm_code == 0b0000_0100 {
+                    info!("Enciphered PIN verification performed by ICC");
+                } else if cvm_code == 0b0000_0101 {
+                    info!("Enciphered PIN verification performed by ICC and signature (paper)");
+                } else if cvm_code == 0b0001_1110 {
+                    info!("Signature (paper)");
+                } else if cvm_code == 0b0001_1111 {
+                    info!("No CVM required");
+                } else {
+                    warn!("Unknown CVM code! {:b}", cvm_code);
+                }
+
+                if cvm_condition_code == 0x00 {
+                    info!("Always");
+                } else if cvm_condition_code == 0x01 {
+                    info!("If unattended cash");
+                } else if cvm_condition_code == 0x02 {
+                    info!("If not unattended cash and not manual cash and not purchase with cashback");
+                } else if cvm_condition_code == 0x03 {
+                    info!("If terminal supports the CVM");
+                } else if cvm_condition_code == 0x04 {
+                    info!("If manual cash");
+                } else if cvm_condition_code == 0x05 {
+                    info!("If purchase with cashback");
+                } else if cvm_condition_code == 0x06 {
+                    info!("If transaction is in the application currency and is under {:02X?} value", amount1);
+                } else if cvm_condition_code == 0x07 {
+                    info!("If transaction is in the application currency and is over {:02X?} value", amount1);
+                } else if cvm_condition_code == 0x08 {
+                    info!("If transaction is in the application currency and is under {:02X?} value", amount2);
+                } else if cvm_condition_code == 0x09 {
+                    info!("If transaction is in the application currency and is over {:02X?} value", amount2);
+                } else {
+                    warn!("Unknown CVM condition code! {:02X?}", cvm_condition_code);
+                }
+
+            }
+        }
+        if get_bit!(auc_b1, 3) {
+            info!("Terminal risk management is to be performed");
+        }
+        if get_bit!(auc_b1, 2) {
+            // Issuer Authentication using the EXTERNAL AUTHENTICATE command is supported
+            info!("Issuer authentication is supported");
+        }
+        // bit 1 = RFU
+        if get_bit!(auc_b1, 0) {
+            info!("CDA supported");
+        }
+
+        let tag_9f07_application_usage_control = self.get_tag_value("9F07").unwrap();
+        let auc_b1 : u8 = tag_9f07_application_usage_control[0];
+        let auc_b2 : u8 = tag_9f07_application_usage_control[1];
+        if get_bit!(auc_b1, 7) {
+            info!("Valid for domestic cash transactions");
+        }
+        if get_bit!(auc_b1, 6) {
+            info!("Valid for international cash transactions");
+        }
+        if get_bit!(auc_b1, 5) {
+            info!("Valid for domestic goods");
+        }
+        if get_bit!(auc_b1, 4) {
+            info!("Valid for international goods");
+        }
+        if get_bit!(auc_b1, 3) {
+            info!("Valid for domestic services");
+        }
+        if get_bit!(auc_b1, 2) {
+            info!("Valid for international services");
+        }
+        if get_bit!(auc_b1, 1) {
+            info!("Valid at ATMs");
+        }
+        if get_bit!(auc_b1, 0) {
+            info!("Valid at terminals other than ATMs");
+        }
+        if get_bit!(auc_b2, 7) {
+            info!("Domestic cashback allowed");
+        }
+        if get_bit!(auc_b2, 6) {
+            info!("International cashback allowed");
+        }
+        // 5 - 0 bits are RFU
 
         Ok(data_authentication)
     }
@@ -377,33 +488,29 @@ impl EmvConnection {
     fn handle_generate_ac(&mut self) -> Result<(), ()> {
         debug!("Generate Application Cryptogram (GENERATE AC):");
 
-        // TODO: handle CDOL1 dynamically
-        // -8C: Card Risk Management Data Object List 1 (CDOL1)
-        // -data: [9F02, 06, 9F03, 06, 9F1A, 02, 95, 05, 5F2A, 02, 9A, 03, 9C, 01, 9F37, 04] = ..........._*......7.
-
-        let tag_9f02_amount_authorised           = b"\x00\x00\x00\x00\x00\x01";
-        let tag_9f03_amount_other                = b"\x00\x00\x00\x00\x00\x00";
+        self.add_tag("95", b"\x00\x00\x00\x00\x00".to_vec());
+        self.add_tag("9F02", b"\x00\x00\x00\x00\x00\x01".to_vec());
+        self.add_tag("9F03", b"\x00\x00\x00\x00\x00\x00".to_vec());
         // https://www.iso.org/obp/ui/#iso:code:3166:FI
-        let tag_9f1a_terminal_country_code       = b"\x02\x46"; // FI
-        let tag_95_terminal_verification_results = b"\x00\x00\x00\x00\x00";
+        self.add_tag("9F1A", b"\x02\x46".to_vec()); // FI
         // https://www.currency-iso.org/dam/downloads/lists/list_one.xml
-        let tag_5f2a_transaction_currency_code   = b"\x09\x78"; // EUR
-        // YYMMDD
-        let tag_9a_transaction_date              = b"\x20\x07\x15";
+        self.add_tag("5F2A", b"\x09\x78".to_vec()); // EUR
+        self.add_tag("9A", b"\x20\x07\x15".to_vec()); // YYMMDD
         // http://www.fintrnmsgtool.com/iso-processing-code.html
-        let tag_9c_transaction_type              = b"\x21"; // Deposit (Credit)
-        let tag_9f37_unpredictable_number        = b"\x00\x00\x00\x00";
+        self.add_tag("9C", b"\x21".to_vec()); // Deposit (Credit)
+        self.add_tag("9F37", b"\x00\x00\x00\x00".to_vec());
+        self.add_tag("9F35", b"\x23".to_vec()); // "Offline only", ref. EMV Book 4, A1 Terminal Type
+        // "An issuer assigned value that is retained by the terminal during the verification process of the Signed Static Application Data"
+        // found on one card that does not support SDA... i.e. card requires value but does not provide it
+        self.add_tag("9F45", b"\x00\x00".to_vec());
+        // EMV Book 4, A4 CVM Results
+        //b1: CVM code
+        //b2: CVM condition code
+        //b3: unknown/failed/success
+        self.add_tag("9F34", b"\x41\x03\x02".to_vec()); // "unencrypted PIN successful"
 
-        let mut cdol_data = Vec::new();
-        cdol_data.extend_from_slice(&tag_9f02_amount_authorised[..]);
-        cdol_data.extend_from_slice(&tag_9f03_amount_other[..]);
-        cdol_data.extend_from_slice(&tag_9f1a_terminal_country_code[..]);
-        cdol_data.extend_from_slice(&tag_95_terminal_verification_results[..]);
-        cdol_data.extend_from_slice(&tag_5f2a_transaction_currency_code[..]);
-        cdol_data.extend_from_slice(&tag_9a_transaction_date[..]);
-        cdol_data.extend_from_slice(&tag_9c_transaction_type[..]);
-        cdol_data.extend_from_slice(&tag_9f37_unpredictable_number[..]);
 
+        let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
 
         let p1_tc_proceed_offline = 0b0100_0000;
@@ -418,6 +525,7 @@ impl EmvConnection {
 
         let (response_trailer, response_data) = self.send_apdu(&generate_ac_command);
         if !is_success_response(&response_trailer) {
+            // 67 00 = wrong length (i.e. CDOL data incorrect)
             warn!("Could not process generate ac");
             return Err(());
         }
@@ -684,18 +792,19 @@ impl EmvConnection {
 
         let mut checksum_data : Vec<u8> = Vec::new();
         checksum_data.extend_from_slice(&icc_certificate[1..checksum_position]);
+
+        let tag_9f48_icc_pk_remainder = self.get_tag_value("9F48");
+        if let Some(tag_9f48_icc_pk_remainder) = tag_9f48_icc_pk_remainder {
+            checksum_data.extend_from_slice(&tag_9f48_icc_pk_remainder[..]);
+        }
+
         checksum_data.extend_from_slice(&tag_9f47_icc_pk_exponent[..]);
-        // NOT PRESENT: 9f48: Integrated Circuit Card (ICC) Public Key Remainder
-        // checksum_data.extend_from_slice( 9f48 if exists ) TODO
 
         checksum_data.extend_from_slice(data_authentication);
 
-        let tag_9f4a_static_data_authentication_tag_list = self.get_tag_value("9F4A").unwrap();
-        // TODO: handle list
-        assert_eq!(tag_9f4a_static_data_authentication_tag_list[0], 0x82);
+        let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&self.get_tag_value("9F4A").unwrap()[..]).unwrap();
 
-        let tag_82_aip = self.get_tag_value("82").unwrap();
-        checksum_data.extend_from_slice(&tag_82_aip[..]);
+        checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
 
@@ -723,8 +832,9 @@ impl EmvConnection {
 
         icc_pk_modulus.extend_from_slice(&icc_certificate_pk_leftmost_digits[..icc_certificate_pk_leftmost_digits_length]);
 
-        // NOT PRESENT: 9f48: Integrated Circuit Card (ICC) Public Key Remainder
-        // icc_pk_modulus.extend_from_slice( 9f48 if exists ) TODO
+        if let Some(tag_9f48_icc_pk_remainder) = tag_9f48_icc_pk_remainder {
+            icc_pk_modulus.extend_from_slice(&tag_9f48_icc_pk_remainder[..]);
+        }
 
         trace!("ICC PK modulus ({} bytes):\n{}", icc_pk_modulus.len(), HexViewBuilder::new(&icc_pk_modulus[..]).finish());
 
@@ -734,15 +844,22 @@ impl EmvConnection {
     fn handle_dynamic_data_authentication(&mut self, icc_pk_modulus : &[u8], icc_pk_exponent : &[u8]) -> Result<(),()> {
         debug!("Perform Dynamic Data Authentication (DDA):");
 
-        let tag_9f49_ddol = self.get_tag_value("9F49").unwrap();
-        // TODO parse DDOL - if DDOL does not exist then fall-back for 9F37 ddol
-
         let mut rng = ChaCha20Rng::from_entropy();
         let mut tag_9f37_unpredictable_number = [0u8; 4];
         rng.try_fill(&mut tag_9f37_unpredictable_number[..]).unwrap();
+        self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
+
+        let ddol_default_value = b"\x9f\x37\x04".to_vec();
+        let tag_9f49_ddol = match self.get_tag_value("9F49") {
+            Some(ddol) => ddol,
+            // fall-back to a default DDOL
+            None => &ddol_default_value
+        };
+
+        let ddol_data = self.get_tag_list_tag_values(&tag_9f49_ddol[..]).unwrap();
 
         let mut auth_data : Vec<u8> = Vec::new();
-        auth_data.extend_from_slice(&tag_9f37_unpredictable_number[..]);
+        auth_data.extend_from_slice(&ddol_data[..]);
 
         let apdu_command_internal_authenticate = b"\x00\x88\x00\x00";
         let mut internal_authenticate_command = apdu_command_internal_authenticate.to_vec();
@@ -769,10 +886,17 @@ impl EmvConnection {
         let icc_pk = RsaPublicKey::new(icc_pk_modulus, icc_pk_exponent);
         let tag_9f4b_signed_data_decrypted = icc_pk.public_decrypt(&tag_9f4b_signed_data[..]).unwrap();
         let tag_9f4b_signed_data_decrypted_length = tag_9f4b_signed_data_decrypted.len();
-        assert_eq!(tag_9f4b_signed_data_decrypted[1], 0x05);
+        if tag_9f4b_signed_data_decrypted[1] != 0x05 {
+            warn!("Unrecognized format");
+            return Err(());
+        }
 
         let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
-        let tag_9f4b_signed_data_decrypted_data_length = tag_9f4b_signed_data_decrypted[3];
+        let tag_9f4b_signed_data_decrypted_dynamic_data_length = tag_9f4b_signed_data_decrypted[3] as usize;
+        
+        let tag_9f4b_signed_data_decrypted_dynamic_data = &tag_9f4b_signed_data_decrypted[4..4+tag_9f4b_signed_data_decrypted_dynamic_data_length];
+        let tag_9f4c_icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[1..];
+        self.add_tag("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
 
         let checksum_position = tag_9f4b_signed_data_decrypted_length - 21;
         let mut checksum_data : Vec<u8> = Vec::new();
@@ -786,6 +910,74 @@ impl EmvConnection {
         assert_eq!(signed_data_checksum, tag_9f4b_signed_data_decrypted_checksum);
 
         Ok(())
+    }
+
+    // EMV has some tags that don't conform to ISO/IEC 7816
+    fn is_non_conforming_one_byte_tag(&self, tag : u8) -> bool {
+        if tag == 0x95 {
+            return true;
+        }
+
+        false
+    }
+
+    fn get_tag_list_tag_values(&self, tag_list : &[u8]) -> Result<Vec<u8>, ()> {
+        let mut output : Vec<u8> = Vec::new();
+
+        if tag_list.len() < 2 {
+            let tag_name = hex::encode(&tag_list[0..1]).to_uppercase();
+            let value = match self.get_tag_value(&tag_name) {
+                Some(value) => value,
+                None => {
+                    warn!("tag {:?} has no value", tag_name);
+                    return Err(());
+                }
+            };
+
+            output.extend_from_slice(&value[..]);
+        } else {
+            let mut i = 0;
+            loop {
+                let mut tag_value_length : usize = 0;
+
+                let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
+
+                if Tag::try_from(tag_name.as_str()).is_ok() || self.is_non_conforming_one_byte_tag(tag_list[i]) {
+                    tag_value_length = tag_list[i+1] as usize;
+                    i += 2;
+                } else {
+                    tag_name = hex::encode(&tag_list[i..i+2]).to_uppercase();
+                    if Tag::try_from(tag_name.as_str()).is_ok() {
+                        tag_value_length = tag_list[i+2] as usize;
+                        i += 3;
+                    } else {
+                        warn!("Incorrect tag {:?}", tag_name);
+                        return Err(());
+                    }
+                }
+
+                let value = match self.get_tag_value(&tag_name) {
+                    Some(value) => value,
+                    None => {
+                        warn!("tag {:?} has no value", tag_name);
+                        return Err(());
+                    }
+                };
+
+                if value.len() != tag_value_length {
+                    warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", tag_name, value.len(), tag_value_length);
+                    return Err(());
+                }
+
+                output.extend_from_slice(&value[..]);
+
+                if i >= tag_list.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(output)
     }
 }
 
