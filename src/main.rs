@@ -4,6 +4,8 @@ use iso7816_tlv::ber::{Tlv, Tag, Value};
 use std::collections::HashMap;
 use std::str;
 use std::convert::TryFrom;
+use std::io::{self};
+use std::{thread, time};
 use serde::{Deserialize, Serialize};
 use log::LevelFilter;
 use log::{error, info, warn, debug, trace};
@@ -17,7 +19,7 @@ use openssl::rsa::{Rsa, Padding};
 use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Datelike, Utc};
 
 macro_rules! get_bit {
     ($byte:expr, $bit:expr) => (if $byte & (1 << $bit) != 0 { true } else { false });
@@ -25,57 +27,77 @@ macro_rules! get_bit {
 
 struct EmvConnection {
     tags : HashMap<String, Vec<u8>>,
-    ctx : Context,
-    card : Card
+    ctx : Option<Context>,
+    card : Option<Card>
+}
+
+enum ReaderError {
+    ReaderConnectionFailed(String),
+    ReaderNotFound,
+    CardConnectionFailed(String),
+    CardNotFound
 }
 
 impl EmvConnection {
     fn new() -> Result<EmvConnection, String> {
+        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None } )
+    }
 
-        let ctx = match Context::establish(Scope::User) {
-            Ok(ctx) => ctx,
+    fn connect_to_card(&mut self) -> Result<(), ReaderError> {
+        if !self.ctx.is_some() {
+            self.ctx = match Context::establish(Scope::User) {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    return Err(ReaderError::ReaderConnectionFailed(format!("Failed to establish context: {}", err)));
+                }
+            };
+        }
+
+        let ctx = self.ctx.as_ref().unwrap();
+        let readers_size = match ctx.list_readers_len() {
+            Ok(readers_size) => readers_size,
             Err(err) => {
-                return Err(format!("Failed to establish context: {}", err));
+                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
             }
         };
 
-        const MAX_READER_SIZE : usize = 2048;
-        let mut readers_buf = [0; MAX_READER_SIZE];
+        let mut readers_buf = vec![0; readers_size];
         let mut readers = match ctx.list_readers(&mut readers_buf) {
             Ok(readers) => readers,
             Err(err) => {
-                return Err(format!("Failed to list readers: {}", err));
+                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
             }
         };
 
         let reader = match readers.next() {
             Some(reader) => reader,
             None => {
-                return Err(format!("No readers are connected."));
+                return Err(ReaderError::ReaderNotFound);
             }
         };
 
         // Connect to the card.
-        let card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
-            Ok(card) => card,
+        self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
+            Ok(card) => Some(card),
             Err(Error::NoSmartcard) => {
-                return Err(format!("No card found in the reader"));
+                return Err(ReaderError::CardNotFound);
             },
             Err(err) => {
-                return Err(format!("Could not connect to the card: {}", err));
+                return Err(ReaderError::CardConnectionFailed(format!("Could not connect to the card: {}", err)));
             }
         };
 
-        let mut names_buffer = [0; MAX_READER_SIZE];
+        const MAX_NAME_SIZE : usize = 2048;
+        let mut names_buffer = [0; MAX_NAME_SIZE];
         let mut atr_buffer = [0; MAX_ATR_SIZE];
-        let card_status = card.status2(&mut names_buffer, &mut atr_buffer).unwrap();
+        let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
 
         // https://www.eftlab.com/knowledge-base/171-atr-list-full/
-        info!("Card reader: {:?}", reader);
-        info!("Card ATR:\n{}", HexViewBuilder::new(card_status.atr()).finish());
-        info!("Card protocol: {:?}", card_status.protocol2().unwrap());
+        debug!("Card reader: {:?}", reader);
+        debug!("Card ATR:\n{}", HexViewBuilder::new(card_status.atr()).finish());
+        debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
 
-        Ok ( EmvConnection { tags : HashMap::new(), ctx : ctx, card : card } )
+        Ok(())
     }
 
     fn get_tag_value(&self, tag_name : &str) -> Option<&Vec<u8>> {
@@ -118,7 +140,7 @@ impl EmvConnection {
         loop {
             // Send an APDU command.
             debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
-            let apdu_response = self.card.transmit(apdu_command, &mut apdu_response_buffer).unwrap();
+            let apdu_response = self.card.as_ref().unwrap().transmit(apdu_command, &mut apdu_response_buffer).unwrap();
 
             response_data.extend_from_slice(&apdu_response[0..apdu_response.len()-2]);
 
@@ -128,6 +150,8 @@ impl EmvConnection {
 
             // Automatically query more data, if available from the ICC
             const SW1_BYTES_AVAILABLE : u8 = 0x61;
+            const SW1_WRONG_LENGTH : u8    = 0x6C;
+
             if response_trailer[0] == SW1_BYTES_AVAILABLE {
                 trace!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
 
@@ -142,6 +166,17 @@ impl EmvConnection {
                 let apdu_command_get_response = b"\x00\xC0\x00\x00";
                 new_apdu_command = apdu_command_get_response.to_vec();
                 new_apdu_command.push(available_data_length);
+
+                apdu_command = &new_apdu_command[..];
+            } else if response_trailer[0] == SW1_WRONG_LENGTH {
+                trace!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
+
+                let available_data_length = response_trailer[1];
+                assert!(available_data_length > 0x00);
+
+                new_apdu_command = apdu.to_vec();
+                let new_apdu_command_length = new_apdu_command.len();
+                new_apdu_command[new_apdu_command_length - 1] = available_data_length;
 
                 apdu_command = &new_apdu_command[..];
             } else {
@@ -237,12 +272,23 @@ impl EmvConnection {
                 "9F35": { "tag":"9F35", "name":"Terminal Type" },
                 "9F45": { "tag":"9F45", "name":"Data Authentication Code" },
                 "9F4C": { "tag":"9F4C", "name":"ICC Dynamic Number" },
-                "9F34": { "tag":"9F34", "name":"Cardholder Verification Method (CVM) Results" }
+                "9F34": { "tag":"9F34", "name":"Cardholder Verification Method (CVM) Results" },
+                "9F11": { "tag":"9F11", "name":"Issuer Code Table Index" },
+                "9F12": { "tag":"9F12", "name":"Application Preferred Name" },
+                "77":   { "tag":"77", "name":"Response Message Template Format 2" },
+                "73":   { "tag":"73", "name":"Directory Discretionary Template" },
+                "9F2E": { "tag":"9F2E", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Exponent" },
+                "9F2F": { "tag":"9F2F", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Remainder" },
+                "9F2D": { "tag":"9F2D", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate" }
             }"#;
 
         let emv_tags : HashMap<String, EmvTag> = serde_json::from_str(emv_definition_data).unwrap();
 
         let tlv_data = parse_tlv(&buf);
+        if !tlv_data.is_some() {
+            return;
+        }
+        let tlv_data = tlv_data.unwrap();
 
         let tag_name = hex::encode(tlv_data.tag().to_bytes()).to_uppercase();
 
@@ -311,7 +357,7 @@ impl EmvConnection {
                         data_authentication_records -= 1;
 
                         if short_file_identifier <= 10 {
-                            if let Value::Constructed(tag_70_tags) = parse_tlv(&data[..]).value() {
+                            if let Value::Constructed(tag_70_tags) = parse_tlv(&data[..]).unwrap().value() {
                                 for tag in tag_70_tags {
                                     data_authentication.extend(tag.to_vec());
                                 }
@@ -460,10 +506,10 @@ impl EmvConnection {
         Ok(data_authentication)
     }
 
-    fn handle_verify(&mut self, ascii_pin : &[u8]) -> Result<(), ()> {
-        debug!("Verify PIN:");
+    fn handle_verify_plaintext_pin(&mut self, ascii_pin : &[u8]) -> Result<(), ()> {
+        debug!("Verify plaintext PIN:");
 
-        let pin_bcd_nc = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
+        let pin_bcd_cn = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
 
         let apdu_command_verify = b"\x00\x20\x00";
         let mut verify_command = apdu_command_verify.to_vec();
@@ -471,10 +517,56 @@ impl EmvConnection {
         verify_command.push(p2_pin_type_qualifier);
         verify_command.push(0x08); // data length
         verify_command.push(0b0010_0000 + ascii_pin.len() as u8); // control + PIN length
-        verify_command.extend_from_slice(&pin_bcd_nc[..]);
+        verify_command.extend_from_slice(&pin_bcd_cn[..]);
         verify_command.push(0xFF); // filler
 
-        let (response_trailer, response_data) = self.send_apdu(&verify_command);
+        let (response_trailer, _) = self.send_apdu(&verify_command);
+        if !is_success_response(&response_trailer) {
+            warn!("Could not verify PIN");
+            //Incorrect PIN = 63, C4
+            return Err(());
+        }
+
+        info!("Pin OK");
+        Ok(())
+    }
+
+    fn handle_verify_enciphered_pin(&mut self, ascii_pin : &[u8], icc_pin_pk_modulus : &[u8], icc_pin_pk_exponent : &[u8]) -> Result<(), ()> {
+        debug!("Verify enciphered PIN:");
+
+        let pin_bcd_cn = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
+
+        let mut rng = ChaCha20Rng::from_entropy();
+        const PK_MAX_SIZE : usize = 248; // ref. EMV Book 2, B2.1 RSA Algorithm
+        let mut random_padding = [0u8; PK_MAX_SIZE];
+        rng.try_fill(&mut random_padding[..]).unwrap();
+
+        let icc_unpredictable_number = self.handle_get_challenge().unwrap();
+
+        // EMV Book 2, 7.1 Keys and Certificates, 7.2 PIN Encipherment and Verification
+
+        let mut plaintext_data = Vec::new();
+        plaintext_data.push(0x7F);
+        // PIN block
+        plaintext_data.push(0b0010_0000 + ascii_pin.len() as u8); // control + PIN length
+        plaintext_data.extend_from_slice(&pin_bcd_cn[..]);
+        plaintext_data.push(0xFF);
+        // ICC Unpredictable Number
+        plaintext_data.extend_from_slice(&icc_unpredictable_number[..]);
+        // Random pagging Nic - 17 (FIXME)
+        plaintext_data.extend_from_slice(&random_padding[0..icc_pin_pk_modulus.len()-17]);
+
+        let icc_pin_pk = RsaPublicKey::new(icc_pin_pk_modulus, icc_pin_pk_exponent);
+        let ciphered_pin_data = icc_pin_pk.public_encrypt(&plaintext_data[..]).unwrap();
+
+        let apdu_command_verify = b"\x00\x20\x00";
+        let mut verify_command = apdu_command_verify.to_vec();
+        let p2_pin_type_qualifier = 0b1000_1000;
+        verify_command.push(p2_pin_type_qualifier);
+        verify_command.push(ciphered_pin_data.len() as u8);
+        verify_command.extend_from_slice(&ciphered_pin_data[..]);
+
+        let (response_trailer, _) = self.send_apdu(&verify_command);
         if !is_success_response(&response_trailer) {
             warn!("Could not verify PIN");
             //Incorrect PIN = 63, C4
@@ -489,17 +581,23 @@ impl EmvConnection {
         debug!("Generate Application Cryptogram (GENERATE AC):");
 
         self.add_tag("95", b"\x00\x00\x00\x00\x00".to_vec());
-        self.add_tag("9F02", b"\x00\x00\x00\x00\x00\x01".to_vec());
-        self.add_tag("9F03", b"\x00\x00\x00\x00\x00\x00".to_vec());
+        let amount2 = 0;
+        self.add_tag("9F03", ascii_to_bcd_n(amount2.to_string().as_bytes(), 6).unwrap());
         // https://www.iso.org/obp/ui/#iso:code:3166:FI
-        self.add_tag("9F1A", b"\x02\x46".to_vec()); // FI
+        let terminal_country = 246;
+        self.add_tag("9F1A", ascii_to_bcd_n(terminal_country.to_string().as_bytes(), 2).unwrap()); // FI
         // https://www.currency-iso.org/dam/downloads/lists/list_one.xml
-        self.add_tag("5F2A", b"\x09\x78".to_vec()); // EUR
-        self.add_tag("9A", b"\x20\x07\x15".to_vec()); // YYMMDD
+        let currency = 978;
+        self.add_tag("5F2A", ascii_to_bcd_n(currency.to_string().as_bytes(), 2).unwrap()); // EUR
+
+        let today = Utc::today().naive_utc();
+        let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
+        self.add_tag("9A", ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+
         // http://www.fintrnmsgtool.com/iso-processing-code.html
         self.add_tag("9C", b"\x21".to_vec()); // Deposit (Credit)
-        self.add_tag("9F37", b"\x00\x00\x00\x00".to_vec());
-        self.add_tag("9F35", b"\x23".to_vec()); // "Offline only", ref. EMV Book 4, A1 Terminal Type
+        let terminal_type = 23;
+        self.add_tag("9F35", ascii_to_bcd_n(terminal_type.to_string().as_bytes(), 1).unwrap()); // "Offline only", ref. EMV Book 4, A1 Terminal Type
         // "An issuer assigned value that is retained by the terminal during the verification process of the Signed Static Application Data"
         // found on one card that does not support SDA... i.e. card requires value but does not provide it
         self.add_tag("9F45", b"\x00\x00".to_vec());
@@ -559,23 +657,12 @@ impl EmvConnection {
         read_record.push(record_index);
         read_record.push((short_file_identifier << 3) | 0x04);
 
-        let mut record_length = 0x00;
-        read_record.push(record_length);
-
-        let read_record_length = read_record.len();
+        const RECORD_LENGTH_DEFAULT : u8 = 0x00;
+        read_record.push(RECORD_LENGTH_DEFAULT);
 
         let (response_trailer, response_data) = self.send_apdu(&read_record);
 
-        const SW1_WRONG_LENGTH : u8 = 0x6C;
-        if response_trailer[0] == SW1_WRONG_LENGTH {
-            record_length = response_trailer[1];
-            read_record[read_record_length - 1] = record_length;
-            let (response_trailer, response_data) = self.send_apdu(&read_record);
-
-            if is_success_response(&response_trailer) {
-                records.extend_from_slice(&response_data);
-            }
-        } else if is_success_response(&response_trailer) {
+        if is_success_response(&response_trailer) {
             records.extend_from_slice(&response_data);
         }
 
@@ -588,11 +675,11 @@ impl EmvConnection {
 
     fn handle_select_payment_system_environment(&mut self) -> Result<Vec<EmvApplication>, ()> {
         debug!("Selecting Payment System Environment (PSE):");
-        let contact_pse_name      = "1PAY.SYS.DDF01";
+        let contact_pse_name = "1PAY.SYS.DDF01";
 
         let pse_name = contact_pse_name;
 
-        let (response_trailer, response_data) = self.send_apdu_select(&pse_name.as_bytes());
+        let (response_trailer, _) = self.send_apdu_select(&pse_name.as_bytes());
         if !is_success_response(&response_trailer) {
             warn!("Could not select {:?}", pse_name);
             return Err(());
@@ -614,7 +701,7 @@ impl EmvConnection {
                         return Err(());
                     }
 
-                    if let Value::Constructed(application_templates) = parse_tlv(&data).value() {
+                    if let Value::Constructed(application_templates) = parse_tlv(&data).unwrap().value() {
                         for tag_61_application_template in application_templates {
                             if let Value::Constructed(application_template) = tag_61_application_template.value() {
                                 self.tags.clear();
@@ -657,7 +744,7 @@ impl EmvConnection {
     }
 
     fn handle_select_payment_application(&mut self, application : &EmvApplication) -> Result<(), ()> {
-        info!("Selecting application. AID:{:02X?}, label:{:?}", application.aid, str::from_utf8(&application.label).unwrap());
+        info!("Selecting application. AID:{:02X?}, label:{:?}, priority:{:02X?}", application.aid, str::from_utf8(&application.label).unwrap(), application.priority);
         let (response_trailer, _) = self.send_apdu_select(&application.aid);
         if !is_success_response(&response_trailer) {
             warn!("Could not select payment application! {:02X?}, {:?}", application.aid, application.label);
@@ -665,6 +752,50 @@ impl EmvConnection {
         }
 
         Ok(())
+    }
+
+    fn handle_get_data(&mut self, tag : &[u8]) -> Result<Vec<u8>, ()> {
+        debug!("GET DATA:");
+
+        assert_eq!(tag.len(), 2);
+        assert_eq!(tag[0], 0x9F);
+        //allowed tags: 9F36, 9F13, 9F17 or 9F4F
+
+        let apdu_command_get_data = b"\x80\xCA";
+
+        let mut get_data_command = apdu_command_get_data.to_vec();
+        get_data_command.extend_from_slice(tag);
+        get_data_command.push(0x05);
+
+        let (response_trailer, response_data) = self.send_apdu(&get_data_command[..]);
+        if !is_success_response(&response_trailer) {
+            // 67 00 = wrong length (i.e. CDOL data incorrect)
+            warn!("Could not process get data");
+            return Err(());
+        }
+
+        let mut output : Vec<u8> = Vec::new();
+        output.extend_from_slice(&response_data);
+
+        Ok(output)
+    }
+
+    fn handle_get_challenge(&mut self) -> Result<Vec<u8>, ()> {
+        debug!("GET CHALLENGE:");
+
+        let apdu_command_get_challenge = b"\x00\x84\x00\x00\x00";
+
+        let (response_trailer, response_data) = self.send_apdu(&apdu_command_get_challenge[..]);
+        if !is_success_response(&response_trailer) {
+            // 67 00 = wrong length (i.e. CDOL data incorrect)
+            warn!("Could not process get challenge");
+            return Err(());
+        }
+
+        let mut output : Vec<u8> = Vec::new();
+        output.extend_from_slice(&response_data);
+
+        Ok(output)
     }
 
     fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
@@ -749,8 +880,7 @@ impl EmvConnection {
         let ascii_iin = bcd_to_ascii(&issuer_certificate_iin).unwrap();
         assert_eq!(ascii_iin, &ascii_pan[0..ascii_iin.len()]);
 
-        debug!("Issuer cert expiry (MMYY): {:?}", str::from_utf8(&bcd_to_ascii(&issuer_certificate_expiry).unwrap()).unwrap());
-        // TODO: validate expiry
+        is_certificate_expired(&issuer_certificate_expiry[..]);
 
         let mut issuer_pk_modulus : Vec<u8> = Vec::new();
         issuer_pk_modulus.extend_from_slice(issuer_pk_leftmost_digits);
@@ -760,11 +890,12 @@ impl EmvConnection {
         Ok((issuer_pk_modulus, tag_9f32_issuer_pk_exponent.to_vec()))
     }
 
-    fn get_icc_public_key(&self, issuer_pk_modulus : &[u8], issuer_pk_exponent : &[u8], data_authentication : &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
-        // ICC public key retrieval: EMV Book 2, 6.4 Retrieval of ICC Public Key
-        debug!("Retrieving ICC public key");
 
-        let tag_9f46_icc_pk_certificate = self.get_tag_value("9F46").unwrap();
+    fn get_icc_public_key(&self, icc_pk_certificate : &Vec<u8>, icc_pk_exponent : &Vec<u8>, icc_pk_remainder : Option<&Vec<u8>>, issuer_pk_modulus : &[u8], issuer_pk_exponent : &[u8], data_authentication : &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+        // ICC public key retrieval: EMV Book 2, 6.4 Retrieval of ICC Public Key
+        debug!("Retrieving ICC public key {:02X?}", &icc_pk_certificate[0..2]);
+
+        let tag_9f46_icc_pk_certificate = icc_pk_certificate;
 
         let issuer_pk = RsaPublicKey::new(issuer_pk_modulus, issuer_pk_exponent);
         let icc_certificate = issuer_pk.public_decrypt(&tag_9f46_icc_pk_certificate[..]).unwrap();
@@ -778,22 +909,22 @@ impl EmvConnection {
 
         let icc_certificate_pan = &icc_certificate[2..12];
         let icc_certificate_expiry = &icc_certificate[12..14];
-        let icc_certificate_serial = &icc_certificate[14..17];
+        //let icc_certificate_serial = &icc_certificate[14..17];
         let icc_certificate_hash_algo = &icc_certificate[17..18];
         let icc_certificate_pk_algo = &icc_certificate[18..19];
-        let icc_certificate_pk_length = &icc_certificate[19..20];
-        let icc_certificate_pk_exp_length = &icc_certificate[20..21];
+        //let icc_certificate_pk_length = &icc_certificate[19..20];
+        //let icc_certificate_pk_exp_length = &icc_certificate[20..21];
         let icc_certificate_pk_leftmost_digits = &icc_certificate[21..checksum_position];
 
         assert_eq!(icc_certificate_hash_algo[0], 0x01); // SHA-1
         assert_eq!(icc_certificate_pk_algo[0], 0x01); // RSA as defined in EMV Book 2, B2.1 RSA Algorihm
 
-        let tag_9f47_icc_pk_exponent = self.get_tag_value("9F47").unwrap().clone();
+        let tag_9f47_icc_pk_exponent = icc_pk_exponent;
 
         let mut checksum_data : Vec<u8> = Vec::new();
         checksum_data.extend_from_slice(&icc_certificate[1..checksum_position]);
 
-        let tag_9f48_icc_pk_remainder = self.get_tag_value("9F48");
+        let tag_9f48_icc_pk_remainder = icc_pk_remainder;
         if let Some(tag_9f48_icc_pk_remainder) = tag_9f48_icc_pk_remainder {
             checksum_data.extend_from_slice(&tag_9f48_icc_pk_remainder[..]);
         }
@@ -820,15 +951,13 @@ impl EmvConnection {
         let icc_ascii_pan = bcd_to_ascii(&icc_certificate_pan).unwrap();
         assert_eq!(icc_ascii_pan, ascii_pan);
 
-        trace!("ICC cert expiry (MMYY): {:?}", str::from_utf8(&bcd_to_ascii(&icc_certificate_expiry).unwrap()).unwrap());
+        is_certificate_expired(&icc_certificate_expiry[..]);
 
 
         let mut icc_pk_modulus : Vec<u8> = Vec::new();
         
         let icc_certificate_pk_leftmost_digits_length = icc_certificate_pk_leftmost_digits.iter()
-            .rev()
-            .position(|c| -> bool { *c != 0xBB })
-            .map(|i| icc_certificate_pk_leftmost_digits.len() - i).unwrap();
+            .rev().position(|c| -> bool { *c != 0xBB }).map(|i| icc_certificate_pk_leftmost_digits.len() - i).unwrap();
 
         icc_pk_modulus.extend_from_slice(&icc_certificate_pk_leftmost_digits[..icc_certificate_pk_leftmost_digits_length]);
 
@@ -838,7 +967,7 @@ impl EmvConnection {
 
         trace!("ICC PK modulus ({} bytes):\n{}", icc_pk_modulus.len(), HexViewBuilder::new(&icc_pk_modulus[..]).finish());
 
-        Ok((icc_pk_modulus, tag_9f47_icc_pk_exponent))
+        Ok((icc_pk_modulus, tag_9f47_icc_pk_exponent.to_vec()))
     }
 
     fn handle_dynamic_data_authentication(&mut self, icc_pk_modulus : &[u8], icc_pk_exponent : &[u8]) -> Result<(),()> {
@@ -892,6 +1021,8 @@ impl EmvConnection {
         }
 
         let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
+        assert_eq!(tag_9f4b_signed_data_decrypted_hash_algo, 0x01);
+
         let tag_9f4b_signed_data_decrypted_dynamic_data_length = tag_9f4b_signed_data_decrypted[3] as usize;
         
         let tag_9f4b_signed_data_decrypted_dynamic_data = &tag_9f4b_signed_data_decrypted[4..4+tag_9f4b_signed_data_decrypted_dynamic_data_length];
@@ -938,7 +1069,7 @@ impl EmvConnection {
         } else {
             let mut i = 0;
             loop {
-                let mut tag_value_length : usize = 0;
+                let tag_value_length : usize;
 
                 let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
 
@@ -1002,6 +1133,36 @@ struct RsaPublicKey {
 impl RsaPublicKey {
     fn new(modulus : &[u8], exponent : &[u8]) -> RsaPublicKey {
         RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent) }
+    }
+
+    fn public_encrypt(&self, plaintext_data : &[u8]) -> Result<Vec<u8>, ()> {
+        let pk_modulus_raw = hex::decode(&self.modulus).unwrap();
+        let pk_modulus = BigNum::from_slice(&pk_modulus_raw[..]).unwrap();
+        let pk_exponent = BigNum::from_slice(&(hex::decode(&self.exponent).unwrap())[..]).unwrap();
+
+        let rsa = Rsa::from_public_components(pk_modulus, pk_exponent).unwrap();
+
+        let mut encrypt_output = [0u8; 4096];
+
+        let length = match rsa.public_encrypt(plaintext_data, &mut encrypt_output[..], Padding::NONE) {
+            Ok(length) => length,
+            Err(_) => {
+                warn!("Could not decrypt data");
+                return Err(());
+            }
+        };
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&encrypt_output[..length]);
+
+        trace!("Encrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+
+        if data.len() != pk_modulus_raw.len() {
+            warn!("Data length discrepancy");
+            return Err(());
+        }
+
+        Ok(data)
     }
 
     fn public_decrypt(&self, cipher_data : &[u8]) -> Result<Vec<u8>, ()> {
@@ -1072,50 +1233,19 @@ fn initialize_logging() {
     let _handle = log4rs::init_config(config).unwrap();
 }
 
-fn parse_tlv(raw_data : &[u8]) -> Tlv {
+fn parse_tlv(raw_data : &[u8]) -> Option<Tlv> {
     let (tlv_data, leftover_buffer) = Tlv::parse(raw_data);
     if leftover_buffer.len() > 0 {
-        warn!("Could not parse as TLV: {:02X?}", leftover_buffer);
+        trace!("Could not parse as TLV: {:02X?}", leftover_buffer);
     }
 
-    let tlv_data = tlv_data.unwrap();
+    let tlv_data : Option<Tlv> = match tlv_data {
+        Ok(tlv) => Some(tlv),
+        Err(_) => None
+
+    };
 
     return tlv_data;
-}
-
-// iso7816_tlv::ber::Tlv.find / find_all doesn't seem to work when earching constructed tags...
-fn find_first_tag<'a>(tag_name : &str, tlv_data : &'a Tlv) -> Option<&'a Tlv> {
-    //trace!("Looking for tag {:?} in {:02X?}", tag_name, tlv_data.to_vec());
-
-    let tag = Tag::try_from(tag_name).unwrap();
-    if tlv_data.tag().to_bytes() == tag.to_bytes() {
-        return Some(tlv_data);
-    }
-
-    match tlv_data.value() {
-        Value::Constructed(tlv_tags) => {
-            for t in tlv_tags {
-                match find_first_tag(tag_name, &t) {
-                    Some(found) => return Some(found),
-                    None => continue
-                }
-            }
-        },
-        Value::Primitive(_) => {
-            return None
-        }
-    }
-
-    return None
-}
-
-fn parse_tag_value(tag_name : &str, tlv_data : &Tlv) -> Option<Vec<u8>> {
-    let tlv_tag = find_first_tag(tag_name, tlv_data).unwrap();
-    if let Value::Primitive(value) = tlv_tag.value() {
-        return Some(value.to_vec());
-    }
-
-    None
 }
 
 fn bcd_to_ascii(bcd_data : &[u8]) -> Result<Vec<u8>, ()> {
@@ -1148,11 +1278,10 @@ fn bcd_to_ascii(bcd_data : &[u8]) -> Result<Vec<u8>, ()> {
 }
 
 //cn = 12 34 56 78 90 12 3F FF
-//n  = 00 00 00 01 23 45
 fn ascii_to_bcd_cn(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
     let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
 
-    assert!(ascii_data.len() <= size);
+    assert!(ascii_data.len() <= size * 2);
 
     const ASCII_CHARACTER_0 : u8 = 0x30;
 
@@ -1180,6 +1309,48 @@ fn ascii_to_bcd_cn(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
         bcd_output.push(bcd_byte);
     }
 
+    assert_eq!(bcd_output.len(), size);
+
+    Ok(bcd_output)
+}
+
+//n = 00 00 00 01 23 45
+fn ascii_to_bcd_n(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
+    let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
+
+    assert!(ascii_data.len() <= size * 2);
+
+    const ASCII_CHARACTER_0 : u8 = 0x30;
+
+    let mut ascii_data_aligned : Vec<u8> = Vec::new();
+    if ascii_data.len() % 2 == 1 {
+        ascii_data_aligned.push(ASCII_CHARACTER_0);
+    }
+    ascii_data_aligned.extend_from_slice(&ascii_data[..]);
+
+    for _ in ascii_data_aligned.len()/2..size {
+        let bcd_byte = 0x00;
+        bcd_output.push(bcd_byte);
+    }
+
+    for i in (0..ascii_data_aligned.len()).step_by(2) {
+        let b1 = ascii_data_aligned[i] - ASCII_CHARACTER_0;
+        if b1 > 0x9 {
+            return Err(());
+        }
+
+        let b2 = ascii_data_aligned[i+1] - ASCII_CHARACTER_0;
+        if b2 > 0x9 {
+            return Err(());
+        }
+
+        let bcd_byte = b2 + (b1 << 4);
+
+        bcd_output.push(bcd_byte);
+    }
+
+    assert_eq!(bcd_output.len(), size);
+
     Ok(bcd_output)
 }
 
@@ -1195,6 +1366,20 @@ fn get_ca_public_key<'a>(ca_data : &'a HashMap<String, CertificateAuthority>, ri
     }
 }
 
+fn is_certificate_expired(date_bcd : &[u8]) -> bool {
+    let today = Utc::today().naive_utc();
+    let expiry_date = NaiveDate::parse_from_str(&format!("01{:02X?}", date_bcd), "%d[%m, %y]").unwrap();
+    let duration = today.signed_duration_since(expiry_date).num_days();
+
+    if duration > 30 {
+        warn!("Certificate expiry date (MMYY) {:02X?} is {} days in the past", date_bcd, duration.to_string());
+
+        return true;
+    }
+
+    false
+}
+
 
 fn run() -> Result<Option<String>, String> {
     initialize_logging();
@@ -1202,6 +1387,9 @@ fn run() -> Result<Option<String>, String> {
     let matches = App::new("Minimum Viable Payment Terminal")
         .version("0.1")
         .about("EMV transaction simulation")
+        .arg(Arg::with_name("interactive")
+            .long("interactive")
+            .help("Simulate payment terminal purchase sequence"))
         .arg(Arg::with_name("pin")
             .short("p")
             .long("pin")
@@ -1210,32 +1398,128 @@ fn run() -> Result<Option<String>, String> {
             .takes_value(true))
         .get_matches();
 
-/*
-    let today = Utc::today().naive_utc();
-    let dt = NaiveDate::parse_from_str("010721", "%d%m%y").unwrap();
-    let duration = today.signed_duration_since(dt).num_days();
-    println!("date: {} {}", dt.to_string(), duration.to_string());
-*/
-    //return Ok(None);
+    let interactive = matches.is_present("interactive");
 
     let mut connection = EmvConnection::new().unwrap();
 
+    let mut purchase_amount = "1".to_string();
+
+    if interactive {
+        println!("Enter amount:");
+        print!("> ");
+        let mut stdin_buffer = String::new();
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        purchase_amount = format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0);
+    }
+
+    //return Ok(None);
+
+    if let Err(err) = connection.connect_to_card() {
+        match err {
+            ReaderError::CardNotFound => {
+                if interactive {
+                    println!("Please insert card");
+
+                    loop {
+                        match connection.connect_to_card() {
+                            Ok(_) => break,
+                            Err(err) => {
+                                match err {
+                                    ReaderError::CardNotFound => {
+                                        thread::sleep(time::Duration::from_millis(250));
+                                    },
+                                    _ => return Err("Could not connect to the reader".to_string())
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    return Err("Card not found.".to_string());
+                }
+            },
+            _ => return Err("Could not connect to the reader".to_string())
+        }
+    }
+
     let applications = connection.handle_select_payment_system_environment().unwrap();
 
-    let application = &applications[0];
+    let mut application_number : usize = 0;
+
+    if interactive && applications.len() > 1 {
+        println!("Select payment application:");
+        for i in 0..applications.len() {
+            println!("{:02}. {}", i+1, str::from_utf8(&applications[i].label).unwrap());
+        }
+
+        print!("> ");
+
+        let mut stdin_buffer = String::new();
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        application_number = stdin_buffer.trim().parse::<usize>().unwrap() - 1;
+    }
+
+    let application = &applications[application_number];
     connection.handle_select_payment_application(application).unwrap();
+
+    connection.add_tag("9F02", ascii_to_bcd_n(purchase_amount.as_bytes(), 6).unwrap());
+
+    let search_tag = b"\x9f\x36";
+    connection.handle_get_data(&search_tag[..]).unwrap(); // TODO: just testing, this not needed
 
     let data_authentication = connection.handle_get_processing_options().unwrap();
 
     let (issuer_pk_modulus, issuer_pk_exponent) = connection.get_issuer_public_key(application).unwrap();
 
-    let (icc_pk_modulus, icc_pk_exponent) = connection.get_icc_public_key(&issuer_pk_modulus[..], &issuer_pk_exponent[..], &data_authentication[..]).unwrap();
+    let tag_9f46_icc_pk_certificate = connection.get_tag_value("9F46").unwrap();
+    let tag_9f47_icc_pk_exponent = connection.get_tag_value("9F47").unwrap();
+    let tag_9f48_icc_pk_remainder = connection.get_tag_value("9F48");
+    let (icc_pk_modulus, icc_pk_exponent) = connection.get_icc_public_key(
+        tag_9f46_icc_pk_certificate, tag_9f47_icc_pk_exponent, tag_9f48_icc_pk_remainder,
+        &issuer_pk_modulus[..], &issuer_pk_exponent[..],
+        &data_authentication[..]).unwrap();
 
     connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]).unwrap();
 
-    let ascii_pin = matches.value_of("pin");
+    let mut ascii_pin : Option<&str> = None;
+
+    if matches.is_present("pin") {
+        ascii_pin = matches.value_of("pin");
+    }
+
+    let mut stdin_buffer = String::new();
+    if interactive {
+        println!("Enter PIN:");
+        print!("> ");
+
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        ascii_pin = Some(&stdin_buffer.trim());
+    }
+
     if ascii_pin.is_some() {
-        connection.handle_verify(ascii_pin.unwrap().as_bytes()).unwrap();
+        //connection.handle_verify_plaintext_pin(ascii_pin.unwrap().as_bytes()).unwrap();
+
+        let mut icc_pin_pk_modulus = icc_pk_modulus;
+        let mut icc_pin_pk_exponent = icc_pk_exponent;
+
+        let tag_9f2d_icc_pin_pk_certificate = connection.get_tag_value("9F2D");
+        let tag_9f2e_icc_pin_pk_exponent = connection.get_tag_value("9F2E");
+        if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
+            let tag_9f2f_icc_pin_pk_remainder = connection.get_tag_value("9F2F");
+
+            // ICC has a separate ICC PIN Encipherement public key
+            let (icc_pin_pk_modulus2, icc_pin_pk_exponent2) = connection.get_icc_public_key(
+                tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
+                &issuer_pk_modulus[..], &issuer_pk_exponent[..],
+                &data_authentication[..]).unwrap();
+
+            icc_pin_pk_modulus = icc_pin_pk_modulus2;
+            icc_pin_pk_exponent = icc_pin_pk_exponent2;
+        }
+
+        connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]).unwrap();
     }
 
     connection.handle_generate_ac().unwrap();
