@@ -136,7 +136,7 @@ impl EmvConnection {
 
         let old_tag = self.tags.get(tag_name);
         if old_tag.is_some() {
-            warn!("Overriding tag {:?} from {:02X?} to {:02X?}", tag_name, old_tag.unwrap(), value);
+            trace!("Overriding tag {:?} from {:02X?} to {:02X?}", tag_name, old_tag.unwrap(), value);
         }
 
         self.tags.insert(tag_name.to_string(), value);
@@ -288,7 +288,7 @@ impl EmvConnection {
 
         let tag_94_afl = self.get_tag_value("94").unwrap().clone();
 
-        info!("Read card AFL information:");
+        debug!("Read card AFL information:");
 
         let mut data_authentication : Vec<u8> = Vec::new();
         assert_eq!(tag_94_afl.len() % 4, 0);
@@ -332,13 +332,13 @@ impl EmvConnection {
         let auc_b1 : u8 = tag_82_aip[0];
         // bit 7 = RFU
         if get_bit!(auc_b1, 6) {
-            info!("SDA supported");
+            debug!("SDA supported");
         }
         if get_bit!(auc_b1, 5) {
-            info!("DDA supported");
+            debug!("DDA supported");
         }
         if get_bit!(auc_b1, 4) {
-            info!("Cardholder verification is supported");
+            debug!("Cardholder verification is supported");
 
 // 2020-07-18T22:09:33.408059800+03:00 DEBUG emvpt -  -8E: Cardholder Verification Method (CVM) List
 // 2020-07-18T22:09:33.409053800+03:00 DEBUG emvpt -  -data: [00, 00, 00, 00, 00, 00, 00, 00, 42, 01, 44, 03, 41, 03, 5E, 03, 42, 03, 1F, 03] = ........B.D.A.^.B...
@@ -354,55 +354,55 @@ impl EmvConnection {
                 let cvm_code = cvm_rule[0];
                 let cvm_condition_code = cvm_rule[1];
 
-                info!("CVM rule: {}", i / 2);
+                debug!("CVM rule: {}", i / 2);
                 // bit 7 = RFU
                 if get_bit!(cvm_code, 6) {
-                    info!("Apply succeeding CV Rule if this CVM is unsuccessful");
+                    debug!("Apply succeeding CV Rule if this CVM is unsuccessful");
                 } else {
-                    info!("Fail cardholder verification if this CVM is unsuccessful");
+                    debug!("Fail cardholder verification if this CVM is unsuccessful");
                 }
 
                 let cvm_code = (cvm_code << 2) >> 2;
                 if cvm_code == 0b0000_0000 {
-                    info!("Fail CVM processing");
+                    debug!("Fail CVM processing");
                 } else if cvm_code == 0b0000_0001 {
-                    info!("Plaintext PIN verification performed by ICC");
+                    debug!("Plaintext PIN verification performed by ICC");
                 } else if cvm_code == 0b0000_0010 {
-                    info!("Enciphered PIN verified online");
+                    debug!("Enciphered PIN verified online");
                 } else if cvm_code == 0b0000_0011 {
-                    info!("Plaintext PIN verification performed by ICC and signature (paper)");
+                    debug!("Plaintext PIN verification performed by ICC and signature (paper)");
                 } else if cvm_code == 0b0000_0100 {
-                    info!("Enciphered PIN verification performed by ICC");
+                    debug!("Enciphered PIN verification performed by ICC");
                 } else if cvm_code == 0b0000_0101 {
-                    info!("Enciphered PIN verification performed by ICC and signature (paper)");
+                    debug!("Enciphered PIN verification performed by ICC and signature (paper)");
                 } else if cvm_code == 0b0001_1110 {
-                    info!("Signature (paper)");
+                    debug!("Signature (paper)");
                 } else if cvm_code == 0b0001_1111 {
-                    info!("No CVM required");
+                    debug!("No CVM required");
                 } else {
                     warn!("Unknown CVM code! {:b}", cvm_code);
                 }
 
                 if cvm_condition_code == 0x00 {
-                    info!("Always");
+                    debug!("Always");
                 } else if cvm_condition_code == 0x01 {
-                    info!("If unattended cash");
+                    debug!("If unattended cash");
                 } else if cvm_condition_code == 0x02 {
-                    info!("If not unattended cash and not manual cash and not purchase with cashback");
+                    debug!("If not unattended cash and not manual cash and not purchase with cashback");
                 } else if cvm_condition_code == 0x03 {
-                    info!("If terminal supports the CVM");
+                    debug!("If terminal supports the CVM");
                 } else if cvm_condition_code == 0x04 {
-                    info!("If manual cash");
+                    debug!("If manual cash");
                 } else if cvm_condition_code == 0x05 {
-                    info!("If purchase with cashback");
+                    debug!("If purchase with cashback");
                 } else if cvm_condition_code == 0x06 {
-                    info!("If transaction is in the application currency and is under {:02X?} value", amount1);
+                    debug!("If transaction is in the application currency and is under {:02X?} value", amount1);
                 } else if cvm_condition_code == 0x07 {
-                    info!("If transaction is in the application currency and is over {:02X?} value", amount1);
+                    debug!("If transaction is in the application currency and is over {:02X?} value", amount1);
                 } else if cvm_condition_code == 0x08 {
-                    info!("If transaction is in the application currency and is under {:02X?} value", amount2);
+                    debug!("If transaction is in the application currency and is under {:02X?} value", amount2);
                 } else if cvm_condition_code == 0x09 {
-                    info!("If transaction is in the application currency and is over {:02X?} value", amount2);
+                    debug!("If transaction is in the application currency and is over {:02X?} value", amount2);
                 } else {
                     warn!("Unknown CVM condition code! {:02X?}", cvm_condition_code);
                 }
@@ -410,49 +410,49 @@ impl EmvConnection {
             }
         }
         if get_bit!(auc_b1, 3) {
-            info!("Terminal risk management is to be performed");
+            debug!("Terminal risk management is to be performed");
         }
         if get_bit!(auc_b1, 2) {
             // Issuer Authentication using the EXTERNAL AUTHENTICATE command is supported
-            info!("Issuer authentication is supported");
+            debug!("Issuer authentication is supported");
         }
         // bit 1 = RFU
         if get_bit!(auc_b1, 0) {
-            info!("CDA supported");
+            debug!("CDA supported");
         }
 
         let tag_9f07_application_usage_control = self.get_tag_value("9F07").unwrap();
         let auc_b1 : u8 = tag_9f07_application_usage_control[0];
         let auc_b2 : u8 = tag_9f07_application_usage_control[1];
         if get_bit!(auc_b1, 7) {
-            info!("Valid for domestic cash transactions");
+            debug!("Valid for domestic cash transactions");
         }
         if get_bit!(auc_b1, 6) {
-            info!("Valid for international cash transactions");
+            debug!("Valid for international cash transactions");
         }
         if get_bit!(auc_b1, 5) {
-            info!("Valid for domestic goods");
+            debug!("Valid for domestic goods");
         }
         if get_bit!(auc_b1, 4) {
-            info!("Valid for international goods");
+            debug!("Valid for international goods");
         }
         if get_bit!(auc_b1, 3) {
-            info!("Valid for domestic services");
+            debug!("Valid for domestic services");
         }
         if get_bit!(auc_b1, 2) {
-            info!("Valid for international services");
+            debug!("Valid for international services");
         }
         if get_bit!(auc_b1, 1) {
-            info!("Valid at ATMs");
+            debug!("Valid at ATMs");
         }
         if get_bit!(auc_b1, 0) {
-            info!("Valid at terminals other than ATMs");
+            debug!("Valid at terminals other than ATMs");
         }
         if get_bit!(auc_b2, 7) {
-            info!("Domestic cashback allowed");
+            debug!("Domestic cashback allowed");
         }
         if get_bit!(auc_b2, 6) {
-            info!("International cashback allowed");
+            debug!("International cashback allowed");
         }
         // 5 - 0 bits are RFU
 
