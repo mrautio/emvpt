@@ -62,8 +62,8 @@ enum ReaderError {
 
 impl EmvConnection {
     fn new() -> Result<EmvConnection, String> {
-        let emv_tags = serde_json::from_str(&fs::read_to_string("emv_tags.json").unwrap()).unwrap();
-        let settings = serde_json::from_str(&fs::read_to_string("settings.json").unwrap()).unwrap();
+        let emv_tags = serde_yaml::from_str(&fs::read_to_string("emv_tags.yaml").unwrap()).unwrap();
+        let settings = serde_yaml::from_str(&fs::read_to_string("settings.yaml").unwrap()).unwrap();
 
         Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings } )
     }
@@ -756,7 +756,7 @@ impl EmvConnection {
     fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
 
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
-        let ca_data : HashMap<String, CertificateAuthority> = serde_json::from_str(&fs::read_to_string("scheme_ca_public_keys.json").unwrap()).unwrap();
+        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string("scheme_ca_public_keys.yaml").unwrap()).unwrap();
 
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92").unwrap();
