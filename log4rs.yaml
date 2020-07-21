@@ -1,0 +1,7 @@
+appenders:
+  stdout:
+    kind: console
+root:
+  level: trace
+  appenders:
+    - stdout

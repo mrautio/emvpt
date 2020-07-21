@@ -1,0 +1,22 @@
+{
+    "terminal": {
+        "capabilities": {
+            "sda": false,
+            "dda": true,
+            "cda": false,
+            "plaintext_pin": true,
+            "enciphered_pin": true
+        }
+    },
+    "default_tags": {
+        "95":   "0000000000",
+        "9F02": "000000000001",
+        "9F03": "000000000000",
+        "9F1A": "0246",
+        "5F2A": "0978",
+        "9C":   "21",
+        "9F35": "23",
+        "9F45": "0000",
+        "9F34": "410302"
+    }
+}

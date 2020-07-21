@@ -1,16 +1,16 @@
-use pcsc::{Context, Card, Scope, ShareMode, Protocols, Error, MAX_BUFFER_SIZE, MAX_ATR_SIZE};
+use pcsc::{Context, Card, Scope, ShareMode, Protocols, MAX_BUFFER_SIZE, MAX_ATR_SIZE};
 use hexplay::HexViewBuilder;
 use iso7816_tlv::ber::{Tlv, Tag, Value};
 use std::collections::HashMap;
 use std::str;
 use std::convert::TryFrom;
 use std::io::{self};
+use std::error;
 use std::{thread, time};
 use serde::{Deserialize, Serialize};
-use log::LevelFilter;
+use std::fs::{self};
 use log::{error, info, warn, debug, trace};
-use log4rs::append::console::ConsoleAppender;
-use log4rs::config::{Appender, Config, Root};
+use log4rs;
 use clap::{App, Arg};
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
@@ -25,10 +25,32 @@ macro_rules! get_bit {
     ($byte:expr, $bit:expr) => (if $byte & (1 << $bit) != 0 { true } else { false });
 }
 
+#[derive(Serialize, Deserialize)]
+struct Capabilities {
+    sda : bool,
+    dda : bool,
+    cda : bool,
+    plaintext_pin : bool,
+    enciphered_pin : bool
+}
+
+#[derive(Serialize, Deserialize)]
+struct Terminal {
+    capabilities : Capabilities
+}
+
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    terminal : Terminal,
+    default_tags : HashMap<String, String>
+}
+
 struct EmvConnection {
     tags : HashMap<String, Vec<u8>>,
     ctx : Option<Context>,
-    card : Option<Card>
+    card : Option<Card>,
+    emv_tags : HashMap<String, EmvTag>,
+    settings : Settings
 }
 
 enum ReaderError {
@@ -40,7 +62,10 @@ enum ReaderError {
 
 impl EmvConnection {
     fn new() -> Result<EmvConnection, String> {
-        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None } )
+        let emv_tags = serde_json::from_str(&fs::read_to_string("emv_tags.json").unwrap()).unwrap();
+        let settings = serde_json::from_str(&fs::read_to_string("settings.json").unwrap()).unwrap();
+
+        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings } )
     }
 
     fn connect_to_card(&mut self) -> Result<(), ReaderError> {
@@ -79,7 +104,7 @@ impl EmvConnection {
         // Connect to the card.
         self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
             Ok(card) => Some(card),
-            Err(Error::NoSmartcard) => {
+            Err(pcsc::Error::NoSmartcard) => {
                 return Err(ReaderError::CardNotFound);
             },
             Err(err) => {
@@ -212,78 +237,6 @@ impl EmvConnection {
     }
 
     fn process_tlv(&mut self, buf: &[u8], level: u8) {
-        let emv_definition_data = r#"
-            {
-                "6F":   { "tag":"6F", "name":"File Control Information (FCI) Template" },
-                "84":   { "tag":"84", "name":"Dedicated File (DF) Name" },
-                "A5":   { "tag":"A5", "name":"File Control Information (FCI) Proprietary Template" },
-                "88":   { "tag":"88", "name":"Short File Identifier (SFI)" },
-                "5F2D": { "tag":"5F2D", "name":"Language Preference" },
-                "BF0C": { "tag":"BF0C", "name":"File Control Information (FCI) Issuer Discretionary Data" },
-                "70":   { "tag":"70", "name":"EMV Proprietary Template" },
-                "61":   { "tag":"61", "name":"Application Template" },
-                "4F":   { "tag":"4F", "name":"Application Identifier (AID)" },
-                "50":   { "tag":"50", "name":"Application Label" },
-                "87":   { "tag":"87", "name":"Application Priority Indicator" },
-                "80":   { "tag":"80", "name":"Response Message Template Format 1" },
-                "57":   { "tag":"57", "name":"Track 2 Equivalent Data" },
-                "5F20": { "tag":"5F20", "name":"Cardholder Name" },
-                "9F1F": { "tag":"9F1F", "name":"Track 1 Discretionary Data" },
-                "90":   { "tag":"90", "name":"Issuer Public Key Certificate" },
-                "8F":   { "tag":"8F", "name":"Certification Authority Public Key Index" },
-                "9F32": { "tag":"9F32", "name":"Issuer Public Key Exponent" },
-                "92":   { "tag":"92", "name":"Issuer Public Key Remainder" },
-                "9F47": { "tag":"9F47", "name":"Integrated Circuit Card (ICC) Public Key Exponent" },
-                "9F46": { "tag":"9F46", "name":"Integrated Circuit Card (ICC) Public Key Certificate" },
-                "5F25": { "tag":"5F25", "name":"Application Effective Date" },
-                "5F24": { "tag":"5F24", "name":"Application Expiration Date" },
-                "5A":   { "tag":"5A", "name":"Application Primary Account Number (PAN)" },
-                "5F34": { "tag":"5F34", "name":"Application Primary Account Number (PAN) Sequence Number" },
-                "9F07": { "tag":"9F07", "name":"Application Usage Control" },
-                "8E":   { "tag":"8E", "name":"Cardholder Verification Method (CVM) List" },
-                "9F0D": { "tag":"9F0D", "name":"Issuer Action Code – Default" },
-                "9F0E": { "tag":"9F0E", "name":"Issuer Action Code – Denial" },
-                "9F0F": { "tag":"9F0F", "name":"Issuer Action Code – Online" },
-                "9F4A": { "tag":"9F4A", "name":"Static Data Authentication Tag List" },
-                "8C":   { "tag":"8C", "name":"Card Risk Management Data Object List 1 (CDOL1)" },
-                "8D":   { "tag":"8D", "name":"Card Risk Management Data Object List 2 (CDOL2)" },
-                "5F28": { "tag":"5F28", "name":"Issuer Country Code" },
-                "9F42": { "tag":"9F42", "name":"Application Currency Code" },
-                "9F44": { "tag":"9F44", "name":"Application Currency Exponent" },
-                "9F49": { "tag":"9F49", "name":"Dynamic Data Authentication Data Object List (DDOL)" },
-                "9F08": { "tag":"9F08", "name":"Application Version Number" },
-                "9F02": { "tag":"9F02", "name":"Amount, Authorised (Numeric)" },
-                "9F03": { "tag":"9F03", "name":"Amount, Other (Numeric)" },
-                "9F1A": { "tag":"9F1A", "name":"Terminal Country Code" },
-                "95":   { "tag":"95", "name":"Terminal Verification Results" },
-                "5F2A": { "tag":"5F2A", "name":"Transaction Currency Code" },
-                "9A":   { "tag":"9A", "name":"Transaction Date" },
-                "9C":   { "tag":"9C", "name":"Transaction Type" },
-                "9F37": { "tag":"9F37", "name":"Unpredictable Number" },
-                "8A":   { "tag":"8A", "name":"Authorisation Response Code" },
-                "9F4B": { "tag":"9F4B", "name":"Signed Dynamic Application Data" },
-                "9F48": { "tag":"9F48", "name":"Integrated Circuit Card (ICC) Public Key Remainder" },
-                "9F27": { "tag":"9F27", "name":"Cryptogram Information Data (CID)" },
-                "9F36": { "tag":"9F36", "name":"Application Transaction Counter (ATC)" },
-                "9F26": { "tag":"9F26", "name":"Application Cryptogram (AC)" },
-                "9F10": { "tag":"9F10", "name":"Issuer Application Data (IAD)" },
-                "82":   { "tag":"82", "name":"Application Interchange Profile (AIP)" },
-                "94":   { "tag":"94", "name":"Application File Locator (AFL)" },
-                "9F35": { "tag":"9F35", "name":"Terminal Type" },
-                "9F45": { "tag":"9F45", "name":"Data Authentication Code" },
-                "9F4C": { "tag":"9F4C", "name":"ICC Dynamic Number" },
-                "9F34": { "tag":"9F34", "name":"Cardholder Verification Method (CVM) Results" },
-                "9F11": { "tag":"9F11", "name":"Issuer Code Table Index" },
-                "9F12": { "tag":"9F12", "name":"Application Preferred Name" },
-                "77":   { "tag":"77", "name":"Response Message Template Format 2" },
-                "73":   { "tag":"73", "name":"Directory Discretionary Template" },
-                "9F2E": { "tag":"9F2E", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Exponent" },
-                "9F2F": { "tag":"9F2F", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Remainder" },
-                "9F2D": { "tag":"9F2D", "name":"Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate" }
-            }"#;
-
-        let emv_tags : HashMap<String, EmvTag> = serde_json::from_str(emv_definition_data).unwrap();
-
         let tlv_data = parse_tlv(&buf);
         if !tlv_data.is_some() {
             return;
@@ -292,7 +245,7 @@ impl EmvConnection {
 
         let tag_name = hex::encode(tlv_data.tag().to_bytes()).to_uppercase();
 
-        match emv_tags.get(tag_name.as_str()) {
+        match self.emv_tags.get(tag_name.as_str()) {
             Some(emv_tag) => {
                 EmvConnection::print_tag(&emv_tag, level);
             },
@@ -581,26 +534,6 @@ impl EmvConnection {
         debug!("Generate Application Cryptogram (GENERATE AC):");
 
         self.add_tag("95", b"\x00\x00\x00\x00\x00".to_vec());
-        let amount2 = 0;
-        self.add_tag("9F03", ascii_to_bcd_n(amount2.to_string().as_bytes(), 6).unwrap());
-        // https://www.iso.org/obp/ui/#iso:code:3166:FI
-        let terminal_country = 246;
-        self.add_tag("9F1A", ascii_to_bcd_n(terminal_country.to_string().as_bytes(), 2).unwrap()); // FI
-        // https://www.currency-iso.org/dam/downloads/lists/list_one.xml
-        let currency = 978;
-        self.add_tag("5F2A", ascii_to_bcd_n(currency.to_string().as_bytes(), 2).unwrap()); // EUR
-
-        let today = Utc::today().naive_utc();
-        let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
-        self.add_tag("9A", ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
-
-        // http://www.fintrnmsgtool.com/iso-processing-code.html
-        self.add_tag("9C", b"\x21".to_vec()); // Deposit (Credit)
-        let terminal_type = 23;
-        self.add_tag("9F35", ascii_to_bcd_n(terminal_type.to_string().as_bytes(), 1).unwrap()); // "Offline only", ref. EMV Book 4, A1 Terminal Type
-        // "An issuer assigned value that is retained by the terminal during the verification process of the Signed Static Application Data"
-        // found on one card that does not support SDA... i.e. card requires value but does not provide it
-        self.add_tag("9F45", b"\x00\x00".to_vec());
         // EMV Book 4, A4 CVM Results
         //b1: CVM code
         //b2: CVM condition code
@@ -754,6 +687,28 @@ impl EmvConnection {
         Ok(())
     }
 
+    fn process_settings(&mut self) -> Result<(), Box<dyn error::Error>> {
+        let default_tags = self.settings.default_tags.clone();
+        for (tag_name, tag_value) in default_tags.iter() {
+            self.add_tag(&tag_name, hex::decode(&tag_value.clone())?);
+        }
+
+        if !self.get_tag_value("9A").is_some() {
+            let today = Utc::today().naive_utc();
+            let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
+            self.add_tag("9A", ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+        }
+
+        if !self.get_tag_value("9F37").is_some() {
+            let mut rng = ChaCha20Rng::from_entropy();
+            let mut tag_9f37_unpredictable_number = [0u8; 4];
+            rng.try_fill(&mut tag_9f37_unpredictable_number[..])?;
+            self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
+        }
+
+        Ok(())
+    }
+
     fn handle_get_data(&mut self, tag : &[u8]) -> Result<Vec<u8>, ()> {
         debug!("GET DATA:");
 
@@ -801,29 +756,8 @@ impl EmvConnection {
     fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
 
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
+        let ca_data : HashMap<String, CertificateAuthority> = serde_json::from_str(&fs::read_to_string("scheme_ca_public_keys.json").unwrap()).unwrap();
 
-        let ca_json_data = r#"
-        {
-            "A000000003": {
-                "issuer": "Visa",
-                "certificates": {
-                    "92": {
-                        "modulus": "996AF56F569187D09293C14810450ED8EE3357397B18A2458EFAA92DA3B6DF6514EC060195318FD43BE9B8F0CC669E3F844057CBDDF8BDA191BB64473BC8DC9A730DB8F6B4EDE3924186FFD9B8C7735789C23A36BA0B8AF65372EB57EA5D89E7D14E9C7B6B557460F10885DA16AC923F15AF3758F0F03EBD3C5C2C949CBA306DB44E6A2C076C5F67E281D7EF56785DC4D75945E491F01918800A9E2DC66F60080566CE0DAF8D17EAD46AD8E30A247C9F",
-                        "exponent": "03"
-                    }
-                }
-            },
-            "A000000004": {
-                "issuer": "MasterCard",
-                "certificates": {
-                    "FA": {
-                        "modulus": "A90FCD55AA2D5D9963E35ED0F440177699832F49C6BAB15CDAE5794BE93F934D4462D5D12762E48C38BA83D8445DEAA74195A301A102B2F114EADA0D180EE5E7A5C73E0C4E11F67A43DDAB5D55683B1474CC0627F44B8D3088A492FFAADAD4F42422D0E7013536C3C49AD3D0FAE96459B0F6B1B6056538A3D6D44640F94467B108867DEC40FAAECD740C00E2B7A8852D",
-                        "exponent": "03"
-                    }
-                }
-            }
-        }"#;
-        let ca_data : HashMap<String, CertificateAuthority> = serde_json::from_str(ca_json_data).unwrap();
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92").unwrap();
         let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
@@ -972,11 +906,6 @@ impl EmvConnection {
 
     fn handle_dynamic_data_authentication(&mut self, icc_pk_modulus : &[u8], icc_pk_exponent : &[u8]) -> Result<(),()> {
         debug!("Perform Dynamic Data Authentication (DDA):");
-
-        let mut rng = ChaCha20Rng::from_entropy();
-        let mut tag_9f37_unpredictable_number = [0u8; 4];
-        rng.try_fill(&mut tag_9f37_unpredictable_number[..]).unwrap();
-        self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
 
         let ddol_default_value = b"\x9f\x37\x04".to_vec();
         let tag_9f49_ddol = match self.get_tag_value("9F49") {
@@ -1221,18 +1150,6 @@ fn is_success_response(response_trailer : &Vec<u8>) -> bool {
     success
 }
 
-fn initialize_logging() {
-    let stdout = ConsoleAppender::builder().build();
-    let stdout_append_name = "stdout";
-
-    let config = Config::builder()
-        .appender(Appender::builder().build(stdout_append_name, Box::new(stdout)))
-        .build(Root::builder().appender(stdout_append_name).build(LevelFilter::Trace))
-        .unwrap();
-
-    let _handle = log4rs::init_config(config).unwrap();
-}
-
 fn parse_tlv(raw_data : &[u8]) -> Option<Tlv> {
     let (tlv_data, leftover_buffer) = Tlv::parse(raw_data);
     if leftover_buffer.len() > 0 {
@@ -1382,7 +1299,7 @@ fn is_certificate_expired(date_bcd : &[u8]) -> bool {
 
 
 fn run() -> Result<Option<String>, String> {
-    initialize_logging();
+    log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
 
     let matches = App::new("Minimum Viable Payment Terminal")
         .version("0.1")
@@ -1402,7 +1319,7 @@ fn run() -> Result<Option<String>, String> {
 
     let mut connection = EmvConnection::new().unwrap();
 
-    let mut purchase_amount = "1".to_string();
+    let mut purchase_amount : Option<String> = None;
 
     if interactive {
         println!("Enter amount:");
@@ -1410,7 +1327,7 @@ fn run() -> Result<Option<String>, String> {
         let mut stdin_buffer = String::new();
         io::stdin().read_line(&mut stdin_buffer).unwrap();
 
-        purchase_amount = format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0);
+        purchase_amount = Some(format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0));
     }
 
     //return Ok(None);
@@ -1463,7 +1380,10 @@ fn run() -> Result<Option<String>, String> {
     let application = &applications[application_number];
     connection.handle_select_payment_application(application).unwrap();
 
-    connection.add_tag("9F02", ascii_to_bcd_n(purchase_amount.as_bytes(), 6).unwrap());
+    connection.process_settings().unwrap();
+    if purchase_amount.is_some() {
+        connection.add_tag("9F02", ascii_to_bcd_n(purchase_amount.unwrap().as_bytes(), 6).unwrap());
+    }
 
     let search_tag = b"\x9f\x36";
     connection.handle_get_data(&search_tag[..]).unwrap(); // TODO: just testing, this not needed
