@@ -4,6 +4,7 @@ use iso7816_tlv::ber::{Tlv, Tag, Value};
 use std::collections::HashMap;
 use std::str;
 use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::io::{self};
 use std::error;
 use std::{thread, time};
@@ -21,23 +22,355 @@ use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Datelike, Utc};
 
+type ApduInterfaceCustomFunction = fn(&[u8]) -> Result<Vec<u8>, ()>;
+
+enum ApduInterface<'a> {
+    Pcsc(&'a Option<&'a Card>),
+    Function(ApduInterfaceCustomFunction)
+}
+
+
+fn send_apdu_raw<'apdu>(interface : &ApduInterface, apdu : &'apdu [u8]) -> Result<Vec<u8>, ()> {
+    let mut output : Vec<u8> = Vec::new();
+
+    match interface {
+        ApduInterface::Pcsc(card) => {
+            let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
+            output.extend_from_slice(card.unwrap().transmit(apdu, &mut apdu_response_buffer).unwrap());
+        },
+        ApduInterface::Function(function) => {
+            output.extend_from_slice(&function(apdu).unwrap()[..]);
+        }
+    }
+
+    Ok(output)
+}
+
 macro_rules! get_bit {
     ($byte:expr, $bit:expr) => (if $byte & (1 << $bit) != 0 { true } else { false });
 }
 
-#[derive(Serialize, Deserialize)]
+macro_rules! set_bit {
+    ($byte:expr, $bit:expr, $bit_value:expr) => (if $bit_value == true { $byte |= 1 << $bit; } else { $byte &= !(1 << $bit); });
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+enum CvmCode {
+    FailCvmProcessing = 0b0000_0000,
+    PlaintextPin = 0b0000_0001,
+    EncipheredPinOnline = 0b0000_0010,
+    PlaintextPinAndSignature = 0b0000_0011,
+    EncipheredPinOffline = 0b0000_0100,
+    EncipheredPinOfflineAndSignature = 0b0000_0101,
+    Signature = 0b0001_1110,
+    NoCvm = 0b0001_1111
+}
+
+impl From<CvmCode> for u8 {
+    fn from(orig: CvmCode) -> Self {
+        match orig {
+            CvmCode::FailCvmProcessing => 0b0000_0000,
+            CvmCode::PlaintextPin => 0b0000_0001,
+            CvmCode::EncipheredPinOnline => 0b0000_0010,
+            CvmCode::PlaintextPinAndSignature => 0b0000_0011,
+            CvmCode::EncipheredPinOffline => 0b0000_0100,
+            CvmCode::EncipheredPinOfflineAndSignature => 0b0000_0101,
+            CvmCode::Signature => 0b0001_1110,
+            CvmCode::NoCvm => 0b0001_1111
+        }
+    }
+}
+
+impl TryFrom<u8> for CvmCode {
+    type Error = &'static str;
+
+    fn try_from(orig: u8) -> Result<Self, Self::Error> {
+        match orig {
+            0b0000_0000 => Ok(CvmCode::FailCvmProcessing),
+            0b0000_0001 => Ok(CvmCode::PlaintextPin),
+            0b0000_0010 => Ok(CvmCode::EncipheredPinOnline),
+            0b0000_0011 => Ok(CvmCode::PlaintextPinAndSignature),
+            0b0000_0100 => Ok(CvmCode::EncipheredPinOffline),
+            0b0000_0101 => Ok(CvmCode::EncipheredPinOfflineAndSignature),
+            0b0001_1110 => Ok(CvmCode::Signature),
+            0b0001_1111 => Ok(CvmCode::NoCvm),
+            _ => Err("Unknown code!")
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+enum CvmConditionCode {
+    Always = 0x00,
+    UnattendedCash = 0x01,
+    NotCashNorPurchaseWithCashback = 0x02,
+    CvmSupported = 0x03,
+    ManualCash = 0x04,
+    PurchaseWithCashback = 0x05,
+    IccCurrencyUnderX = 0x06,
+    IccCurrencyOverX = 0x07,
+    IccCurrencyUnderY = 0x08,
+    IccCurrencyOverY = 0x09
+}
+
+impl From<CvmConditionCode> for u8 {
+    fn from(orig: CvmConditionCode) -> Self {
+        match orig {
+            CvmConditionCode::Always => 0x00,
+            CvmConditionCode::UnattendedCash => 0x01,
+            CvmConditionCode::NotCashNorPurchaseWithCashback => 0x02,
+            CvmConditionCode::CvmSupported => 0x03,
+            CvmConditionCode::ManualCash => 0x04,
+            CvmConditionCode::PurchaseWithCashback => 0x05,
+            CvmConditionCode::IccCurrencyUnderX => 0x06,
+            CvmConditionCode::IccCurrencyOverX => 0x07,
+            CvmConditionCode::IccCurrencyUnderY => 0x08,
+            CvmConditionCode::IccCurrencyOverY => 0x09
+        }
+    }
+}
+
+impl TryFrom<u8> for CvmConditionCode {
+    type Error = &'static str;
+
+    fn try_from(orig: u8) -> Result<Self, Self::Error> {
+        match orig {
+            0x00 => Ok(CvmConditionCode::Always),
+            0x01 => Ok(CvmConditionCode::UnattendedCash),
+            0x02 => Ok(CvmConditionCode::NotCashNorPurchaseWithCashback),
+            0x03 => Ok(CvmConditionCode::CvmSupported),
+            0x04 => Ok(CvmConditionCode::ManualCash),
+            0x05 => Ok(CvmConditionCode::PurchaseWithCashback),
+            0x06 => Ok(CvmConditionCode::IccCurrencyUnderX),
+            0x07 => Ok(CvmConditionCode::IccCurrencyOverX),
+            0x08 => Ok(CvmConditionCode::IccCurrencyUnderY),
+            0x09 => Ok(CvmConditionCode::IccCurrencyOverY),
+            _ => Err("Unknown condition!")
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct CvmRule {
+    amount_x : u32,
+    amount_y : u32,
+    fail_if_unsuccessful : bool,
+    code : CvmCode,
+    condition : CvmConditionCode
+}
+
+impl CvmRule {
+    fn into_9f34_value(rule : Result<CvmRule, CvmRule>) -> Vec<u8> {
+        // EMV Book 4, A4 CVM Results
+
+        let rule_unwrapped = match rule {
+            Ok(rule) => rule,
+            Err(rule) => rule
+        };
+
+        let mut c : u8 = rule_unwrapped.code.try_into().unwrap();
+        if ! rule_unwrapped.fail_if_unsuccessful {
+            c += 0b0100_0000;
+        }
+
+
+        let mut value : Vec<u8> = Vec::new();
+        value.push(c);
+        value.push(rule_unwrapped.condition.try_into().unwrap());
+
+        let result : u8 = match rule {
+            Ok(rule) => {
+                match rule.code {
+                    CvmCode::Signature => 0x00, // unknown
+                    _ => 0x02 // successful
+                }
+            },
+            Err(_) => 0x01 // failed
+        };
+
+        value.push(result);
+
+        debug!("9F34 {:02X?}: {:?}", value, rule_unwrapped);
+
+        return value;
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct Capabilities {
     sda : bool,
     dda : bool,
     cda : bool,
     plaintext_pin : bool,
-    enciphered_pin : bool
+    enciphered_pin : bool,
+    terminal_risk_management : bool,
+    issuer_authentication : bool
 }
 
+#[derive(Debug)]
+struct UsageControl {
+    domestic_cash_transactions : bool,
+    international_cash_transactions : bool,
+    domestic_goods : bool,
+    international_goods : bool,
+    domestic_services : bool,
+    international_services : bool,
+    atms : bool,
+    terminals_other_than_atms : bool,
+    domestic_cashback : bool,
+    international_cashback : bool
+}
+
+#[derive(Debug)]
+struct Icc {
+    capabilities : Capabilities,
+    usage : UsageControl,
+    cvm_rules : Vec<CvmRule>
+}
+
+impl Icc {
+    fn new() -> Icc {
+        let capabilities = Capabilities {
+            sda: false,
+            dda: false,
+            cda: false,
+            plaintext_pin: false,
+            enciphered_pin: false,
+            terminal_risk_management: false,
+            issuer_authentication: false
+        };
+
+        let usage = UsageControl {
+            domestic_cash_transactions: false,
+            international_cash_transactions: false,
+            domestic_goods: false,
+            international_goods: false,
+            domestic_services: false,
+            international_services: false,
+            atms: false,
+            terminals_other_than_atms: false,
+            domestic_cashback: false,
+            international_cashback: false
+        };
+
+        Icc { capabilities : capabilities, usage : usage, cvm_rules : Vec::new() }
+    }
+}
+
+// TODO: support EMV Book 4, A2 Terminal Capabilities (a.k.a. 9F33)
 #[derive(Serialize, Deserialize)]
 struct Terminal {
-    capabilities : Capabilities
+    use_random : bool,
+    capabilities : Capabilities,
+    tvr : TerminalVerificationResults
 }
+
+// EMV Book 3, C5 Terminal Verification Results
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+struct TerminalVerificationResults {
+    //TVR byte 1
+    offline_data_authentication_was_not_performed : bool,
+    sda_failed : bool,
+    icc_data_missing : bool,
+    card_appears_on_terminal_exception_file : bool,
+    dda_failed : bool,
+    cda_failed : bool,
+    //RFU
+    //RFU
+
+    // TVR byte 2
+    icc_and_terminal_have_different_application_versions : bool,
+    expired_application : bool,
+    application_not_yet_effective : bool,
+    requested_service_not_allowed_for_card_product : bool,
+    new_card : bool,
+    //RFU
+    //RFU
+    //RFU
+
+    //TVR byte 3
+    cardholder_verification_was_not_successful : bool,
+    unrecognised_cvm : bool,
+    pin_try_limit_exceeded : bool,
+    pin_entry_required_and_pin_pad_not_present_or_not_working : bool,
+    pin_entry_required_pin_pad_present_but_pin_was_not_entered : bool,
+    online_pin_entered : bool,
+    //RFU
+    //RFU
+
+    //TVR byte 4
+    transaction_exceeds_floor_limit : bool,
+    lower_consecutive_offline_limit_exceeded : bool,
+    upper_consecutive_offline_limit_exceeded : bool,
+    transaction_selected_randomly_for_online_processing : bool,
+    merchant_forced_transaction_online : bool,
+    //RFU
+    //RFU
+    //RFU
+
+    //TVR byte 5
+    default_tdol_used : bool,
+    issuer_authentication_failed : bool,
+    script_processing_failed_before_final_generate_ac : bool,
+    script_processing_failed_after_final_generate_ac : bool
+    //RFU
+    //RFU
+    //RFU
+    //RFU
+}
+
+impl From<TerminalVerificationResults> for Vec<u8> {
+    fn from(tvr: TerminalVerificationResults) -> Self {
+        let mut b1 : u8 = 0b0000_0000;
+        let mut b2 : u8 = 0b0000_0000;
+        let mut b3 : u8 = 0b0000_0000;
+        let mut b4 : u8 = 0b0000_0000;
+        let mut b5 : u8 = 0b0000_0000;
+
+        set_bit!(b1, 7, tvr.offline_data_authentication_was_not_performed);
+        set_bit!(b1, 6, tvr.sda_failed);
+        set_bit!(b1, 5, tvr.icc_data_missing);
+        set_bit!(b1, 4, tvr.card_appears_on_terminal_exception_file);
+        set_bit!(b1, 3, tvr.dda_failed);
+        set_bit!(b1, 2, tvr.cda_failed);
+
+        set_bit!(b2, 7, tvr.icc_and_terminal_have_different_application_versions);
+        set_bit!(b2, 6, tvr.expired_application);
+        set_bit!(b2, 5, tvr.application_not_yet_effective);
+        set_bit!(b2, 4, tvr.requested_service_not_allowed_for_card_product);
+        set_bit!(b2, 3, tvr.new_card);
+
+        set_bit!(b3, 7, tvr.cardholder_verification_was_not_successful);
+        set_bit!(b3, 6, tvr.unrecognised_cvm);
+        set_bit!(b3, 5, tvr.pin_try_limit_exceeded);
+        set_bit!(b3, 4, tvr.pin_entry_required_and_pin_pad_not_present_or_not_working);
+        set_bit!(b3, 3, tvr.pin_entry_required_pin_pad_present_but_pin_was_not_entered);
+        set_bit!(b3, 2, tvr.online_pin_entered);
+
+        set_bit!(b4, 7, tvr.transaction_exceeds_floor_limit);
+        set_bit!(b4, 6, tvr.lower_consecutive_offline_limit_exceeded);
+        set_bit!(b4, 5, tvr.upper_consecutive_offline_limit_exceeded);
+        set_bit!(b4, 4, tvr.transaction_selected_randomly_for_online_processing);
+        set_bit!(b4, 3, tvr.merchant_forced_transaction_online);
+
+        set_bit!(b5, 7, tvr.default_tdol_used);
+        set_bit!(b5, 6, tvr.issuer_authentication_failed);
+        set_bit!(b5, 5, tvr.script_processing_failed_before_final_generate_ac);
+        set_bit!(b5, 4, tvr.script_processing_failed_after_final_generate_ac);
+
+        let mut output : Vec<u8> = Vec::new();
+        output.push(b1);
+        output.push(b2);
+        output.push(b3);
+        output.push(b4);
+        output.push(b5);
+
+        output
+    }
+}
+
 
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -45,12 +378,14 @@ struct Settings {
     default_tags : HashMap<String, String>
 }
 
-struct EmvConnection {
+struct EmvConnection<'a> {
     tags : HashMap<String, Vec<u8>>,
     ctx : Option<Context>,
     card : Option<Card>,
+    interface : Option<ApduInterface<'a>>,
     emv_tags : HashMap<String, EmvTag>,
-    settings : Settings
+    settings : Settings,
+    icc : Icc
 }
 
 enum ReaderError {
@@ -60,12 +395,12 @@ enum ReaderError {
     CardNotFound
 }
 
-impl EmvConnection {
-    fn new() -> Result<EmvConnection, String> {
+impl EmvConnection<'_> {
+    fn new() -> Result<EmvConnection<'static>, String> {
         let emv_tags = serde_yaml::from_str(&fs::read_to_string("emv_tags.yaml").unwrap()).unwrap();
         let settings = serde_yaml::from_str(&fs::read_to_string("settings.yaml").unwrap()).unwrap();
 
-        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings } )
+        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings, icc : Icc::new(), interface : None } )
     }
 
     fn connect_to_card(&mut self) -> Result<(), ReaderError> {
@@ -103,7 +438,9 @@ impl EmvConnection {
 
         // Connect to the card.
         self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
-            Ok(card) => Some(card),
+            Ok(card) => {
+                Some(card)
+            },
             Err(pcsc::Error::NoSmartcard) => {
                 return Err(ReaderError::CardNotFound);
             },
@@ -145,7 +482,7 @@ impl EmvConnection {
     fn send_apdu_select(&mut self, aid : &[u8]) -> (Vec<u8>, Vec<u8>) {
         self.tags.clear();
 
-        let apdu_command_select   = b"\x00\xA4\x04\x00";
+        let apdu_command_select = b"\x00\xA4\x04\x00";
 
         let mut select_command = apdu_command_select.to_vec();
         select_command.push(aid.len() as u8);
@@ -155,17 +492,25 @@ impl EmvConnection {
     }
 
     fn send_apdu<'apdu>(&mut self, apdu : &'apdu [u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
 
         let mut response_data : Vec<u8> = Vec::new();
         let mut response_trailer : Vec<u8>;
 
         let mut new_apdu_command;
         let mut apdu_command = apdu;
+
+
+        let card = &self.card.as_ref();
+        let mut interface : &ApduInterface = &ApduInterface::Pcsc(card);
+        if self.interface.is_some() {
+            interface = self.interface.as_ref().unwrap();
+        }
+
         loop {
             // Send an APDU command.
             debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
-            let apdu_response = self.card.as_ref().unwrap().transmit(apdu_command, &mut apdu_response_buffer).unwrap();
+
+            let apdu_response = send_apdu_raw(interface, apdu_command).unwrap();
 
             response_data.extend_from_slice(&apdu_response[0..apdu_response.len()-2]);
 
@@ -331,21 +676,16 @@ impl EmvConnection {
 
         let auc_b1 : u8 = tag_82_aip[0];
         // bit 7 = RFU
-        if get_bit!(auc_b1, 6) {
-            debug!("SDA supported");
-        }
-        if get_bit!(auc_b1, 5) {
-            debug!("DDA supported");
-        }
+        self.icc.capabilities.sda = get_bit!(auc_b1, 6);
+        self.icc.capabilities.dda = get_bit!(auc_b1, 5);
         if get_bit!(auc_b1, 4) {
-            debug!("Cardholder verification is supported");
+            // Cardholder verification is supported
 
-// 2020-07-18T22:09:33.408059800+03:00 DEBUG emvpt -  -8E: Cardholder Verification Method (CVM) List
-// 2020-07-18T22:09:33.409053800+03:00 DEBUG emvpt -  -data: [00, 00, 00, 00, 00, 00, 00, 00, 42, 01, 44, 03, 41, 03, 5E, 03, 42, 03, 1F, 03] = ........B.D.A.^.B...
-
-            let tag_8e_cvm_list = self.get_tag_value("8E").unwrap();
+            let tag_8e_cvm_list = self.get_tag_value("8E").unwrap().clone();
             let amount1 = &tag_8e_cvm_list[0..4];
             let amount2 = &tag_8e_cvm_list[4..8];
+            let amount_x = str::from_utf8(&bcd_to_ascii(&amount1[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
+            let amount_y = str::from_utf8(&bcd_to_ascii(&amount2[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
 
             let tag_84_cvm_rules = &tag_8e_cvm_list[8..];
             assert_eq!(tag_84_cvm_rules.len() % 2, 0);
@@ -354,106 +694,38 @@ impl EmvConnection {
                 let cvm_code = cvm_rule[0];
                 let cvm_condition_code = cvm_rule[1];
 
-                debug!("CVM rule: {}", i / 2);
                 // bit 7 = RFU
-                if get_bit!(cvm_code, 6) {
-                    debug!("Apply succeeding CV Rule if this CVM is unsuccessful");
-                } else {
-                    debug!("Fail cardholder verification if this CVM is unsuccessful");
-                }
-
+                let fail_if_unsuccessful = ! get_bit!(cvm_code, 6);
                 let cvm_code = (cvm_code << 2) >> 2;
-                if cvm_code == 0b0000_0000 {
-                    debug!("Fail CVM processing");
-                } else if cvm_code == 0b0000_0001 {
-                    debug!("Plaintext PIN verification performed by ICC");
-                } else if cvm_code == 0b0000_0010 {
-                    debug!("Enciphered PIN verified online");
-                } else if cvm_code == 0b0000_0011 {
-                    debug!("Plaintext PIN verification performed by ICC and signature (paper)");
-                } else if cvm_code == 0b0000_0100 {
-                    debug!("Enciphered PIN verification performed by ICC");
-                } else if cvm_code == 0b0000_0101 {
-                    debug!("Enciphered PIN verification performed by ICC and signature (paper)");
-                } else if cvm_code == 0b0001_1110 {
-                    debug!("Signature (paper)");
-                } else if cvm_code == 0b0001_1111 {
-                    debug!("No CVM required");
-                } else {
-                    warn!("Unknown CVM code! {:b}", cvm_code);
-                }
+                let code : CvmCode = cvm_code.try_into().unwrap();
+                let condition : CvmConditionCode = cvm_condition_code.try_into().unwrap();
 
-                if cvm_condition_code == 0x00 {
-                    debug!("Always");
-                } else if cvm_condition_code == 0x01 {
-                    debug!("If unattended cash");
-                } else if cvm_condition_code == 0x02 {
-                    debug!("If not unattended cash and not manual cash and not purchase with cashback");
-                } else if cvm_condition_code == 0x03 {
-                    debug!("If terminal supports the CVM");
-                } else if cvm_condition_code == 0x04 {
-                    debug!("If manual cash");
-                } else if cvm_condition_code == 0x05 {
-                    debug!("If purchase with cashback");
-                } else if cvm_condition_code == 0x06 {
-                    debug!("If transaction is in the application currency and is under {:02X?} value", amount1);
-                } else if cvm_condition_code == 0x07 {
-                    debug!("If transaction is in the application currency and is over {:02X?} value", amount1);
-                } else if cvm_condition_code == 0x08 {
-                    debug!("If transaction is in the application currency and is under {:02X?} value", amount2);
-                } else if cvm_condition_code == 0x09 {
-                    debug!("If transaction is in the application currency and is over {:02X?} value", amount2);
-                } else {
-                    warn!("Unknown CVM condition code! {:02X?}", cvm_condition_code);
-                }
-
+                let rule = CvmRule { amount_x : amount_x, amount_y : amount_y, fail_if_unsuccessful : fail_if_unsuccessful, code : code, condition : condition };
+                self.icc.cvm_rules.push(rule);
             }
         }
-        if get_bit!(auc_b1, 3) {
-            debug!("Terminal risk management is to be performed");
-        }
-        if get_bit!(auc_b1, 2) {
-            // Issuer Authentication using the EXTERNAL AUTHENTICATE command is supported
-            debug!("Issuer authentication is supported");
-        }
+        self.icc.capabilities.terminal_risk_management = get_bit!(auc_b1, 3);
+        // Issuer Authentication using the EXTERNAL AUTHENTICATE command is supported
+        self.icc.capabilities.issuer_authentication = get_bit!(auc_b1, 2);
         // bit 1 = RFU
-        if get_bit!(auc_b1, 0) {
-            debug!("CDA supported");
-        }
+        self.icc.capabilities.cda = get_bit!(auc_b1, 0);
 
         let tag_9f07_application_usage_control = self.get_tag_value("9F07").unwrap();
         let auc_b1 : u8 = tag_9f07_application_usage_control[0];
         let auc_b2 : u8 = tag_9f07_application_usage_control[1];
-        if get_bit!(auc_b1, 7) {
-            debug!("Valid for domestic cash transactions");
-        }
-        if get_bit!(auc_b1, 6) {
-            debug!("Valid for international cash transactions");
-        }
-        if get_bit!(auc_b1, 5) {
-            debug!("Valid for domestic goods");
-        }
-        if get_bit!(auc_b1, 4) {
-            debug!("Valid for international goods");
-        }
-        if get_bit!(auc_b1, 3) {
-            debug!("Valid for domestic services");
-        }
-        if get_bit!(auc_b1, 2) {
-            debug!("Valid for international services");
-        }
-        if get_bit!(auc_b1, 1) {
-            debug!("Valid at ATMs");
-        }
-        if get_bit!(auc_b1, 0) {
-            debug!("Valid at terminals other than ATMs");
-        }
-        if get_bit!(auc_b2, 7) {
-            debug!("Domestic cashback allowed");
-        }
-        if get_bit!(auc_b2, 6) {
-            debug!("International cashback allowed");
-        }
+        self.icc.usage.domestic_cash_transactions = get_bit!(auc_b1, 7);
+        self.icc.usage.international_cash_transactions = get_bit!(auc_b1, 6);
+        self.icc.usage.domestic_goods = get_bit!(auc_b1, 5);
+        self.icc.usage.international_goods = get_bit!(auc_b1, 4);
+        self.icc.usage.domestic_services = get_bit!(auc_b1, 3);
+        self.icc.usage.international_services = get_bit!(auc_b1, 2);
+        self.icc.usage.atms = get_bit!(auc_b1, 1);
+        self.icc.usage.terminals_other_than_atms = get_bit!(auc_b1, 0);
+        self.icc.usage.domestic_cashback = get_bit!(auc_b2, 7);
+        self.icc.usage.international_cashback = get_bit!(auc_b2, 6);
+
+        debug!("{:?}", self.icc);
+
         // 5 - 0 bits are RFU
 
         Ok(data_authentication)
@@ -484,15 +756,21 @@ impl EmvConnection {
         Ok(())
     }
 
+    fn fill_random(&self, data : &mut [u8]) {
+        if self.settings.terminal.use_random {
+            let mut rng = ChaCha20Rng::from_entropy();
+            rng.try_fill(data).unwrap();
+        }
+    }
+
     fn handle_verify_enciphered_pin(&mut self, ascii_pin : &[u8], icc_pin_pk_modulus : &[u8], icc_pin_pk_exponent : &[u8]) -> Result<(), ()> {
         debug!("Verify enciphered PIN:");
 
         let pin_bcd_cn = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
 
-        let mut rng = ChaCha20Rng::from_entropy();
         const PK_MAX_SIZE : usize = 248; // ref. EMV Book 2, B2.1 RSA Algorithm
         let mut random_padding = [0u8; PK_MAX_SIZE];
-        rng.try_fill(&mut random_padding[..]).unwrap();
+        self.fill_random(&mut random_padding[..]);
 
         let icc_unpredictable_number = self.handle_get_challenge().unwrap();
 
@@ -506,7 +784,7 @@ impl EmvConnection {
         plaintext_data.push(0xFF);
         // ICC Unpredictable Number
         plaintext_data.extend_from_slice(&icc_unpredictable_number[..]);
-        // Random pagging Nic - 17 (FIXME)
+        // Random padding
         plaintext_data.extend_from_slice(&random_padding[0..icc_pin_pk_modulus.len()-17]);
 
         let icc_pin_pk = RsaPublicKey::new(icc_pin_pk_modulus, icc_pin_pk_exponent);
@@ -533,13 +811,9 @@ impl EmvConnection {
     fn handle_generate_ac(&mut self) -> Result<(), ()> {
         debug!("Generate Application Cryptogram (GENERATE AC):");
 
-        self.add_tag("95", b"\x00\x00\x00\x00\x00".to_vec());
-        // EMV Book 4, A4 CVM Results
-        //b1: CVM code
-        //b2: CVM condition code
-        //b3: unknown/failed/success
-        self.add_tag("9F34", b"\x41\x03\x02".to_vec()); // "unencrypted PIN successful"
-
+        let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
+        self.add_tag("95", tag_95_tvr);
+        debug!("{:?}", self.settings.terminal.tvr);
 
         let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
@@ -700,9 +974,9 @@ impl EmvConnection {
         }
 
         if !self.get_tag_value("9F37").is_some() {
-            let mut rng = ChaCha20Rng::from_entropy();
             let mut tag_9f37_unpredictable_number = [0u8; 4];
-            rng.try_fill(&mut tag_9f37_unpredictable_number[..])?;
+            self.fill_random(&mut tag_9f37_unpredictable_number[..]);
+
             self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
         }
 
@@ -807,12 +1081,22 @@ impl EmvConnection {
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
 
-        assert_eq!(cert_checksum, issuer_certificate_checksum);
+        if &cert_checksum[..] != &issuer_certificate_checksum[..] {
+            warn!("Issuer cert checksum mismatch!");
+            warn!("Calculated checksum\n{}", HexViewBuilder::new(&cert_checksum[..]).finish());
+            warn!("Issuer provided checksum\n{}", HexViewBuilder::new(&issuer_certificate_checksum[..]).finish());
+
+            return Err(());
+        }
 
         let tag_5a_pan = self.get_tag_value("5A").unwrap();
         let ascii_pan = bcd_to_ascii(&tag_5a_pan[..]).unwrap();
         let ascii_iin = bcd_to_ascii(&issuer_certificate_iin).unwrap();
-        assert_eq!(ascii_iin, &ascii_pan[0..ascii_iin.len()]);
+        if ascii_iin != &ascii_pan[0..ascii_iin.len()] {
+            warn!("IIN mismatch! Cert IIN: {:02X?}, PAN IIN: {:02X?}", ascii_iin, &ascii_pan[0..ascii_iin.len()]);
+
+            return Err(());
+        }
 
         is_certificate_expired(&issuer_certificate_expiry[..]);
 
@@ -843,12 +1127,21 @@ impl EmvConnection {
 
         let icc_certificate_pan = &icc_certificate[2..12];
         let icc_certificate_expiry = &icc_certificate[12..14];
-        //let icc_certificate_serial = &icc_certificate[14..17];
+        let icc_certificate_serial = &icc_certificate[14..17];
         let icc_certificate_hash_algo = &icc_certificate[17..18];
         let icc_certificate_pk_algo = &icc_certificate[18..19];
-        //let icc_certificate_pk_length = &icc_certificate[19..20];
-        //let icc_certificate_pk_exp_length = &icc_certificate[20..21];
+        let icc_certificate_pk_length = &icc_certificate[19..20];
+        let icc_certificate_pk_exp_length = &icc_certificate[20..21];
         let icc_certificate_pk_leftmost_digits = &icc_certificate[21..checksum_position];
+
+        debug!("ICC PAN:{:02X?}", icc_certificate_pan);
+        debug!("ICC expiry:{:02X?}", icc_certificate_expiry);
+        debug!("ICC serial:{:02X?}", icc_certificate_serial);
+        debug!("ICC hash algo:{:02X?}", icc_certificate_hash_algo);
+        debug!("ICC pk algo:{:02X?}", icc_certificate_pk_algo);
+        debug!("ICC pk length:{:02X?}", icc_certificate_pk_length);
+        debug!("ICC pk exp length:{:02X?}", icc_certificate_pk_exp_length);
+        debug!("ICC pk leftmost digits:{:02X?}", icc_certificate_pk_leftmost_digits);
 
         assert_eq!(icc_certificate_hash_algo[0], 0x01); // SHA-1
         assert_eq!(icc_certificate_pk_algo[0], 0x01); // RSA as defined in EMV Book 2, B2.1 RSA Algorihm
@@ -883,10 +1176,13 @@ impl EmvConnection {
         let tag_5a_pan = self.get_tag_value("5A").unwrap();
         let ascii_pan = bcd_to_ascii(&tag_5a_pan[..]).unwrap();
         let icc_ascii_pan = bcd_to_ascii(&icc_certificate_pan).unwrap();
-        assert_eq!(icc_ascii_pan, ascii_pan);
+        if icc_ascii_pan != ascii_pan {
+            warn!("PAN mismatch! Cert PAN: {:02X?}, PAN: {:02X?}", icc_ascii_pan, ascii_pan);
+
+            return Err(());
+        }
 
         is_certificate_expired(&icc_certificate_expiry[..]);
-
 
         let mut icc_pk_modulus : Vec<u8> = Vec::new();
         
@@ -967,7 +1263,13 @@ impl EmvConnection {
 
         let tag_9f4b_signed_data_decrypted_checksum = &tag_9f4b_signed_data_decrypted[checksum_position..checksum_position+20];
 
-        assert_eq!(signed_data_checksum, tag_9f4b_signed_data_decrypted_checksum);
+        if &signed_data_checksum[..] != &tag_9f4b_signed_data_decrypted_checksum[..] {
+            warn!("Signed data checksum mismatch!");
+            warn!("Calculated checksum\n{}", HexViewBuilder::new(&signed_data_checksum[..]).finish());
+            warn!("Signed data checksum\n{}", HexViewBuilder::new(&tag_9f4b_signed_data_decrypted_checksum[..]).finish());
+
+            return Err(());
+        }
 
         Ok(())
     }
@@ -1385,9 +1687,6 @@ fn run() -> Result<Option<String>, String> {
         connection.add_tag("9F02", ascii_to_bcd_n(purchase_amount.unwrap().as_bytes(), 6).unwrap());
     }
 
-    let search_tag = b"\x9f\x36";
-    connection.handle_get_data(&search_tag[..]).unwrap(); // TODO: just testing, this not needed
-
     let data_authentication = connection.handle_get_processing_options().unwrap();
 
     let (issuer_pk_modulus, issuer_pk_exponent) = connection.get_issuer_public_key(application).unwrap();
@@ -1400,46 +1699,154 @@ fn run() -> Result<Option<String>, String> {
         &issuer_pk_modulus[..], &issuer_pk_exponent[..],
         &data_authentication[..]).unwrap();
 
-    connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]).unwrap();
-
-    let mut ascii_pin : Option<&str> = None;
-
-    if matches.is_present("pin") {
-        ascii_pin = matches.value_of("pin");
+    if connection.settings.terminal.capabilities.dda && connection.icc.capabilities.dda {
+        if let Err(_) = connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]) {
+            connection.settings.terminal.tvr.dda_failed = true;
+        }
     }
 
-    let mut stdin_buffer = String::new();
-    if interactive {
-        println!("Enter PIN:");
-        print!("> ");
+    let purchase_amount = str::from_utf8(&bcd_to_ascii(&connection.get_tag_value("9F02").unwrap()[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
 
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
+    let cvm_rules = connection.icc.cvm_rules.clone();
+    for rule in cvm_rules {
+        let mut skip_if_not_supported = false;
+        let mut success = false;
 
-        ascii_pin = Some(&stdin_buffer.trim());
-    }
-
-    if ascii_pin.is_some() {
-        //connection.handle_verify_plaintext_pin(ascii_pin.unwrap().as_bytes()).unwrap();
-
-        let mut icc_pin_pk_modulus = icc_pk_modulus;
-        let mut icc_pin_pk_exponent = icc_pk_exponent;
-
-        let tag_9f2d_icc_pin_pk_certificate = connection.get_tag_value("9F2D");
-        let tag_9f2e_icc_pin_pk_exponent = connection.get_tag_value("9F2E");
-        if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
-            let tag_9f2f_icc_pin_pk_remainder = connection.get_tag_value("9F2F");
-
-            // ICC has a separate ICC PIN Encipherement public key
-            let (icc_pin_pk_modulus2, icc_pin_pk_exponent2) = connection.get_icc_public_key(
-                tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
-                &issuer_pk_modulus[..], &issuer_pk_exponent[..],
-                &data_authentication[..]).unwrap();
-
-            icc_pin_pk_modulus = icc_pin_pk_modulus2;
-            icc_pin_pk_exponent = icc_pin_pk_exponent2;
+        match rule.condition {
+            CvmConditionCode::UnattendedCash | CvmConditionCode::ManualCash | CvmConditionCode::PurchaseWithCashback => {
+                // TODO: conditions currently never supported, maybe should implement it more flexible
+                continue;
+            },
+            CvmConditionCode::CvmSupported => {
+                skip_if_not_supported = true;
+            }
+            // TODO: verify that ICC and terminal currencies are the same or provide conversion
+            CvmConditionCode::IccCurrencyUnderX => {
+                if purchase_amount >= rule.amount_x {
+                    continue;
+                }
+            },
+            CvmConditionCode::IccCurrencyOverX => {
+                if purchase_amount <= rule.amount_x {
+                    continue;
+                }
+            }
+            CvmConditionCode::IccCurrencyUnderY => {
+                if purchase_amount >= rule.amount_y {
+                    continue;
+                }
+            },
+            CvmConditionCode::IccCurrencyOverY => {
+                if purchase_amount <= rule.amount_y {
+                    continue;
+                }
+            },
+            _ => ()
         }
 
-        connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]).unwrap();
+        match rule.code {
+            CvmCode::FailCvmProcessing => success = false,
+            CvmCode::EncipheredPinOnline => {
+                debug!("Enciphered PIN online is not supported");
+
+                if skip_if_not_supported {
+                    continue;
+                }
+
+                success = false;
+            },
+            CvmCode::PlaintextPin | CvmCode::PlaintextPinAndSignature | CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => {
+                let enciphered_pin = match rule.code {
+                    CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => true,
+                    _ => false
+                };
+
+                let mut ascii_pin : Option<&str> = None;
+
+                if matches.is_present("pin") {
+                    ascii_pin = matches.value_of("pin");
+                }
+
+                let mut stdin_buffer = String::new();
+                if interactive {
+                    println!("Enter PIN:");
+                    print!("> ");
+
+                    io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+                    ascii_pin = Some(&stdin_buffer.trim());
+                }
+
+                if ascii_pin.is_some() {
+                    if enciphered_pin && connection.settings.terminal.capabilities.enciphered_pin {
+                        let mut icc_pin_pk_modulus = icc_pk_modulus.clone();
+                        let mut icc_pin_pk_exponent = icc_pk_exponent.clone();
+
+                        let tag_9f2d_icc_pin_pk_certificate = connection.get_tag_value("9F2D");
+                        let tag_9f2e_icc_pin_pk_exponent = connection.get_tag_value("9F2E");
+                        if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
+                            let tag_9f2f_icc_pin_pk_remainder = connection.get_tag_value("9F2F");
+
+                            // ICC has a separate ICC PIN Encipherement public key
+                            match connection.get_icc_public_key(
+                                tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
+                                &issuer_pk_modulus[..], &issuer_pk_exponent[..],
+                                &data_authentication[..]) {
+                                Ok((modulus, exponent)) => {
+                                    icc_pin_pk_modulus = modulus;
+                                    icc_pin_pk_exponent = exponent;
+
+                                    success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]) {
+                                        Ok(_) => true,
+                                        Err(_) => false
+                                    };
+                                },
+                                Err(_) => {
+                                    success = false;
+                                }
+                            };
+
+                        } else {
+                            success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]) {
+                                Ok(_) => true,
+                                Err(_) => false
+                            };
+                        }
+
+                    } else if connection.settings.terminal.capabilities.plaintext_pin {
+                        success = match connection.handle_verify_plaintext_pin(ascii_pin.unwrap().as_bytes()) {
+                            Ok(_) => true,
+                            Err(_) => false
+                        };
+                    } else if skip_if_not_supported {
+                        continue;
+                    }
+                }
+            },
+            CvmCode::Signature | CvmCode::NoCvm => {
+                success = true;
+            }
+        }
+
+        if success {
+            connection.settings.terminal.tvr.cardholder_verification_was_not_successful = false;
+            connection.add_tag("9F34", CvmRule::into_9f34_value(Ok(rule)));
+            break;
+        } else {
+            connection.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
+            connection.add_tag("9F34", CvmRule::into_9f34_value(Err(rule)));
+
+            if ! skip_if_not_supported {
+                break;
+            }
+        }
+    }
+
+    if ! connection.get_tag_value("9F34").is_some() {
+        connection.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
+
+        // "no CVM performed"
+        connection.add_tag("9F34", b"\x3F\x00\x01".to_vec());
     }
 
     connection.handle_generate_ac().unwrap();
@@ -1459,4 +1866,136 @@ fn main() {
             1
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize, Clone)]
+    struct ApduRequestResponse {
+        req : String,
+        res : String
+    }
+
+    impl ApduRequestResponse {
+        fn to_raw_vec(s : &String) -> Vec<u8> {
+            hex::decode(s.replace(" ", "")).unwrap()
+        }
+    }
+
+    fn find_dummy_apdu<'a>(test_data : &'a Vec<ApduRequestResponse>, apdu : &[u8]) -> Option<&'a ApduRequestResponse> {
+        for data in test_data {
+            if &apdu[..] == &ApduRequestResponse::to_raw_vec(&data.req)[..] {
+                return Some(data);
+            }
+        }
+
+        None
+    }
+
+    fn dummy_card_apdu_interface(apdu : &[u8]) -> Result<Vec<u8>, ()> {
+        let mut output : Vec<u8> = Vec::new();
+
+        let mut response = b"\x6A\x82".to_vec(); // file not found error
+
+        let test_data : Vec<ApduRequestResponse> = serde_yaml::from_str(&fs::read_to_string("test_data.yaml").unwrap()).unwrap();
+
+        if let Some(req) = find_dummy_apdu(&test_data, &apdu[..]) {
+            response = ApduRequestResponse::to_raw_vec(&req.res);
+        }
+
+        output.extend_from_slice(&response[..]);
+        Ok(output)
+    }
+
+    #[test]
+    fn test_rsa_key() -> Result<(), String> {
+        //log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+
+        const KEY_SIZE : u32 = 1408;
+        const KEY_BYTE_SIZE : usize = KEY_SIZE as usize / 8;
+
+        // openssl key generation:
+        // openssl genrsa -out icc_1234560012345608_e_3_private_key.pem -3 1024
+        // openssl genrsa -out iin_313233343536_e_3_private_key.pem -3 1408
+        // openssl genrsa -out AFFFFFFFFF_92_ca_private_key.pem -3 1408
+        // openssl rsa -in AFFFFFFFFF_92_ca_private_key.pem -outform PEM -pubout -out AFFFFFFFFF_92_ca_key.pem
+
+        let rsa = Rsa::private_key_from_pem(&fs::read_to_string("AFFFFFFFFF_92_ca_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("iin_313233343536_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("icc_1234560012345608_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        
+        let public_key_modulus  = &rsa.n().to_vec()[..];
+        let public_key_exponent = &rsa.e().to_vec()[..];
+
+        let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent);
+        debug!("modulus: {:02X?}, exponent: {:02X?}", public_key_modulus, public_key_exponent);
+
+        let mut encrypt_output = [0u8; KEY_BYTE_SIZE];
+        let mut plaintext_data = [0u8; KEY_BYTE_SIZE];
+        plaintext_data[0] = 0x6A;
+        plaintext_data[1] = 0xFF;
+        plaintext_data[KEY_BYTE_SIZE-1] = 0xBC;
+
+        let encrypt_size = rsa.private_encrypt(&plaintext_data[..], &mut encrypt_output[..], Padding::NONE).unwrap();
+
+        debug!("Encrypt result ({} bytes):\n{}", encrypt_output.len(), HexViewBuilder::new(&encrypt_output[..]).finish());
+
+        let decrypted_data = pk.public_decrypt(&encrypt_output[0..encrypt_size]).unwrap();
+
+        assert_eq!(&plaintext_data[..], &decrypted_data[..]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_purchase_transaction() -> Result<(), String> {
+        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+
+        let mut connection = EmvConnection::new().unwrap();
+        connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
+
+        let applications = connection.handle_select_payment_system_environment().unwrap();
+
+        let application = &applications[0];
+        connection.handle_select_payment_application(application).unwrap();
+
+        connection.process_settings().unwrap();
+
+        // force unpreditable number
+        connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
+        connection.settings.terminal.use_random = false;
+
+        let search_tag = b"\x9f\x36";
+        connection.handle_get_data(&search_tag[..]).unwrap();
+
+        let data_authentication = connection.handle_get_processing_options().unwrap();
+
+        let (issuer_pk_modulus, issuer_pk_exponent) = connection.get_issuer_public_key(application).unwrap();
+
+        let tag_9f46_icc_pk_certificate = connection.get_tag_value("9F46").unwrap();
+        let tag_9f47_icc_pk_exponent = connection.get_tag_value("9F47").unwrap();
+        let tag_9f48_icc_pk_remainder = connection.get_tag_value("9F48");
+        let (icc_pk_modulus, icc_pk_exponent) = connection.get_icc_public_key(
+            tag_9f46_icc_pk_certificate, tag_9f47_icc_pk_exponent, tag_9f48_icc_pk_remainder,
+            &issuer_pk_modulus[..], &issuer_pk_exponent[..],
+            &data_authentication[..]).unwrap();
+
+        connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]).unwrap();
+
+        let ascii_pin = "1234".to_string();
+        connection.handle_verify_plaintext_pin(ascii_pin.as_bytes()).unwrap();
+
+        let icc_pin_pk_modulus = icc_pk_modulus.clone();
+        let icc_pin_pk_exponent = icc_pk_exponent.clone();
+        connection.handle_verify_enciphered_pin(ascii_pin.as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]).unwrap();
+
+        // enciphered PIN OK
+        connection.add_tag("9F34", b"\x44\x03\x02".to_vec());
+
+        connection.handle_generate_ac().unwrap();
+
+       Ok(())
+    }
 }

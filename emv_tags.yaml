@@ -178,6 +178,9 @@
 '9F4C':
   tag: '9F4C'
   name: 'ICC Dynamic Number'
+'9F33':
+  tag: '9F33'
+  name: 'Terminal Capabilities'
 '9F34':
   tag: '9F34'
   name: 'Cardholder Verification Method (CVM) Results'
