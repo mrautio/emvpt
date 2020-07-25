@@ -1963,6 +1963,9 @@ mod tests {
 
         connection.process_settings().unwrap();
 
+        // force transaction date as 24.07.2020
+        connection.add_tag("9A", b"\x20\x07\x24".to_vec());
+
         // force unpreditable number
         connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
         connection.settings.terminal.use_random = false;
