@@ -403,6 +403,17 @@ impl EmvConnection<'_> {
         Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings, icc : Icc::new(), interface : None } )
     }
 
+    fn print_tags(&self) {
+        let mut i = 0;
+        for (key, value) in &self.tags {
+            i += 1;
+            let emv_tag = self.emv_tags.get(key);
+            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string() }).name);
+            info!("value: {:02X?} = {}", value, String::from_utf8_lossy(&value).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+        }
+
+    }
+
     fn connect_to_card(&mut self) -> Result<(), ReaderError> {
         if !self.ctx.is_some() {
             self.ctx = match Context::establish(Scope::User) {
@@ -1349,7 +1360,7 @@ struct EmvApplication {
     priority : Vec<u8>
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct EmvTag {
     tag: String,
     name: String
@@ -1609,6 +1620,9 @@ fn run() -> Result<Option<String>, String> {
         .arg(Arg::with_name("interactive")
             .long("interactive")
             .help("Simulate payment terminal purchase sequence"))
+        .arg(Arg::with_name("print-tags")
+            .long("print-tags")
+            .help("Print all read or generated tags"))
         .arg(Arg::with_name("pin")
             .short("p")
             .long("pin")
@@ -1618,6 +1632,7 @@ fn run() -> Result<Option<String>, String> {
         .get_matches();
 
     let interactive = matches.is_present("interactive");
+    let print_tags = matches.is_present("print-tags");
 
     let mut connection = EmvConnection::new().unwrap();
 
@@ -1677,6 +1692,10 @@ fn run() -> Result<Option<String>, String> {
         io::stdin().read_line(&mut stdin_buffer).unwrap();
 
         application_number = stdin_buffer.trim().parse::<usize>().unwrap() - 1;
+    }
+
+    if print_tags {
+        connection.print_tags();
     }
 
     let application = &applications[application_number];
@@ -1851,6 +1870,10 @@ fn run() -> Result<Option<String>, String> {
 
     connection.handle_generate_ac().unwrap();
 
+    if print_tags {
+        connection.print_tags();
+    }
+
     Ok(None)
 }
 
@@ -1871,6 +1894,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::{LevelFilter};
+    use log4rs::{
+        append::console::ConsoleAppender,
+        config::{Appender, Root}
+    };
 
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
@@ -1907,6 +1935,15 @@ mod tests {
 
         output.extend_from_slice(&response[..]);
         Ok(output)
+    }
+
+    fn init_logging() {
+        let stdout: ConsoleAppender = ConsoleAppender::builder().build();
+        let config = log4rs::config::Config::builder()
+            .appender(Appender::builder().build("stdout", Box::new(stdout)))
+            .build(Root::builder().appender("stdout").build(LevelFilter::Trace))
+            .unwrap();
+        log4rs::init_config(config).unwrap();
     }
 
     #[test]
@@ -1951,7 +1988,8 @@ mod tests {
 
     #[test]
     fn test_purchase_transaction() -> Result<(), String> {
-        log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        //log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        init_logging();
 
         let mut connection = EmvConnection::new().unwrap();
         connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
