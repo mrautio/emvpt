@@ -18,7 +18,6 @@ serde = { version = "1.0.114", features = ["derive"] }
 serde_yaml = "0.8.13"
 log = "0.4.8"
 log4rs = "0.12.0"
-clap = "2.33.1"
 rand_chacha = "0.2.2"
 rand = "0.7.3"
 # NOTE: mingw pre built binaries here: https://bintray.com/vszakats/generic/openssl
