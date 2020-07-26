@@ -6,6 +6,7 @@ use std::{thread, time};
 use std::str;
 
 use emvpt::*;
+use emvpt::bcdutil::*;
 
 fn run() -> Result<Option<String>, String> {
     log4rs::init_file("../config/log4rs.yaml", Default::default()).unwrap();

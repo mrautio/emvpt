@@ -18,6 +18,8 @@ use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Datelike, Utc};
 
+pub mod bcdutil;
+
 type ApduInterfaceCustomFunction = fn(&[u8]) -> Result<Vec<u8>, ()>;
 
 pub enum ApduInterface<'a> {
@@ -691,8 +693,8 @@ impl EmvConnection<'_> {
             let tag_8e_cvm_list = self.get_tag_value("8E").unwrap().clone();
             let amount1 = &tag_8e_cvm_list[0..4];
             let amount2 = &tag_8e_cvm_list[4..8];
-            let amount_x = str::from_utf8(&bcd_to_ascii(&amount1[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
-            let amount_y = str::from_utf8(&bcd_to_ascii(&amount2[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
+            let amount_x = str::from_utf8(&bcdutil::bcd_to_ascii(&amount1[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
+            let amount_y = str::from_utf8(&bcdutil::bcd_to_ascii(&amount2[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
 
             let tag_84_cvm_rules = &tag_8e_cvm_list[8..];
             assert_eq!(tag_84_cvm_rules.len() % 2, 0);
@@ -741,7 +743,7 @@ impl EmvConnection<'_> {
     pub fn handle_verify_plaintext_pin(&mut self, ascii_pin : &[u8]) -> Result<(), ()> {
         debug!("Verify plaintext PIN:");
 
-        let pin_bcd_cn = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
+        let pin_bcd_cn = bcdutil::ascii_to_bcd_cn(ascii_pin, 6).unwrap();
 
         let apdu_command_verify = b"\x00\x20\x00";
         let mut verify_command = apdu_command_verify.to_vec();
@@ -773,7 +775,7 @@ impl EmvConnection<'_> {
     pub fn handle_verify_enciphered_pin(&mut self, ascii_pin : &[u8], icc_pin_pk_modulus : &[u8], icc_pin_pk_exponent : &[u8]) -> Result<(), ()> {
         debug!("Verify enciphered PIN:");
 
-        let pin_bcd_cn = ascii_to_bcd_cn(ascii_pin, 6).unwrap();
+        let pin_bcd_cn = bcdutil::ascii_to_bcd_cn(ascii_pin, 6).unwrap();
 
         const PK_MAX_SIZE : usize = 248; // ref. EMV Book 2, B2.1 RSA Algorithm
         let mut random_padding = [0u8; PK_MAX_SIZE];
@@ -977,7 +979,7 @@ impl EmvConnection<'_> {
         if !self.get_tag_value("9A").is_some() {
             let today = Utc::today().naive_utc();
             let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
-            self.add_tag("9A", ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+            self.add_tag("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F37").is_some() {
@@ -1097,8 +1099,8 @@ impl EmvConnection<'_> {
         }
 
         let tag_5a_pan = self.get_tag_value("5A").unwrap();
-        let ascii_pan = bcd_to_ascii(&tag_5a_pan[..]).unwrap();
-        let ascii_iin = bcd_to_ascii(&issuer_certificate_iin).unwrap();
+        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..]).unwrap();
+        let ascii_iin = bcdutil::bcd_to_ascii(&issuer_certificate_iin).unwrap();
         if ascii_iin != &ascii_pan[0..ascii_iin.len()] {
             warn!("IIN mismatch! Cert IIN: {:02X?}, PAN IIN: {:02X?}", ascii_iin, &ascii_pan[0..ascii_iin.len()]);
 
@@ -1181,8 +1183,8 @@ impl EmvConnection<'_> {
         assert_eq!(cert_checksum, icc_certificate_checksum);
 
         let tag_5a_pan = self.get_tag_value("5A").unwrap();
-        let ascii_pan = bcd_to_ascii(&tag_5a_pan[..]).unwrap();
-        let icc_ascii_pan = bcd_to_ascii(&icc_certificate_pan).unwrap();
+        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..]).unwrap();
+        let icc_ascii_pan = bcdutil::bcd_to_ascii(&icc_certificate_pan).unwrap();
         if icc_ascii_pan != ascii_pan {
             warn!("PAN mismatch! Cert PAN: {:02X?}, PAN: {:02X?}", icc_ascii_pan, ascii_pan);
 
@@ -1472,112 +1474,6 @@ fn parse_tlv(raw_data : &[u8]) -> Option<Tlv> {
     };
 
     return tlv_data;
-}
-
-pub fn bcd_to_ascii(bcd_data : &[u8]) -> Result<Vec<u8>, ()> {
-    let mut ascii_output : Vec<u8> = Vec::with_capacity(bcd_data.len() * 2);
-
-    const ASCII_CHARACTER_0 : u8 = 0x30;
-
-    for i in 0..bcd_data.len() {
-        let byte = bcd_data[i];
-        let n2 = byte >> 4;
-        let n1 = byte & 0xF;
-
-        if byte == 0xFF {
-            break;
-        }
-        ascii_output.push(ASCII_CHARACTER_0 + n2);
-
-        if n1 != 0xF {
-            ascii_output.push(ASCII_CHARACTER_0 + n1);
-        } else if i != bcd_data.len() - 1 {
-            return Err(());
-        }
-
-        if n1 > 0x9 || n2 > 0x9 {
-            return Err(());
-        }
-    }
-
-    Ok(ascii_output)
-}
-
-//cn = 12 34 56 78 90 12 3F FF
-pub fn ascii_to_bcd_cn(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
-    let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
-
-    assert!(ascii_data.len() <= size * 2);
-
-    const ASCII_CHARACTER_0 : u8 = 0x30;
-
-    for i in (0..ascii_data.len()).step_by(2) {
-        let b1 = ascii_data[i] - ASCII_CHARACTER_0;
-        if b1 > 0x9 {
-            return Err(());
-        }
-
-        let mut b2 = 0xF;
-        if i + 1 < ascii_data.len() {
-            b2 = ascii_data[i + 1] - ASCII_CHARACTER_0;
-            if b2 > 0x9 {
-                return Err(());
-            }
-        }
-
-        let bcd_byte = b2 + (b1 << 4);
-
-        bcd_output.push(bcd_byte);
-    }
-
-    for _ in bcd_output.len()..size {
-        let bcd_byte = 0xFF;
-        bcd_output.push(bcd_byte);
-    }
-
-    assert_eq!(bcd_output.len(), size);
-
-    Ok(bcd_output)
-}
-
-//n = 00 00 00 01 23 45
-pub fn ascii_to_bcd_n(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
-    let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
-
-    assert!(ascii_data.len() <= size * 2);
-
-    const ASCII_CHARACTER_0 : u8 = 0x30;
-
-    let mut ascii_data_aligned : Vec<u8> = Vec::new();
-    if ascii_data.len() % 2 == 1 {
-        ascii_data_aligned.push(ASCII_CHARACTER_0);
-    }
-    ascii_data_aligned.extend_from_slice(&ascii_data[..]);
-
-    for _ in ascii_data_aligned.len()/2..size {
-        let bcd_byte = 0x00;
-        bcd_output.push(bcd_byte);
-    }
-
-    for i in (0..ascii_data_aligned.len()).step_by(2) {
-        let b1 = ascii_data_aligned[i] - ASCII_CHARACTER_0;
-        if b1 > 0x9 {
-            return Err(());
-        }
-
-        let b2 = ascii_data_aligned[i+1] - ASCII_CHARACTER_0;
-        if b2 > 0x9 {
-            return Err(());
-        }
-
-        let bcd_byte = b2 + (b1 << 4);
-
-        bcd_output.push(bcd_byte);
-    }
-
-    assert_eq!(bcd_output.len(), size);
-
-    Ok(bcd_output)
 }
 
 pub fn get_ca_public_key<'a>(ca_data : &'a HashMap<String, CertificateAuthority>, rid : &[u8], index : &[u8]) -> Option<&'a RsaPublicKey> {
