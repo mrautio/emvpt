@@ -590,37 +590,56 @@ impl EmvConnection<'_> {
 
     }
 
-    fn process_tlv(&mut self, buf: &[u8], level: u8) {
-        let tlv_data = parse_tlv(&buf);
-        if !tlv_data.is_some() {
-            return;
-        }
-        let tlv_data = tlv_data.unwrap();
+    pub fn process_tlv(&mut self, buf: &[u8], level: u8) {
+        let mut read_buffer = buf;
 
-        let tag_name = hex::encode(tlv_data.tag().to_bytes()).to_uppercase();
+        loop {
+            let (tlv_data, leftover_buffer) = Tlv::parse(read_buffer);
 
-        match self.emv_tags.get(tag_name.as_str()) {
-            Some(emv_tag) => {
-                EmvConnection::print_tag(&emv_tag, level);
-            },
-            _ => {
-                let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string() };
-                EmvConnection::print_tag(&unknown_tag, level);
-            }
-        }
+            let tlv_data : Tlv = match tlv_data {
+                Ok(tlv) => tlv,
+                Err(err) => {
+                    if leftover_buffer.len() > 0 {
+                        trace!("Could not parse as TLV! error:{:?}, data: {:02X?}", err, read_buffer);
+                    }
 
-        match tlv_data.value() {
-            Value::Constructed(v) => {
-                for tlv_tag in v {
-                    self.process_tlv(&tlv_tag.to_vec(), level + 1);
+                    break;
                 }
-            },
-            Value::Primitive(v) => {
-                self.add_tag(&tag_name, v.to_vec());
 
-                EmvConnection::print_tag_value(v, level);
+            };
+
+            read_buffer = leftover_buffer;
+
+
+            let tag_name = hex::encode(tlv_data.tag().to_bytes()).to_uppercase();
+
+            match self.emv_tags.get(tag_name.as_str()) {
+                Some(emv_tag) => {
+                    EmvConnection::print_tag(&emv_tag, level);
+                },
+                _ => {
+                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string() };
+                    EmvConnection::print_tag(&unknown_tag, level);
+                }
             }
-        };
+
+            match tlv_data.value() {
+                Value::Constructed(v) => {
+                    for tlv_tag in v {
+                        self.process_tlv(&tlv_tag.to_vec(), level + 1);
+                    }
+                },
+                Value::Primitive(v) => {
+                    self.add_tag(&tag_name, v.to_vec());
+
+                    EmvConnection::print_tag_value(v, level);
+                }
+            };
+
+            if leftover_buffer.len() == 0 {
+                break;
+            }
+        }
     }
 
     pub fn handle_get_processing_options(&mut self) -> Result<Vec<u8>, ()> {
@@ -1507,6 +1526,7 @@ mod tests {
     use super::*;
     use hexplay::HexViewBuilder;
     use std::str;
+    use std::sync::Once;
     use serde::{Deserialize, Serialize};
     use log4rs;
     use openssl::rsa::{Rsa, Padding};
@@ -1517,6 +1537,8 @@ mod tests {
         append::console::ConsoleAppender,
         config::{Appender, Root}
     };
+
+    static LOGGING: Once = Once::new();
 
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
@@ -1556,17 +1578,19 @@ mod tests {
     }
 
     fn init_logging() {
-        let stdout: ConsoleAppender = ConsoleAppender::builder().build();
-        let config = log4rs::config::Config::builder()
-            .appender(Appender::builder().build("stdout", Box::new(stdout)))
-            .build(Root::builder().appender("stdout").build(LevelFilter::Trace))
-            .unwrap();
-        log4rs::init_config(config).unwrap();
+        LOGGING.call_once(|| {
+            let stdout: ConsoleAppender = ConsoleAppender::builder().build();
+            let config = log4rs::config::Config::builder()
+                .appender(Appender::builder().build("stdout", Box::new(stdout)))
+                .build(Root::builder().appender("stdout").build(LevelFilter::Trace))
+                .unwrap();
+            log4rs::init_config(config).unwrap();
+        });
     }
 
     #[test]
     fn test_rsa_key() -> Result<(), String> {
-        //log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
+        init_logging();
 
         const KEY_SIZE : u32 = 1408;
         const KEY_BYTE_SIZE : usize = KEY_SIZE as usize / 8;
@@ -1578,14 +1602,15 @@ mod tests {
         // openssl rsa -in AFFFFFFFFF_92_ca_private_key.pem -outform PEM -pubout -out AFFFFFFFFF_92_ca_key.pem
 
         let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/AFFFFFFFFF_92_ca_private_key.pem").unwrap().as_bytes()).unwrap();
-        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("iin_313233343536_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
-        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("icc_1234560012345608_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/iin_313233343536_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/icc_1234560012345608_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
         
         let public_key_modulus  = &rsa.n().to_vec()[..];
         let public_key_exponent = &rsa.e().to_vec()[..];
+        let private_key_exponent = &rsa.d().to_vec()[..];
 
         let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent);
-        debug!("modulus: {:02X?}, exponent: {:02X?}", public_key_modulus, public_key_exponent);
+        debug!("modulus: {:02X?}, exponent: {:02X?}, private_exponent: {:02X?}", public_key_modulus, public_key_exponent, private_key_exponent);
 
         let mut encrypt_output = [0u8; KEY_BYTE_SIZE];
         let mut plaintext_data = [0u8; KEY_BYTE_SIZE];
@@ -1606,7 +1631,6 @@ mod tests {
 
     #[test]
     fn test_purchase_transaction() -> Result<(), String> {
-        //log4rs::init_file("log4rs.yaml", Default::default()).unwrap();
         init_logging();
 
         let mut connection = EmvConnection::new().unwrap();
@@ -1655,6 +1679,6 @@ mod tests {
 
         connection.handle_generate_ac().unwrap();
 
-       Ok(())
+        Ok(())
     }
 }
