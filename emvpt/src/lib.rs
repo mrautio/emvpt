@@ -500,7 +500,7 @@ impl EmvConnection<'_> {
         self.send_apdu(&select_command)
     }
 
-    fn send_apdu<'apdu>(&mut self, apdu : &'apdu [u8]) -> (Vec<u8>, Vec<u8>) {
+    pub fn send_apdu<'apdu>(&mut self, apdu : &'apdu [u8]) -> (Vec<u8>, Vec<u8>) {
 
         let mut response_data : Vec<u8> = Vec::new();
         let mut response_trailer : Vec<u8>;
@@ -661,7 +661,7 @@ impl EmvConnection<'_> {
 
         let tag_94_afl = self.get_tag_value("94").unwrap().clone();
 
-        debug!("Read card AFL information:");
+        debug!("Read card Application File Locator (AFL) information:");
 
         let mut data_authentication : Vec<u8> = Vec::new();
         assert_eq!(tag_94_afl.len() % 4, 0);
