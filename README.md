@@ -2,6 +2,14 @@
 
 Minimum Viable Payment Terminal
 
+## Building
+
+### Docker
+
+```
+docker build -t emvpt -f Dockerfile . && docker run --rm -t emvpt
+```
+
 ## References
 
 * http://www.fintrnmsgtool.com/iso-processing-code.html
