@@ -1,3 +1,5 @@
+![Build and test](https://github.com/mrautio/emvpt/workflows/Docker%20Image%20CI/badge.svg)
+
 # emvpt
 
 Minimum Viable Payment Terminal
