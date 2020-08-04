@@ -265,6 +265,12 @@ fn run() -> Result<Option<String>, String> {
         connection.add_tag("9F34", b"\x3F\x00\x01".to_vec());
     }
 
+    // TODO terminal risk management:
+    // ref. EMV Book 4, 6.3.5 Terminal Risk Management & EMV Book 3, 10.6 Terminal Risk Management
+
+    // TODO terminal action analysis:
+    // ref. EMV Book 4, 6.3.6 Terminal Action Analysis & EMV Book 3, 10.7 Terminal Action Analysis
+
     connection.handle_generate_ac().unwrap();
 
     if print_tags {

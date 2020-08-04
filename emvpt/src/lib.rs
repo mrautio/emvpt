@@ -53,6 +53,39 @@ macro_rules! set_bit {
 }
 
 #[repr(u8)]
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum CryptogramType {
+    // bits 6-7 are relevant
+    ApplicationAuthenticationCryptogram = 0b0000_0000, // AAC, transaction declined
+    AuthorisationRequestCryptogram = 0b1000_0000, // ARQC, online authorisation requested
+    TransactionCertificate = 0b0100_0000 // TC, transaction approved
+}
+
+impl From<CryptogramType> for u8 {
+    fn from(orig: CryptogramType) -> Self {
+        match orig {
+            CryptogramType::ApplicationAuthenticationCryptogram => 0b0000_0000,
+            CryptogramType::AuthorisationRequestCryptogram => 0b1000_0000,
+            CryptogramType::TransactionCertificate => 0b0100_0000
+        }
+    }
+}
+
+impl TryFrom<u8> for CryptogramType {
+    type Error = &'static str;
+
+    fn try_from(orig: u8) -> Result<Self, Self::Error> {
+        match orig >> 6 << 6 {
+            0b0000_0000 => Ok(CryptogramType::ApplicationAuthenticationCryptogram),
+            0b1000_0000 => Ok(CryptogramType::AuthorisationRequestCryptogram),
+            0b0100_0000 => Ok(CryptogramType::TransactionCertificate),
+            _ => Err("Unknown code!")
+        }
+    }
+}
+
+
+#[repr(u8)]
 #[derive(Debug, Copy, Clone)]
 pub enum CvmCode {
     FailCvmProcessing = 0b0000_0000,
@@ -262,7 +295,9 @@ impl Icc {
 pub struct Terminal {
     pub use_random : bool,
     pub capabilities : Capabilities,
-    pub tvr : TerminalVerificationResults
+    pub tvr : TerminalVerificationResults,
+    pub cryptogram_type : CryptogramType,
+    pub cryptogram_type_arqc : CryptogramType
 }
 
 // EMV Book 3, C5 Terminal Verification Results
@@ -377,7 +412,7 @@ pub struct Settings {
 }
 
 pub struct EmvConnection<'a> {
-    tags : HashMap<String, Vec<u8>>,
+    pub tags : HashMap<String, Vec<u8>>,
     ctx : Option<Context>,
     card : Option<Card>,
     pub interface : Option<ApduInterface<'a>>,
@@ -836,21 +871,21 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
-    pub fn handle_generate_ac(&mut self) -> Result<(), ()> {
-        debug!("Generate Application Cryptogram (GENERATE AC):");
+    // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
 
-        let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
-        self.add_tag("95", tag_95_tvr);
-        debug!("{:?}", self.settings.terminal.tvr);
-
-        let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
+    fn send_generate_ac(&mut self, requested_cryptogram_type : CryptogramType, cdol_tag : &str) -> Result<CryptogramType, ()> {
+        let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
 
-        let p1_tc_proceed_offline = 0b0100_0000;
+        let mut p1_reference_control_parameter : u8 = requested_cryptogram_type.into();
+        if self.icc.capabilities.cda {
+            // TODO: implement CDA
+            set_bit!(p1_reference_control_parameter, 4, self.settings.terminal.capabilities.cda);
+        }
 
         let apdu_command_generate_ac = b"\x80\xAE";
         let mut generate_ac_command = apdu_command_generate_ac.to_vec();
-        generate_ac_command.push(p1_tc_proceed_offline);
+        generate_ac_command.push(p1_reference_control_parameter);
         generate_ac_command.push(0x00);
         generate_ac_command.push(cdol_data.len() as u8);
         generate_ac_command.extend_from_slice(&cdol_data);
@@ -875,10 +910,61 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        //let tag_9f27_cryptogram_information_data = connection.get_tag_value("9F27").unwrap();
-        //let tag_9f36_application_transaction_counter = connection.get_tag_value("9F36").unwrap();
-        //let tag_9f26_application_cryptogram = connection.get_tag_value("9F26").unwrap();
-        //let tag_9f10_issuer_application_data = connection.get_tag_value("9F10");
+        if let CryptogramType::ApplicationAuthenticationCryptogram = requested_cryptogram_type {
+            warn!("Transaction declined by terminal (AAC)");
+            return Err(());
+        }
+
+        let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
+        let icc_cryptogram_type = CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
+
+        if let CryptogramType::ApplicationAuthenticationCryptogram = icc_cryptogram_type {
+            warn!("Transaction declined by ICC (AAC)");
+            return Err(());
+        }
+
+        Ok(icc_cryptogram_type)
+    }
+
+    pub fn handle_generate_ac(&mut self) -> Result<(), ()> {
+        debug!("Generate Application Cryptogram (GENERATE AC) - first issuance:");
+
+        let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
+        self.add_tag("95", tag_95_tvr);
+        debug!("{:?}", self.settings.terminal.tvr);
+
+        let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C").unwrap();
+
+        if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
+            //TODO: naturally this implementation shouldn't be here...
+
+            debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
+
+            // ref. EMV Book 4, A6 Authorisation Response Code
+            self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
+
+            let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
+            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26").unwrap();
+            let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
+
+            let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type_arqc, "8D").unwrap();
+
+            let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
+            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26").unwrap();
+            let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
+
+            if let CryptogramType::TransactionCertificate = icc_cryptogram_type  {
+                return Ok(());
+            } else {
+                warn!("Transaction has unexpected return type from ICC");
+                return Err(());
+            }
+
+        } else if let CryptogramType::AuthorisationRequestCryptogram = self.settings.terminal.cryptogram_type {
+            warn!("Transaction terminated by terminal - ARQC requested but got unexpected return type from ICC");
+            return Err(());
+        }
+
 
         Ok(())
     }
