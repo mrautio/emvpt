@@ -139,6 +139,9 @@
 '5F2A':
   tag: '5F2A'
   name: 'Transaction Currency Code'
+'93':
+  tag: '93'
+  name: 'Signed Static Application Data'
 '9A':
   tag: '9A'
   name: 'Transaction Date'
@@ -148,6 +151,9 @@
 '9F37':
   tag: '9F37'
   name: 'Unpredictable Number'
+'9F38':
+  tag: '9F38'
+  name: 'Processing Options Data Object List (PDOL)'
 '8A':
   tag: '8A'
   name: 'Authorisation Response Code'

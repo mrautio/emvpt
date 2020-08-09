@@ -1,9 +1,9 @@
 terminal:
   use_random: true
   capabilities:
-    sda: false
+    sda: true
     dda: true
-    cda: false
+    cda: true
     plaintext_pin: true
     enciphered_pin: true
     terminal_risk_management: true

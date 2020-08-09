@@ -258,7 +258,10 @@ pub struct UsageControl {
 pub struct Icc {
     pub capabilities : Capabilities,
     pub usage : UsageControl,
-    pub cvm_rules : Vec<CvmRule>
+    pub cvm_rules : Vec<CvmRule>,
+    pub issuer_pk : Option<RsaPublicKey>,
+    pub icc_pk : Option<RsaPublicKey>,
+    pub icc_pin_pk : Option<RsaPublicKey>
 }
 
 impl Icc {
@@ -286,7 +289,7 @@ impl Icc {
             international_cashback: false
         };
 
-        Icc { capabilities : capabilities, usage : usage, cvm_rules : Vec::new() }
+        Icc { capabilities : capabilities, usage : usage, cvm_rules : Vec::new(), issuer_pk : None, icc_pk : None, icc_pin_pk : None }
     }
 }
 
@@ -511,10 +514,6 @@ impl EmvConnection<'_> {
     }
 
     pub fn add_tag(&mut self, tag_name : &str, value : Vec<u8>) {
-        if tag_name == "80" {
-            return;
-        }
-
         let old_tag = self.tags.get(tag_name);
         if old_tag.is_some() {
             trace!("Overriding tag {:?} from {:02X?} to {:02X?}", tag_name, old_tag.unwrap(), value);
@@ -646,7 +645,7 @@ impl EmvConnection<'_> {
             read_buffer = leftover_buffer;
 
 
-            let tag_name = hex::encode(tlv_data.tag().to_bytes()).to_uppercase();
+            let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
 
             match self.emv_tags.get(tag_name.as_str()) {
                 Some(emv_tag) => {
@@ -678,7 +677,17 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_get_processing_options(&mut self) -> Result<Vec<u8>, ()> {
+        //ref. EMV Book 3, 6.5.8 GET PROCESSING OPTIONS Command-Response APDUs
+
         debug!("GET PROCESSING OPTIONS:");
+
+        let tag_9f38_pdol = self.get_tag_value("9F38");
+        if tag_9f38_pdol.is_some() {
+            // TODO FIXME
+            warn!("PDOL handling not done!");
+            return Err(());
+        }
+
         let get_processing_options_command = b"\x80\xA8\x00\x00\x02\x83\x00".to_vec();
         let (response_trailer, response_data) = self.send_apdu(&get_processing_options_command);
         if !is_success_response(&response_trailer) {
@@ -826,7 +835,7 @@ impl EmvConnection<'_> {
         }
     }
 
-    pub fn handle_verify_enciphered_pin(&mut self, ascii_pin : &[u8], icc_pin_pk_modulus : &[u8], icc_pin_pk_exponent : &[u8]) -> Result<(), ()> {
+    pub fn handle_verify_enciphered_pin(&mut self, ascii_pin : &[u8]) -> Result<(), ()> {
         debug!("Verify enciphered PIN:");
 
         let pin_bcd_cn = bcdutil::ascii_to_bcd_cn(ascii_pin, 6).unwrap();
@@ -848,10 +857,9 @@ impl EmvConnection<'_> {
         // ICC Unpredictable Number
         plaintext_data.extend_from_slice(&icc_unpredictable_number[..]);
         // Random padding
-        plaintext_data.extend_from_slice(&random_padding[0..icc_pin_pk_modulus.len()-17]);
+        plaintext_data.extend_from_slice(&random_padding[0..self.icc.icc_pin_pk.as_ref().unwrap().get_key_byte_size()-17]);
 
-        let icc_pin_pk = RsaPublicKey::new(icc_pin_pk_modulus, icc_pin_pk_exponent);
-        let ciphered_pin_data = icc_pin_pk.public_encrypt(&plaintext_data[..]).unwrap();
+        let ciphered_pin_data = self.icc.icc_pin_pk.as_ref().unwrap().public_encrypt(&plaintext_data[..]).unwrap();
 
         let apdu_command_verify = b"\x00\x20\x00";
         let mut verify_command = apdu_command_verify.to_vec();
@@ -871,8 +879,82 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
-    // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
+    fn handle_application_cryptogram_card_authentication(&mut self, tag_77_data : &[u8], cdol_tag : &str) -> Result<(),()> {
+        //ref. EMV Book 2, 6.6.2 Dynamic Signature Verification
 
+        debug!("Perform Application Cryptogram Data Authentication (CDA):");
+
+        let tag_9f37_unpredictable_number = self.get_tag_value("9F37").unwrap();
+
+        let tag_9f4b_signed_data_decrypted_dynamic_data = self.validate_signed_dynamic_application_data(&tag_9f37_unpredictable_number[..]).unwrap();
+        let mut i = 0;
+        let icc_dynamic_number_length = tag_9f4b_signed_data_decrypted_dynamic_data[i] as usize;
+        i += 1;
+        let _icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + icc_dynamic_number_length];
+        i += icc_dynamic_number_length;
+        let cryptogram_information_data = &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + 1];
+        i += 1;
+        let tag_9f26_application_cryptogram = &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + 8];
+        i += 8;
+        let transaction_data_hash_code = &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + 20];
+
+        let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
+
+        if &tag_9f27_cryptogram_information_data[..] != cryptogram_information_data {
+            warn!("Cryptogram information data mismatch in CDE! 9F27:{:02X?}, 9F4B.CID:{:02X?}", &tag_9f27_cryptogram_information_data[..], cryptogram_information_data);
+            return Err(());
+        }
+
+        let mut checksum_data : Vec<u8> = Vec::new();
+
+        let tag_9f38_pdol = self.get_tag_value("9F38");
+        if tag_9f38_pdol.is_some() {
+            let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol.unwrap()[..]).unwrap();
+            assert!(pdol_data.len() <= 0xFF);
+            checksum_data.extend_from_slice(&pdol_data);
+        }
+
+        let cdol1_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
+        assert!(cdol1_data.len() <= 0xFF);
+        checksum_data.extend_from_slice(&cdol1_data);
+
+        if cdol_tag == "8D" {
+            let cdol2_data = self.get_tag_list_tag_values(&self.get_tag_value("8D").unwrap()[..]).unwrap();
+            assert!(cdol2_data.len() <= 0xFF);
+            checksum_data.extend_from_slice(&cdol2_data);
+        }
+
+        let mut tag_77_hex_encoded = hex::encode_upper(tag_77_data);
+
+        let tag_9f4b_signed_dynamic_application_data_hex_encoded = hex::encode_upper(self.get_tag_value("9F4B").unwrap());
+
+        let tag_9f4b_tlv_header_length = 4 /* tag */ + 2 /* tag length */;
+        let tag_77_part1 : String = tag_77_hex_encoded.drain(..tag_77_hex_encoded.find(&tag_9f4b_signed_dynamic_application_data_hex_encoded).unwrap() - tag_9f4b_tlv_header_length).collect();
+        checksum_data.extend_from_slice(&hex::decode(&tag_77_part1).unwrap()[..]);
+
+        let tag_9f4b_whole_size = tag_9f4b_signed_dynamic_application_data_hex_encoded.len() + tag_9f4b_tlv_header_length;
+        if tag_77_hex_encoded.len() > tag_9f4b_whole_size {
+            let tag_77_part2 : String = tag_77_hex_encoded.drain(tag_9f4b_whole_size..).collect();
+            checksum_data.extend_from_slice(&hex::decode(&tag_77_part2).unwrap()[..]);
+        }
+
+        let transaction_data_hash_code_checksum = sha::sha1(&checksum_data[..]);
+
+        if &transaction_data_hash_code_checksum[..] != &transaction_data_hash_code[..] {
+            warn!("Transaction data hash code mismatch!");
+            warn!("Calculated transaction data\n{}", HexViewBuilder::new(&checksum_data[..]).finish());
+            warn!("Calculated transaction data hash code\n{}", HexViewBuilder::new(&transaction_data_hash_code_checksum[..]).finish());
+            warn!("Transaction data hash code\n{}", HexViewBuilder::new(transaction_data_hash_code).finish());
+
+            return Err(());
+        }
+
+        self.add_tag("9F26", tag_9f26_application_cryptogram.to_vec());
+
+        Ok(())
+    }
+
+    // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
     fn send_generate_ac(&mut self, requested_cryptogram_type : CryptogramType, cdol_tag : &str) -> Result<CryptogramType, ()> {
         let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
@@ -923,6 +1005,11 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
+        if get_bit!(p1_reference_control_parameter, 4) {
+            self.handle_application_cryptogram_card_authentication(&response_data[3..], cdol_tag)?;
+        }
+
+
         Ok(icc_cryptogram_type)
     }
 
@@ -940,17 +1027,14 @@ impl EmvConnection<'_> {
 
             debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
 
-            // ref. EMV Book 4, A6 Authorisation Response Code
-            self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
-
             let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
-            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26").unwrap();
+            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
             let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
-
+            
             let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type_arqc, "8D").unwrap();
 
             let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
-            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26").unwrap();
+            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
             let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
 
             if let CryptogramType::TransactionCertificate = icc_cryptogram_type  {
@@ -1094,6 +1178,11 @@ impl EmvConnection<'_> {
             self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
         }
 
+        if !self.get_tag_value("8A").is_some() {
+            // ref. EMV Book 4, A6 Authorisation Response Code
+            self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
+        }
+
         Ok(())
     }
 
@@ -1139,6 +1228,37 @@ impl EmvConnection<'_> {
         output.extend_from_slice(&response_data);
 
         Ok(output)
+    }
+
+    pub fn handle_public_keys(&mut self, application : &EmvApplication, data_authentication : &[u8]) -> Result<(), ()> {
+        let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application).unwrap();
+        self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..]));
+
+        let tag_9f46_icc_pk_certificate = self.get_tag_value("9F46");
+        let tag_9f47_icc_pk_exponent = self.get_tag_value("9F47");
+        if tag_9f46_icc_pk_certificate.is_some() && tag_9f47_icc_pk_exponent.is_some() {
+            let tag_9f48_icc_pk_remainder = self.get_tag_value("9F48");
+            let (icc_pk_modulus, icc_pk_exponent) = self.get_icc_public_key(
+                tag_9f46_icc_pk_certificate.unwrap(), tag_9f47_icc_pk_exponent.unwrap(), tag_9f48_icc_pk_remainder,
+                data_authentication).unwrap();
+            self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..]));
+            self.icc.icc_pin_pk = self.icc.icc_pk.clone();
+        }
+
+        let tag_9f2d_icc_pin_pk_certificate = self.get_tag_value("9F2D");
+        let tag_9f2e_icc_pin_pk_exponent = self.get_tag_value("9F2E");
+        if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
+            let tag_9f2f_icc_pin_pk_remainder = self.get_tag_value("9F2F");
+
+            // ICC has a separate ICC PIN Encipherement public key
+            let (icc_pin_pk_modulus, icc_pin_pk_exponent) = self.get_icc_public_key(
+                tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
+                data_authentication).unwrap();
+
+            self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]));
+        }
+
+        Ok(())
     }
 
     pub fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
@@ -1223,14 +1343,13 @@ impl EmvConnection<'_> {
     }
 
 
-    pub fn get_icc_public_key(&self, icc_pk_certificate : &Vec<u8>, icc_pk_exponent : &Vec<u8>, icc_pk_remainder : Option<&Vec<u8>>, issuer_pk_modulus : &[u8], issuer_pk_exponent : &[u8], data_authentication : &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    pub fn get_icc_public_key(&self, icc_pk_certificate : &Vec<u8>, icc_pk_exponent : &Vec<u8>, icc_pk_remainder : Option<&Vec<u8>>, data_authentication : &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
         // ICC public key retrieval: EMV Book 2, 6.4 Retrieval of ICC Public Key
         debug!("Retrieving ICC public key {:02X?}", &icc_pk_certificate[0..2]);
 
         let tag_9f46_icc_pk_certificate = icc_pk_certificate;
 
-        let issuer_pk = RsaPublicKey::new(issuer_pk_modulus, issuer_pk_exponent);
-        let icc_certificate = issuer_pk.public_decrypt(&tag_9f46_icc_pk_certificate[..]).unwrap();
+        let icc_certificate = self.icc.issuer_pk.as_ref().unwrap().public_decrypt(&tag_9f46_icc_pk_certificate[..]).unwrap();
         let icc_certificate_length = icc_certificate.len();
         if icc_certificate[1] != 0x04 {
             warn!("Incorrect ICC certificate type {:02X?}", icc_certificate[1]);
@@ -1314,7 +1433,93 @@ impl EmvConnection<'_> {
         Ok((icc_pk_modulus, tag_9f47_icc_pk_exponent.to_vec()))
     }
 
-    pub fn handle_dynamic_data_authentication(&mut self, icc_pk_modulus : &[u8], icc_pk_exponent : &[u8]) -> Result<(),()> {
+    pub fn validate_signed_dynamic_application_data(&self, auth_data : &[u8]) -> Result<Vec<u8>,()> {
+        let tag_9f4b_signed_data = self.get_tag_value("9F4B").unwrap();
+        trace!("9F4B signed data result moduluslength: ({} bytes):\n{}", tag_9f4b_signed_data.len(), HexViewBuilder::new(&tag_9f4b_signed_data[..]).finish());
+
+        if self.icc.icc_pk.is_none() {
+            warn!("ICC PK missing, can't validate");
+            return Err(());
+        }
+
+        let tag_9f4b_signed_data_decrypted = self.icc.icc_pk.as_ref().unwrap().public_decrypt(&tag_9f4b_signed_data[..]).unwrap();
+        let tag_9f4b_signed_data_decrypted_length = tag_9f4b_signed_data_decrypted.len();
+        if tag_9f4b_signed_data_decrypted[1] != 0x05 {
+            warn!("Unrecognized format");
+            return Err(());
+        }
+
+        let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
+        assert_eq!(tag_9f4b_signed_data_decrypted_hash_algo, 0x01);
+
+        let tag_9f4b_signed_data_decrypted_dynamic_data_length = tag_9f4b_signed_data_decrypted[3] as usize;
+        
+        let tag_9f4b_signed_data_decrypted_dynamic_data = &tag_9f4b_signed_data_decrypted[4..4+tag_9f4b_signed_data_decrypted_dynamic_data_length];
+
+        let checksum_position = tag_9f4b_signed_data_decrypted_length - 21;
+        let mut checksum_data : Vec<u8> = Vec::new();
+        checksum_data.extend_from_slice(&tag_9f4b_signed_data_decrypted[1..checksum_position]);
+        checksum_data.extend_from_slice(&auth_data[..]);
+
+        let signed_data_checksum = sha::sha1(&checksum_data[..]);
+
+        let tag_9f4b_signed_data_decrypted_checksum = &tag_9f4b_signed_data_decrypted[checksum_position..checksum_position+20];
+
+        if &signed_data_checksum[..] != &tag_9f4b_signed_data_decrypted_checksum[..] {
+            warn!("Signed data checksum mismatch!");
+            warn!("Calculated checksum\n{}", HexViewBuilder::new(&signed_data_checksum[..]).finish());
+            warn!("Signed data checksum\n{}", HexViewBuilder::new(&tag_9f4b_signed_data_decrypted_checksum[..]).finish());
+
+            return Err(());
+        }
+
+        Ok(tag_9f4b_signed_data_decrypted_dynamic_data.to_vec())
+    }
+
+    pub fn handle_signed_static_application_data(&mut self, data_authentication : &[u8]) -> Result<(),()> {
+        debug!("Validate Signed Static Application Data (SDA):");
+
+        if self.icc.issuer_pk.is_none() {
+            warn!("Issuer PK missing, can't perform SDA");
+            return Err(());
+        }
+
+        let tag_93_ssad = self.get_tag_value("93").unwrap();
+
+        if tag_93_ssad.len() != self.icc.issuer_pk.as_ref().unwrap().get_key_byte_size() {
+            warn!("SDA and issuer key mismatch");
+            return Err(());
+        }
+
+        let tag_93_ssad_decrypted = self.icc.issuer_pk.as_ref().unwrap().public_decrypt(&tag_93_ssad[..]).unwrap();
+
+        assert_eq!(tag_93_ssad_decrypted[1], 0x03);
+
+        let mut checksum_data : Vec<u8> = Vec::new();
+        checksum_data.extend_from_slice(&tag_93_ssad_decrypted[1 .. tag_93_ssad_decrypted.len() - 22]);
+        checksum_data.extend_from_slice(data_authentication);
+        let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&self.get_tag_value("9F4A").unwrap()[..]).unwrap();
+        checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
+
+        let ssad_checksum_calculated = sha::sha1(&checksum_data[..]);
+
+        let ssad_checksum = &tag_93_ssad_decrypted[tag_93_ssad_decrypted.len() - 22 .. tag_93_ssad_decrypted.len() - 1];
+
+        if &ssad_checksum_calculated[..] != ssad_checksum {
+            warn!("SDA verification mismatch!");
+            warn!("Checksum input\n{}", HexViewBuilder::new(&checksum_data[..]).finish());
+            warn!("Calculated checksum\n{}", HexViewBuilder::new(&ssad_checksum_calculated[..]).finish());
+            warn!("Stored checksum\n{}", HexViewBuilder::new(&ssad_checksum[..]).finish());
+
+            return Err(());
+        }
+
+        self.add_tag("9F45", tag_93_ssad_decrypted[3..5].to_vec());
+
+        Ok(())
+    }
+
+    pub fn handle_dynamic_data_authentication(&mut self) -> Result<(),()> {
         debug!("Perform Dynamic Data Authentication (DDA):");
 
         let ddol_default_value = b"\x9f\x37\x04".to_vec();
@@ -1348,42 +1553,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        let tag_9f4b_signed_data = self.get_tag_value("9F4B").unwrap();
-        trace!("9F4B signed data result moduluslength:{}, ({} bytes):\n{}", icc_pk_modulus.len(), tag_9f4b_signed_data.len(), HexViewBuilder::new(&tag_9f4b_signed_data[..]).finish());
+        let tag_9f4b_signed_data_decrypted_dynamic_data = self.validate_signed_dynamic_application_data(&auth_data[..]).unwrap();
 
-        let icc_pk = RsaPublicKey::new(icc_pk_modulus, icc_pk_exponent);
-        let tag_9f4b_signed_data_decrypted = icc_pk.public_decrypt(&tag_9f4b_signed_data[..]).unwrap();
-        let tag_9f4b_signed_data_decrypted_length = tag_9f4b_signed_data_decrypted.len();
-        if tag_9f4b_signed_data_decrypted[1] != 0x05 {
-            warn!("Unrecognized format");
-            return Err(());
-        }
-
-        let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
-        assert_eq!(tag_9f4b_signed_data_decrypted_hash_algo, 0x01);
-
-        let tag_9f4b_signed_data_decrypted_dynamic_data_length = tag_9f4b_signed_data_decrypted[3] as usize;
-        
-        let tag_9f4b_signed_data_decrypted_dynamic_data = &tag_9f4b_signed_data_decrypted[4..4+tag_9f4b_signed_data_decrypted_dynamic_data_length];
         let tag_9f4c_icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[1..];
         self.add_tag("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
-
-        let checksum_position = tag_9f4b_signed_data_decrypted_length - 21;
-        let mut checksum_data : Vec<u8> = Vec::new();
-        checksum_data.extend_from_slice(&tag_9f4b_signed_data_decrypted[1..checksum_position]);
-        checksum_data.extend_from_slice(&auth_data[..]);
-
-        let signed_data_checksum = sha::sha1(&checksum_data[..]);
-
-        let tag_9f4b_signed_data_decrypted_checksum = &tag_9f4b_signed_data_decrypted[checksum_position..checksum_position+20];
-
-        if &signed_data_checksum[..] != &tag_9f4b_signed_data_decrypted_checksum[..] {
-            warn!("Signed data checksum mismatch!");
-            warn!("Calculated checksum\n{}", HexViewBuilder::new(&signed_data_checksum[..]).finish());
-            warn!("Signed data checksum\n{}", HexViewBuilder::new(&tag_9f4b_signed_data_decrypted_checksum[..]).finish());
-
-            return Err(());
-        }
 
         Ok(())
     }
@@ -1469,7 +1642,7 @@ pub struct EmvTag {
     pub name: String
 }
  
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RsaPublicKey {
     pub modulus: String,
     pub exponent: String
@@ -1478,6 +1651,10 @@ pub struct RsaPublicKey {
 impl RsaPublicKey {
     pub fn new(modulus : &[u8], exponent : &[u8]) -> RsaPublicKey {
         RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent) }
+    }
+
+    pub fn get_key_byte_size(&self) -> usize {
+        return self.modulus.len() / 2;
     }
 
     pub fn public_encrypt(&self, plaintext_data : &[u8]) -> Result<Vec<u8>, ()> {
@@ -1492,7 +1669,7 @@ impl RsaPublicKey {
         let length = match rsa.public_encrypt(plaintext_data, &mut encrypt_output[..], Padding::NONE) {
             Ok(length) => length,
             Err(_) => {
-                warn!("Could not decrypt data");
+                warn!("Could not encrypt data");
                 return Err(());
             }
         };
@@ -1586,7 +1763,10 @@ pub fn get_ca_public_key<'a>(ca_data : &'a HashMap<String, CertificateAuthority>
         Some(ca) => {
             match ca.certificates.get(&hex::encode_upper(&index)) {
                 Some(pk) => Some(pk),
-                _ => None
+                _ => {
+                    warn!("No CA key defined! rid:{:02X?}, index:{:02X?}", rid, index);
+                    return None
+                }
             }
         },
         _ => None
@@ -1741,24 +1921,18 @@ mod tests {
 
         let data_authentication = connection.handle_get_processing_options().unwrap();
 
-        let (issuer_pk_modulus, issuer_pk_exponent) = connection.get_issuer_public_key(application).unwrap();
+        connection.handle_public_keys(application, &data_authentication[..]).unwrap();
 
-        let tag_9f46_icc_pk_certificate = connection.get_tag_value("9F46").unwrap();
-        let tag_9f47_icc_pk_exponent = connection.get_tag_value("9F47").unwrap();
-        let tag_9f48_icc_pk_remainder = connection.get_tag_value("9F48");
-        let (icc_pk_modulus, icc_pk_exponent) = connection.get_icc_public_key(
-            tag_9f46_icc_pk_certificate, tag_9f47_icc_pk_exponent, tag_9f48_icc_pk_remainder,
-            &issuer_pk_modulus[..], &issuer_pk_exponent[..],
-            &data_authentication[..]).unwrap();
+        if connection.settings.terminal.capabilities.sda && connection.icc.capabilities.sda {
+            connection.handle_signed_static_application_data(&data_authentication[..]).unwrap();
+        }
 
-        connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]).unwrap();
+        connection.handle_dynamic_data_authentication().unwrap();
 
         let ascii_pin = "1234".to_string();
         connection.handle_verify_plaintext_pin(ascii_pin.as_bytes()).unwrap();
 
-        let icc_pin_pk_modulus = icc_pk_modulus.clone();
-        let icc_pin_pk_exponent = icc_pk_exponent.clone();
-        connection.handle_verify_enciphered_pin(ascii_pin.as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]).unwrap();
+        connection.handle_verify_enciphered_pin(ascii_pin.as_bytes()).unwrap();
 
         // enciphered PIN OK
         connection.add_tag("9F34", b"\x44\x03\x02".to_vec());

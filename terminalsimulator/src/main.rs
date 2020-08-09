@@ -1,4 +1,4 @@
-use log::{error, warn, debug};
+use log::{error, warn, info, debug};
 use log4rs;
 use clap::{App, Arg};
 use std::io::{self};
@@ -105,18 +105,14 @@ fn run() -> Result<Option<String>, String> {
 
     let data_authentication = connection.handle_get_processing_options().unwrap();
 
-    let (issuer_pk_modulus, issuer_pk_exponent) = connection.get_issuer_public_key(application).unwrap();
+    connection.handle_public_keys(application, &data_authentication[..]).unwrap();
 
-    let tag_9f46_icc_pk_certificate = connection.get_tag_value("9F46").unwrap();
-    let tag_9f47_icc_pk_exponent = connection.get_tag_value("9F47").unwrap();
-    let tag_9f48_icc_pk_remainder = connection.get_tag_value("9F48");
-    let (icc_pk_modulus, icc_pk_exponent) = connection.get_icc_public_key(
-        tag_9f46_icc_pk_certificate, tag_9f47_icc_pk_exponent, tag_9f48_icc_pk_remainder,
-        &issuer_pk_modulus[..], &issuer_pk_exponent[..],
-        &data_authentication[..]).unwrap();
+    if connection.settings.terminal.capabilities.sda && connection.icc.capabilities.sda {
+        connection.handle_signed_static_application_data(&data_authentication[..]).unwrap();
+    }
 
     if connection.settings.terminal.capabilities.dda && connection.icc.capabilities.dda {
-        if let Err(_) = connection.handle_dynamic_data_authentication(&icc_pk_modulus[..], &icc_pk_exponent[..]) {
+        if let Err(_) = connection.handle_dynamic_data_authentication() {
             connection.settings.terminal.tvr.dda_failed = true;
         }
     }
@@ -195,40 +191,10 @@ fn run() -> Result<Option<String>, String> {
 
                 if ascii_pin.is_some() {
                     if enciphered_pin && connection.settings.terminal.capabilities.enciphered_pin {
-                        let mut icc_pin_pk_modulus = icc_pk_modulus.clone();
-                        let mut icc_pin_pk_exponent = icc_pk_exponent.clone();
-
-                        let tag_9f2d_icc_pin_pk_certificate = connection.get_tag_value("9F2D");
-                        let tag_9f2e_icc_pin_pk_exponent = connection.get_tag_value("9F2E");
-                        if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
-                            let tag_9f2f_icc_pin_pk_remainder = connection.get_tag_value("9F2F");
-
-                            // ICC has a separate ICC PIN Encipherement public key
-                            match connection.get_icc_public_key(
-                                tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
-                                &issuer_pk_modulus[..], &issuer_pk_exponent[..],
-                                &data_authentication[..]) {
-                                Ok((modulus, exponent)) => {
-                                    icc_pin_pk_modulus = modulus;
-                                    icc_pin_pk_exponent = exponent;
-
-                                    success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]) {
-                                        Ok(_) => true,
-                                        Err(_) => false
-                                    };
-                                },
-                                Err(_) => {
-                                    success = false;
-                                }
-                            };
-
-                        } else {
-                            success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes(), &icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]) {
-                                Ok(_) => true,
-                                Err(_) => false
-                            };
-                        }
-
+                        success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes()) {
+                            Ok(_) => true,
+                            Err(_) => false
+                        };
                     } else if connection.settings.terminal.capabilities.plaintext_pin {
                         success = match connection.handle_verify_plaintext_pin(ascii_pin.unwrap().as_bytes()) {
                             Ok(_) => true,
@@ -271,7 +237,10 @@ fn run() -> Result<Option<String>, String> {
     // TODO terminal action analysis:
     // ref. EMV Book 4, 6.3.6 Terminal Action Analysis & EMV Book 3, 10.7 Terminal Action Analysis
 
-    connection.handle_generate_ac().unwrap();
+    match connection.handle_generate_ac() {
+        Ok(_) => info!("Purchase successful!"),
+        Err(_) => warn!("Purchase unsuccessful!")
+    };
 
     if print_tags {
         connection.print_tags();
