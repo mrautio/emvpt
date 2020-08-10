@@ -38,7 +38,6 @@ terminal:
   cryptogram_type: 'AuthorisationRequestCryptogram'
   cryptogram_type_arqc: 'TransactionCertificate'
 default_tags:
-  '9F02': '000000000001'
   '9F03': '000000000000'
   '9F1A': '0246'
   '5F2A': 0978

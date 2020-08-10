@@ -261,7 +261,8 @@ pub struct Icc {
     pub cvm_rules : Vec<CvmRule>,
     pub issuer_pk : Option<RsaPublicKey>,
     pub icc_pk : Option<RsaPublicKey>,
-    pub icc_pin_pk : Option<RsaPublicKey>
+    pub icc_pin_pk : Option<RsaPublicKey>,
+    pub data_authentication : Option<Vec<u8>>
 }
 
 impl Icc {
@@ -289,7 +290,7 @@ impl Icc {
             international_cashback: false
         };
 
-        Icc { capabilities : capabilities, usage : usage, cvm_rules : Vec::new(), issuer_pk : None, icc_pk : None, icc_pin_pk : None }
+        Icc { capabilities : capabilities, usage : usage, cvm_rules : Vec::new(), issuer_pk : None, icc_pk : None, icc_pin_pk : None, data_authentication : None }
     }
 }
 
@@ -421,7 +422,11 @@ pub struct EmvConnection<'a> {
     pub interface : Option<ApduInterface<'a>>,
     emv_tags : HashMap<String, EmvTag>,
     pub settings : Settings,
-    pub icc : Icc
+    pub icc : Icc,
+    pub pin_callback : Option<&'a dyn Fn() -> Result<String, ()>>,
+    pub amount_callback : Option<&'a dyn Fn() -> Result<u64, ()>>,
+    pub pse_application_select_callback : Option<&'a dyn Fn(&Vec<EmvApplication>) -> Result<EmvApplication, ()>>,
+    pub start_transaction_callback : Option<&'a dyn Fn(&mut EmvConnection) -> Result<(), ()>>
 }
 
 pub enum ReaderError {
@@ -436,7 +441,18 @@ impl EmvConnection<'_> {
         let emv_tags = serde_yaml::from_str(&fs::read_to_string("../config/emv_tags.yaml").unwrap()).unwrap();
         let settings = serde_yaml::from_str(&fs::read_to_string("../config/settings.yaml").unwrap()).unwrap();
 
-        Ok ( EmvConnection { tags : HashMap::new(), ctx : None, card : None, emv_tags : emv_tags, settings : settings, icc : Icc::new(), interface : None } )
+        Ok ( EmvConnection {
+            tags : HashMap::new(),
+            ctx : None,
+            card : None,
+            emv_tags : emv_tags,
+            settings : settings,
+            icc : Icc::new(),
+            interface : None,
+            pin_callback : None,
+            amount_callback : None,
+            pse_application_select_callback : None,
+            start_transaction_callback : None } )
     }
 
     pub fn print_tags(&self) {
@@ -676,7 +692,7 @@ impl EmvConnection<'_> {
         }
     }
 
-    pub fn handle_get_processing_options(&mut self) -> Result<Vec<u8>, ()> {
+    pub fn handle_get_processing_options(&mut self) -> Result<(), ()> {
         //ref. EMV Book 3, 6.5.8 GET PROCESSING OPTIONS Command-Response APDUs
 
         debug!("GET PROCESSING OPTIONS:");
@@ -800,7 +816,9 @@ impl EmvConnection<'_> {
 
         // 5 - 0 bits are RFU
 
-        Ok(data_authentication)
+        self.icc.data_authentication = Some(data_authentication);
+
+        Ok(())
     }
 
     pub fn handle_verify_plaintext_pin(&mut self, ascii_pin : &[u8]) -> Result<(), ()> {
@@ -1009,48 +1027,39 @@ impl EmvConnection<'_> {
             self.handle_application_cryptogram_card_authentication(&response_data[3..], cdol_tag)?;
         }
 
+        let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
+        let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
+        let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
 
         Ok(icc_cryptogram_type)
     }
 
-    pub fn handle_generate_ac(&mut self) -> Result<(), ()> {
+    pub fn handle_1st_generate_ac(&mut self) -> Result<CryptogramType, ()> {
         debug!("Generate Application Cryptogram (GENERATE AC) - first issuance:");
 
-        let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
-        self.add_tag("95", tag_95_tvr);
-        debug!("{:?}", self.settings.terminal.tvr);
-
-        let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C").unwrap();
-
+        let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C")?;
+        
         if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
-            //TODO: naturally this implementation shouldn't be here...
-
-            debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
-
-            let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
-            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
-            let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
-            
-            let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type_arqc, "8D").unwrap();
-
-            let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
-            let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
-            let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
-
-            if let CryptogramType::TransactionCertificate = icc_cryptogram_type  {
-                return Ok(());
-            } else {
-                warn!("Transaction has unexpected return type from ICC");
-                return Err(());
-            }
-
+            // handle_2nd_generate_ac needed
         } else if let CryptogramType::AuthorisationRequestCryptogram = self.settings.terminal.cryptogram_type {
             warn!("Transaction terminated by terminal - ARQC requested but got unexpected return type from ICC");
             return Err(());
         }
 
+        Ok(icc_cryptogram_type)
+    }
 
-        Ok(())
+    pub fn handle_2nd_generate_ac(&mut self) -> Result<CryptogramType, ()> {
+        debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
+
+        let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type_arqc, "8D")?;
+
+        if let CryptogramType::TransactionCertificate = icc_cryptogram_type  {
+            return Ok(icc_cryptogram_type);
+        }
+
+        warn!("Transaction has unexpected return type from ICC");
+        Err(())
     }
 
     fn read_record(&mut self, short_file_identifier : u8, record_index : u8) -> Option<Vec<u8>> {
@@ -1159,6 +1168,16 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    pub fn select_payment_application(&mut self) -> Result<EmvApplication, ()> {
+        let applications = self.handle_select_payment_system_environment()?;
+
+        let application = self.pse_application_select_callback.unwrap()(&applications)?;
+        self.handle_select_payment_application(&application)?;
+
+        Ok(application)
+    }
+
+
     pub fn process_settings(&mut self) -> Result<(), Box<dyn error::Error>> {
         let default_tags = self.settings.default_tags.clone();
         for (tag_name, tag_value) in default_tags.iter() {
@@ -1230,9 +1249,11 @@ impl EmvConnection<'_> {
         Ok(output)
     }
 
-    pub fn handle_public_keys(&mut self, application : &EmvApplication, data_authentication : &[u8]) -> Result<(), ()> {
-        let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application).unwrap();
+    pub fn handle_public_keys(&mut self, application : &EmvApplication) -> Result<(), ()> {
+        let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application)?;
         self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..]));
+
+        let data_authentication = &self.icc.data_authentication.as_ref().unwrap()[..];
 
         let tag_9f46_icc_pk_certificate = self.get_tag_value("9F46");
         let tag_9f47_icc_pk_exponent = self.get_tag_value("9F47");
@@ -1240,7 +1261,7 @@ impl EmvConnection<'_> {
             let tag_9f48_icc_pk_remainder = self.get_tag_value("9F48");
             let (icc_pk_modulus, icc_pk_exponent) = self.get_icc_public_key(
                 tag_9f46_icc_pk_certificate.unwrap(), tag_9f47_icc_pk_exponent.unwrap(), tag_9f48_icc_pk_remainder,
-                data_authentication).unwrap();
+                data_authentication)?;
             self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..]));
             self.icc.icc_pin_pk = self.icc.icc_pk.clone();
         }
@@ -1253,7 +1274,7 @@ impl EmvConnection<'_> {
             // ICC has a separate ICC PIN Encipherement public key
             let (icc_pin_pk_modulus, icc_pin_pk_exponent) = self.get_icc_public_key(
                 tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
-                data_authentication).unwrap();
+                data_authentication)?;
 
             self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]));
         }
@@ -1561,6 +1582,144 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    pub fn start_transaction(&mut self, application : &EmvApplication) -> Result<(),()> {
+        self.process_settings().unwrap();
+
+        self.start_transaction_callback.unwrap()(self)?;
+
+        self.handle_get_processing_options()?;
+
+        self.handle_public_keys(application).unwrap();
+
+        Ok(())
+    }
+
+    pub fn handle_card_verification_methods(&mut self) -> Result<(), ()> {
+        let purchase_amount = str::from_utf8(&bcdutil::bcd_to_ascii(&self.get_tag_value("9F02").unwrap()[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
+
+        let cvm_rules = self.icc.cvm_rules.clone();
+        for rule in cvm_rules {
+            let mut skip_if_not_supported = false;
+            let mut success = false;
+
+            match rule.condition {
+                CvmConditionCode::UnattendedCash | CvmConditionCode::ManualCash | CvmConditionCode::PurchaseWithCashback => {
+                    // TODO: conditions currently never supported, maybe should implement it more flexible
+                    continue;
+                },
+                CvmConditionCode::CvmSupported => {
+                    skip_if_not_supported = true;
+                }
+                // TODO: verify that ICC and terminal currencies are the same or provide conversion
+                CvmConditionCode::IccCurrencyUnderX => {
+                    if purchase_amount >= rule.amount_x {
+                        continue;
+                    }
+                },
+                CvmConditionCode::IccCurrencyOverX => {
+                    if purchase_amount <= rule.amount_x {
+                        continue;
+                    }
+                }
+                CvmConditionCode::IccCurrencyUnderY => {
+                    if purchase_amount >= rule.amount_y {
+                        continue;
+                    }
+                },
+                CvmConditionCode::IccCurrencyOverY => {
+                    if purchase_amount <= rule.amount_y {
+                        continue;
+                    }
+                },
+                _ => ()
+            }
+
+            match rule.code {
+                CvmCode::FailCvmProcessing => success = false,
+                CvmCode::EncipheredPinOnline => {
+                    debug!("Enciphered PIN online is not supported");
+
+                    if skip_if_not_supported {
+                        continue;
+                    }
+
+                    success = false;
+                },
+                CvmCode::PlaintextPin | CvmCode::PlaintextPinAndSignature | CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => {
+                    let enciphered_pin = match rule.code {
+                        CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => true,
+                        _ => false
+                    };
+
+                    let ascii_pin = self.pin_callback.unwrap()()?;
+
+                    if enciphered_pin && self.settings.terminal.capabilities.enciphered_pin {
+                        success = match self.handle_verify_enciphered_pin(ascii_pin.as_bytes()) {
+                            Ok(_) => true,
+                            Err(_) => false
+                        };
+                    } else if self.settings.terminal.capabilities.plaintext_pin {
+                        success = match self.handle_verify_plaintext_pin(ascii_pin.as_bytes()) {
+                            Ok(_) => true,
+                            Err(_) => false
+                        };
+                    } else if skip_if_not_supported {
+                        continue;
+                    }
+                },
+                CvmCode::Signature | CvmCode::NoCvm => {
+                    success = true;
+                }
+            }
+
+            if success {
+                self.settings.terminal.tvr.cardholder_verification_was_not_successful = false;
+                self.add_tag("9F34", CvmRule::into_9f34_value(Ok(rule)));
+                break;
+            } else {
+                self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
+                self.add_tag("9F34", CvmRule::into_9f34_value(Err(rule)));
+
+                if ! skip_if_not_supported {
+                    break;
+                }
+            }
+        }
+
+        if ! self.get_tag_value("9F34").is_some() {
+            self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
+
+            // "no CVM performed"
+            self.add_tag("9F34", b"\x3F\x00\x01".to_vec());
+        }
+
+        Ok(())
+    }
+
+    pub fn handle_terminal_risk_management(&mut self) -> Result<(),()> {
+        if self.settings.terminal.capabilities.sda && self.icc.capabilities.sda {
+            if let Err(_) = self.handle_signed_static_application_data(&self.icc.data_authentication.as_ref().unwrap().clone()[..]) {
+                self.settings.terminal.tvr.sda_failed = true;
+            }
+        }
+
+        if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
+            if let Err(_) = self.handle_dynamic_data_authentication() {
+                self.settings.terminal.tvr.dda_failed = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn handle_terminal_action_analysis(&mut self) -> Result<(),()> {
+        let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
+        self.add_tag("95", tag_95_tvr);
+        debug!("{:?}", self.settings.terminal.tvr);
+
+        Ok(())
+    }
+
     // EMV has some tags that don't conform to ISO/IEC 7816
     fn is_non_conforming_one_byte_tag(&self, tag : u8) -> bool {
         if tag == 0x95 {
@@ -1630,6 +1789,7 @@ impl EmvConnection<'_> {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct EmvApplication {
     pub aid : Vec<u8>,
     pub label : Vec<u8>,
@@ -1790,6 +1950,7 @@ pub fn is_certificate_expired(date_bcd : &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::bcdutil::*;
     use hexplay::HexViewBuilder;
     use std::str;
     use std::sync::Once;
@@ -1895,20 +2056,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_purchase_transaction() -> Result<(), String> {
-        init_logging();
+    fn pse_application_select(applications : &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
+        Ok(applications[0].clone())
+    }
 
-        let mut connection = EmvConnection::new().unwrap();
-        connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
+    fn pin_entry() -> Result<String, ()> {
+        Ok("1234".to_string())
+    }
 
-        let applications = connection.handle_select_payment_system_environment().unwrap();
+    fn amount_entry() -> Result<u64, ()> {
+        Ok(1)
+    }
 
-        let application = &applications[0];
-        connection.handle_select_payment_application(application).unwrap();
-
-        connection.process_settings().unwrap();
-
+    fn start_transaction(connection : &mut EmvConnection) -> Result<(), ()> {
         // force transaction date as 24.07.2020
         connection.add_tag("9A", b"\x20\x07\x24".to_vec());
 
@@ -1916,28 +2076,85 @@ mod tests {
         connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
         connection.settings.terminal.use_random = false;
 
+        Ok(())
+    }
+
+    fn setup_connection(connection : &mut EmvConnection) -> Result<(), ()> {
+        connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
+        connection.pse_application_select_callback = Some(&pse_application_select);
+        connection.pin_callback = Some(&pin_entry);
+        connection.amount_callback = Some(&amount_entry);
+        connection.start_transaction_callback = Some(&start_transaction);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_data() -> Result<(), ()> {
+        init_logging();
+
+        let mut connection = EmvConnection::new().unwrap();
+        setup_connection(&mut connection)?;
+
+        connection.select_payment_application()?;
+
         let search_tag = b"\x9f\x36";
-        connection.handle_get_data(&search_tag[..]).unwrap();
+        connection.handle_get_data(&search_tag[..])?;
 
-        let data_authentication = connection.handle_get_processing_options().unwrap();
+        Ok(())
+    }
 
-        connection.handle_public_keys(application, &data_authentication[..]).unwrap();
+    #[test]
+    fn test_pin_verification_methods() -> Result<(), ()> {
+        init_logging();
 
-        if connection.settings.terminal.capabilities.sda && connection.icc.capabilities.sda {
-            connection.handle_signed_static_application_data(&data_authentication[..]).unwrap();
+        let mut connection = EmvConnection::new().unwrap();
+        setup_connection(&mut connection)?;
+
+        let application = connection.select_payment_application()?;
+
+        connection.start_transaction(&application).unwrap();
+
+        let ascii_pin = connection.pin_callback.unwrap()()?;
+
+        connection.handle_verify_plaintext_pin(ascii_pin.as_bytes())?;
+        connection.handle_verify_enciphered_pin(ascii_pin.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_purchase_transaction() -> Result<(), ()> {
+        init_logging();
+
+        let mut connection = EmvConnection::new().unwrap();
+        setup_connection(&mut connection)?;
+
+        let amount = connection.amount_callback.unwrap()()?;
+
+        let application = connection.select_payment_application()?;
+
+        connection.start_transaction(&application)?;
+
+        connection.add_tag("9F02", ascii_to_bcd_n(format!("{}", amount).as_bytes(), 6).unwrap());
+
+        connection.handle_card_verification_methods()?;
+
+        connection.handle_terminal_risk_management()?;
+
+        connection.handle_terminal_action_analysis()?;
+
+        match connection.handle_1st_generate_ac()? {
+            CryptogramType::AuthorisationRequestCryptogram => {
+                match connection.handle_2nd_generate_ac()? {
+                    CryptogramType::AuthorisationRequestCryptogram => { return Err(()); },
+                    CryptogramType::TransactionCertificate => { /* Expected */ },
+                    CryptogramType::ApplicationAuthenticationCryptogram => { return Err(()); }
+                }
+            },
+            CryptogramType::TransactionCertificate => { return Err(()); /* For test case 2ND GEN AC TC is expected */ },
+            CryptogramType::ApplicationAuthenticationCryptogram => { return Err(()); }
         }
-
-        connection.handle_dynamic_data_authentication().unwrap();
-
-        let ascii_pin = "1234".to_string();
-        connection.handle_verify_plaintext_pin(ascii_pin.as_bytes()).unwrap();
-
-        connection.handle_verify_enciphered_pin(ascii_pin.as_bytes()).unwrap();
-
-        // enciphered PIN OK
-        connection.add_tag("9F34", b"\x44\x03\x02".to_vec());
-
-        connection.handle_generate_ac().unwrap();
 
         Ok(())
     }

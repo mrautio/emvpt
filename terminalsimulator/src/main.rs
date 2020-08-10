@@ -1,4 +1,4 @@
-use log::{error, warn, info, debug};
+use log::{error, warn, info};
 use log4rs;
 use clap::{App, Arg};
 use std::io::{self};
@@ -6,7 +6,66 @@ use std::{thread, time};
 use std::str;
 
 use emvpt::*;
-use emvpt::bcdutil::*;
+
+static mut INTERACTIVE : bool = false;
+static mut PIN_OPTION : Option<String> = None;
+
+fn pse_application_select(applications : &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
+    let user_interactive = unsafe { INTERACTIVE };
+
+    if user_interactive && applications.len() > 1 {
+        println!("Select payment application:");
+        for i in 0..applications.len() {
+            println!("{:02}. {}", i+1, str::from_utf8(&applications[i].label).unwrap());
+        }
+
+        print!("> ");
+
+        let mut stdin_buffer = String::new();
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        return Ok(applications[stdin_buffer.trim().parse::<usize>().unwrap() - 1].clone());
+    }
+
+    Ok(applications[0].clone())
+}
+
+fn pin_entry() -> Result<String, ()> {
+    let user_interactive = unsafe { INTERACTIVE };
+    unsafe {
+        if PIN_OPTION.is_some() {
+            return Ok(PIN_OPTION.as_ref().unwrap().to_string());
+        }
+    }
+
+
+    let mut stdin_buffer = String::new();
+    if user_interactive {
+        println!("Enter PIN:");
+        print!("> ");
+
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        return Ok(stdin_buffer.trim().to_string());
+    }
+
+    Ok("".to_string())
+}
+
+fn amount_entry() -> Result<u64, ()> {
+    let user_interactive = unsafe { INTERACTIVE };
+
+    if user_interactive {
+        println!("Enter amount:");
+        print!("> ");
+        let mut stdin_buffer = String::new();
+        io::stdin().read_line(&mut stdin_buffer).unwrap();
+
+        return Ok(format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0).parse::<u64>().unwrap());
+    }
+
+    Ok(1)
+}
 
 fn run() -> Result<Option<String>, String> {
     log4rs::init_file("../config/log4rs.yaml", Default::default()).unwrap();
@@ -28,28 +87,27 @@ fn run() -> Result<Option<String>, String> {
             .takes_value(true))
         .get_matches();
 
-    let interactive = matches.is_present("interactive");
+    unsafe {
+        INTERACTIVE = matches.is_present("interactive");
+        if matches.is_present("pin") {
+            PIN_OPTION = Some(matches.value_of("pin").unwrap().to_string());
+        }
+    }
+    let user_interactive = unsafe { INTERACTIVE };
+
     let print_tags = matches.is_present("print-tags");
 
     let mut connection = EmvConnection::new().unwrap();
+    connection.pse_application_select_callback = Some(&pse_application_select);
+    connection.pin_callback = Some(&pin_entry);
+    connection.amount_callback = Some(&amount_entry);
 
-    let mut purchase_amount : Option<String> = None;
-
-    if interactive {
-        println!("Enter amount:");
-        print!("> ");
-        let mut stdin_buffer = String::new();
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
-
-        purchase_amount = Some(format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0));
-    }
-
-    //return Ok(None);
+    let purchase_amount = connection.amount_callback.unwrap()().unwrap();
 
     if let Err(err) = connection.connect_to_card() {
         match err {
             ReaderError::CardNotFound => {
-                if interactive {
+                if user_interactive {
                     println!("Please insert card");
 
                     loop {
@@ -73,174 +131,38 @@ fn run() -> Result<Option<String>, String> {
         }
     }
 
-    let applications = connection.handle_select_payment_system_environment().unwrap();
-
-    let mut application_number : usize = 0;
-
-    if interactive && applications.len() > 1 {
-        println!("Select payment application:");
-        for i in 0..applications.len() {
-            println!("{:02}. {}", i+1, str::from_utf8(&applications[i].label).unwrap());
-        }
-
-        print!("> ");
-
-        let mut stdin_buffer = String::new();
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
-
-        application_number = stdin_buffer.trim().parse::<usize>().unwrap() - 1;
-    }
-
-    if print_tags {
-        connection.print_tags();
-    }
-
-    let application = &applications[application_number];
-    connection.handle_select_payment_application(application).unwrap();
+    let application = connection.select_payment_application().unwrap();
 
     connection.process_settings().unwrap();
-    if purchase_amount.is_some() {
-        connection.add_tag("9F02", ascii_to_bcd_n(purchase_amount.unwrap().as_bytes(), 6).unwrap());
-    }
+    connection.add_tag("9F02", bcdutil::ascii_to_bcd_n(format!("{}", purchase_amount).as_bytes(), 6).unwrap());
 
-    let data_authentication = connection.handle_get_processing_options().unwrap();
+    connection.handle_get_processing_options().unwrap();
 
-    connection.handle_public_keys(application, &data_authentication[..]).unwrap();
+    connection.handle_public_keys(&application).unwrap();
 
-    if connection.settings.terminal.capabilities.sda && connection.icc.capabilities.sda {
-        connection.handle_signed_static_application_data(&data_authentication[..]).unwrap();
-    }
+    connection.handle_card_verification_methods().unwrap();
 
-    if connection.settings.terminal.capabilities.dda && connection.icc.capabilities.dda {
-        if let Err(_) = connection.handle_dynamic_data_authentication() {
-            connection.settings.terminal.tvr.dda_failed = true;
-        }
-    }
+    connection.handle_terminal_risk_management().unwrap();
 
-    let purchase_amount = str::from_utf8(&bcd_to_ascii(&connection.get_tag_value("9F02").unwrap()[..]).unwrap()[..]).unwrap().parse::<u32>().unwrap();
+    connection.handle_terminal_action_analysis().unwrap();
 
-    let cvm_rules = connection.icc.cvm_rules.clone();
-    for rule in cvm_rules {
-        let mut skip_if_not_supported = false;
-        let mut success = false;
+    let mut purchase_successful = false;
 
-        match rule.condition {
-            CvmConditionCode::UnattendedCash | CvmConditionCode::ManualCash | CvmConditionCode::PurchaseWithCashback => {
-                // TODO: conditions currently never supported, maybe should implement it more flexible
-                continue;
-            },
-            CvmConditionCode::CvmSupported => {
-                skip_if_not_supported = true;
+    match connection.handle_1st_generate_ac().unwrap() {
+        CryptogramType::AuthorisationRequestCryptogram => {
+            if let CryptogramType::TransactionCertificate = connection.handle_2nd_generate_ac().unwrap() {
+                purchase_successful = true;
             }
-            // TODO: verify that ICC and terminal currencies are the same or provide conversion
-            CvmConditionCode::IccCurrencyUnderX => {
-                if purchase_amount >= rule.amount_x {
-                    continue;
-                }
-            },
-            CvmConditionCode::IccCurrencyOverX => {
-                if purchase_amount <= rule.amount_x {
-                    continue;
-                }
-            }
-            CvmConditionCode::IccCurrencyUnderY => {
-                if purchase_amount >= rule.amount_y {
-                    continue;
-                }
-            },
-            CvmConditionCode::IccCurrencyOverY => {
-                if purchase_amount <= rule.amount_y {
-                    continue;
-                }
-            },
-            _ => ()
-        }
-
-        match rule.code {
-            CvmCode::FailCvmProcessing => success = false,
-            CvmCode::EncipheredPinOnline => {
-                debug!("Enciphered PIN online is not supported");
-
-                if skip_if_not_supported {
-                    continue;
-                }
-
-                success = false;
-            },
-            CvmCode::PlaintextPin | CvmCode::PlaintextPinAndSignature | CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => {
-                let enciphered_pin = match rule.code {
-                    CvmCode::EncipheredPinOffline | CvmCode::EncipheredPinOfflineAndSignature => true,
-                    _ => false
-                };
-
-                let mut ascii_pin : Option<&str> = None;
-
-                if matches.is_present("pin") {
-                    ascii_pin = matches.value_of("pin");
-                }
-
-                let mut stdin_buffer = String::new();
-                if interactive {
-                    println!("Enter PIN:");
-                    print!("> ");
-
-                    io::stdin().read_line(&mut stdin_buffer).unwrap();
-
-                    ascii_pin = Some(&stdin_buffer.trim());
-                }
-
-                if ascii_pin.is_some() {
-                    if enciphered_pin && connection.settings.terminal.capabilities.enciphered_pin {
-                        success = match connection.handle_verify_enciphered_pin(ascii_pin.unwrap().as_bytes()) {
-                            Ok(_) => true,
-                            Err(_) => false
-                        };
-                    } else if connection.settings.terminal.capabilities.plaintext_pin {
-                        success = match connection.handle_verify_plaintext_pin(ascii_pin.unwrap().as_bytes()) {
-                            Ok(_) => true,
-                            Err(_) => false
-                        };
-                    } else if skip_if_not_supported {
-                        continue;
-                    }
-                }
-            },
-            CvmCode::Signature | CvmCode::NoCvm => {
-                success = true;
-            }
-        }
-
-        if success {
-            connection.settings.terminal.tvr.cardholder_verification_was_not_successful = false;
-            connection.add_tag("9F34", CvmRule::into_9f34_value(Ok(rule)));
-            break;
-        } else {
-            connection.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
-            connection.add_tag("9F34", CvmRule::into_9f34_value(Err(rule)));
-
-            if ! skip_if_not_supported {
-                break;
-            }
-        }
+        },
+        CryptogramType::TransactionCertificate => { purchase_successful = true; },
+        CryptogramType::ApplicationAuthenticationCryptogram => { purchase_successful = false; }
     }
 
-    if ! connection.get_tag_value("9F34").is_some() {
-        connection.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
-
-        // "no CVM performed"
-        connection.add_tag("9F34", b"\x3F\x00\x01".to_vec());
+    if purchase_successful {
+        info!("Purchase successful!");
+    } else {
+        warn!("Purchase unsuccessful!");
     }
-
-    // TODO terminal risk management:
-    // ref. EMV Book 4, 6.3.5 Terminal Risk Management & EMV Book 3, 10.6 Terminal Risk Management
-
-    // TODO terminal action analysis:
-    // ref. EMV Book 4, 6.3.6 Terminal Action Analysis & EMV Book 3, 10.7 Terminal Action Analysis
-
-    match connection.handle_generate_ac() {
-        Ok(_) => info!("Purchase successful!"),
-        Err(_) => warn!("Purchase unsuccessful!")
-    };
 
     if print_tags {
         connection.print_tags();
