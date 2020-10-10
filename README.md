@@ -11,6 +11,12 @@ Minimum Viable Payment Terminal
 ```
 docker build -t emvpt -f Dockerfile . && docker run --rm -t emvpt
 ```
+## Update dependencies
+
+```sh
+emvpt> cargo upgrade && cargo update && cargo audit
+terminalsimulator> cargo upgrade && cargo update && cargo audit
+```
 
 ## References
 
