@@ -1,6 +1,6 @@
-FROM rust:latest
+FROM alpine:latest
 
-RUN apt-get update && apt-get install -y libpcsclite-dev
+RUN apk add --no-cache gcc make pkgconfig pcsc-lite-dev openssl-dev rust cargo
 
 ADD config /tmp/config
 ADD emvpt /tmp/emvpt
