@@ -9,5 +9,5 @@ edition = "2018"
 [dependencies]
 emvpt = { path = "../emvpt", version = "0.1.0" }
 log = "0.4.11"
-log4rs = "0.13.0"
+log4rs = "1.0.0"
 clap = "2.33.3"
