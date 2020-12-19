@@ -704,11 +704,19 @@ impl EmvConnection<'_> {
 
         debug!("GET PROCESSING OPTIONS:");
 
+        let apdu_command_get_processing_options = b"\x80\xA8\x00\x00";
+        let mut get_processing_options_command = apdu_command_get_processing_options.to_vec();
+
         let tag_9f38_pdol = self.get_tag_value("9F38");
         if tag_9f38_pdol.is_some() {
-            // TODO FIXME
-            warn!("PDOL handling not done!");
-            return Err(());
+            get_processing_options_command.push((tag_9f38_pdol.unwrap().len() + 2) as u8); // lc
+            get_processing_options_command.push(0x83); // data
+            get_processing_options_command.extend_from_slice(&tag_9f38_pdol.unwrap()[..]); // data
+            get_processing_options_command.push(0x00); // le
+        } else {
+            get_processing_options_command.push(0x02); // lc
+            get_processing_options_command.push(0x83); // data
+            get_processing_options_command.push(0x00); // le
         }
 
         let get_processing_options_command = b"\x80\xA8\x00\x00\x02\x83\x00".to_vec();
