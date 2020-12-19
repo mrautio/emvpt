@@ -172,6 +172,9 @@
 '9F26':
   tag: '9F26'
   name: 'Application Cryptogram (AC)'
+'9F24':
+  tag: '9F24'
+  name: 'PAR Data'
 '9F10':
   tag: '9F10'
   name: 'Issuer Application Data (IAD)'
