@@ -4,18 +4,31 @@
 
 Minimum Viable Payment Terminal
 
-## Building
+## Terminal simulator run
 
-### Docker
+Note! You'll need a smart card reader device to run the simulator.
 
+```sh
+terminalsimulator$ cargo run -- --help
 ```
+
+## Library
+
+```sh
+emvpt$ cargo test
+```
+
+## Docker
+
+```sh
 docker build -t emvpt -f Dockerfile . && docker run --rm -t emvpt
 ```
+
 ## Update dependencies
 
 ```sh
-emvpt> cargo upgrade && cargo update && cargo audit
-terminalsimulator> cargo upgrade && cargo update && cargo audit
+emvpt$ cargo upgrade && cargo update && cargo audit
+terminalsimulator$ cargo upgrade && cargo update && cargo audit
 ```
 
 ## References
