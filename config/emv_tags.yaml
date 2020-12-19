@@ -169,6 +169,9 @@
 '9F36':
   tag: '9F36'
   name: 'Application Transaction Counter (ATC)'
+'9F21':
+  tag: '9F21'
+  name: 'Transaction Time'
 '9F26':
   tag: '9F26'
   name: 'Application Cryptogram (AC)'

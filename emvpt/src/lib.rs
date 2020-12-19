@@ -16,7 +16,7 @@ use openssl::rsa::{Rsa, Padding};
 use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
-use chrono::{NaiveDate, Datelike, Utc};
+use chrono::{NaiveDate, Timelike, Datelike, Utc};
 
 pub mod bcdutil;
 
@@ -1191,10 +1191,17 @@ impl EmvConnection<'_> {
             self.add_tag(&tag_name, hex::decode(&tag_value.clone())?);
         }
 
+        let now = Utc::now().naive_utc();
         if !self.get_tag_value("9A").is_some() {
-            let today = Utc::today().naive_utc();
+            let today = now.date();
             let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
             self.add_tag("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+        }
+
+        if !self.get_tag_value("9F21").is_some() {
+            let time = now.time();
+            let transaction_time_ascii_hhmmss = format!("{:02}{:02}{:02}",time.hour(), time.minute(), time.second());
+            self.add_tag("9F21", bcdutil::ascii_to_bcd_cn(transaction_time_ascii_hhmmss.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F37").is_some() {
@@ -1294,7 +1301,7 @@ impl EmvConnection<'_> {
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
         let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string(&self.settings.configuration_files.scheme_ca_public_keys).unwrap()).unwrap();
 
-        let tag_92_issuer_pk_remainder = self.get_tag_value("92").unwrap();
+        let tag_92_issuer_pk_remainder = self.get_tag_value("92");
         let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
         let tag_90_issuer_public_key_certificate = self.get_tag_value("90").unwrap();
 
@@ -1337,7 +1344,9 @@ impl EmvConnection<'_> {
 
         let mut checksum_data : Vec<u8> = Vec::new();
         checksum_data.extend_from_slice(&issuer_certificate[1..checksum_position]);
-        checksum_data.extend_from_slice(&tag_92_issuer_pk_remainder[..]);
+        if tag_92_issuer_pk_remainder.is_some() {
+            checksum_data.extend_from_slice(&tag_92_issuer_pk_remainder.unwrap()[..]);
+        }
         checksum_data.extend_from_slice(&tag_9f32_issuer_pk_exponent[..]);
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
@@ -1363,7 +1372,9 @@ impl EmvConnection<'_> {
 
         let mut issuer_pk_modulus : Vec<u8> = Vec::new();
         issuer_pk_modulus.extend_from_slice(issuer_pk_leftmost_digits);
-        issuer_pk_modulus.extend_from_slice(&tag_92_issuer_pk_remainder[..]);
+        if tag_92_issuer_pk_remainder.is_some() {
+            issuer_pk_modulus.extend_from_slice(&tag_92_issuer_pk_remainder.unwrap()[..]);
+        }
         trace!("Issuer PK modulus:\n{}", HexViewBuilder::new(&issuer_pk_modulus[..]).finish());
 
         Ok((issuer_pk_modulus, tag_9f32_issuer_pk_exponent.to_vec()))
