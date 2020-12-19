@@ -211,3 +211,6 @@
 '9F2D':
   tag: '9F2D'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate'
+'9F7C':
+  tag: '9F7C'
+  name: 'Customer Exclusive Data'
