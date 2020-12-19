@@ -1378,8 +1378,11 @@ impl EmvConnection<'_> {
 
         is_certificate_expired(&issuer_certificate_expiry[..]);
 
+        let issuer_pk_leftmost_digits_length = issuer_pk_leftmost_digits.iter()
+            .rev().position(|c| -> bool { *c != 0xBB }).map(|i| issuer_pk_leftmost_digits.len() - i).unwrap();
+
         let mut issuer_pk_modulus : Vec<u8> = Vec::new();
-        issuer_pk_modulus.extend_from_slice(issuer_pk_leftmost_digits);
+        issuer_pk_modulus.extend_from_slice(&issuer_pk_leftmost_digits[..issuer_pk_leftmost_digits_length]);
         if tag_92_issuer_pk_remainder.is_some() {
             issuer_pk_modulus.extend_from_slice(&tag_92_issuer_pk_remainder.unwrap()[..]);
         }
