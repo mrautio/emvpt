@@ -85,6 +85,12 @@ fn run() -> Result<Option<String>, String> {
             .value_name("PIN CODE")
             .help("Card PIN code")
             .takes_value(true))
+        .arg(Arg::with_name("settings")
+            .short("s")
+            .long("settings")
+            .value_name("settings file")
+            .help("Settings file location")
+            .takes_value(true))
         .get_matches();
 
     unsafe {
@@ -97,7 +103,8 @@ fn run() -> Result<Option<String>, String> {
 
     let print_tags = matches.is_present("print-tags");
 
-    let mut connection = EmvConnection::new().unwrap();
+    let mut connection = EmvConnection::new(&matches.value_of("settings").unwrap_or("../config/settings.yaml").to_string()).unwrap();
+
     connection.pse_application_select_callback = Some(&pse_application_select);
     connection.pin_callback = Some(&pin_entry);
     connection.amount_callback = Some(&amount_entry);

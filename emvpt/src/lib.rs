@@ -410,7 +410,14 @@ impl From<TerminalVerificationResults> for Vec<u8> {
 
 
 #[derive(Serialize, Deserialize)]
+pub struct ConfigurationFiles {
+    emv_tags : String,
+    scheme_ca_public_keys : String
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
+    configuration_files : ConfigurationFiles,
     pub terminal : Terminal,
     default_tags : HashMap<String, String>
 }
@@ -437,9 +444,9 @@ pub enum ReaderError {
 }
 
 impl EmvConnection<'_> {
-    pub fn new() -> Result<EmvConnection<'static>, String> {
-        let emv_tags = serde_yaml::from_str(&fs::read_to_string("../config/emv_tags.yaml").unwrap()).unwrap();
-        let settings = serde_yaml::from_str(&fs::read_to_string("../config/settings.yaml").unwrap()).unwrap();
+    pub fn new(settings_file : &str) -> Result<EmvConnection<'static>, String> {
+        let settings : Settings = serde_yaml::from_str(&fs::read_to_string(settings_file).unwrap()).unwrap();
+        let emv_tags = serde_yaml::from_str(&fs::read_to_string(settings.configuration_files.emv_tags.clone()).unwrap()).unwrap();
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
@@ -1285,8 +1292,7 @@ impl EmvConnection<'_> {
     pub fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
 
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
-        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string("../config/scheme_ca_public_keys.yaml").unwrap()).unwrap();
-
+        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string(&self.settings.configuration_files.scheme_ca_public_keys).unwrap()).unwrap();
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92").unwrap();
         let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
@@ -1967,6 +1973,8 @@ mod tests {
 
     static LOGGING: Once = Once::new();
 
+    static SETTINGS_FILE : &str = "../config/settings.yaml";
+
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
         req : String,
@@ -2093,7 +2101,7 @@ mod tests {
     fn test_get_data() -> Result<(), ()> {
         init_logging();
 
-        let mut connection = EmvConnection::new().unwrap();
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
         setup_connection(&mut connection)?;
 
         connection.select_payment_application()?;
@@ -2108,7 +2116,7 @@ mod tests {
     fn test_pin_verification_methods() -> Result<(), ()> {
         init_logging();
 
-        let mut connection = EmvConnection::new().unwrap();
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
         setup_connection(&mut connection)?;
 
         let application = connection.select_payment_application()?;
@@ -2127,7 +2135,7 @@ mod tests {
     fn test_purchase_transaction() -> Result<(), ()> {
         init_logging();
 
-        let mut connection = EmvConnection::new().unwrap();
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
         setup_connection(&mut connection)?;
 
         let amount = connection.amount_callback.unwrap()()?;
