@@ -487,47 +487,44 @@ impl EmvConnection<'_> {
         let readers_size = match ctx.list_readers_len() {
             Ok(readers_size) => readers_size,
             Err(err) => {
-                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
+                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers size: {}", err)));
             }
         };
 
         let mut readers_buf = vec![0; readers_size];
-        let mut readers = match ctx.list_readers(&mut readers_buf) {
+        let readers = match ctx.list_readers(&mut readers_buf) {
             Ok(readers) => readers,
             Err(err) => {
                 return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
             }
         };
 
-        let reader = match readers.next() {
-            Some(reader) => reader,
-            None => {
-                return Err(ReaderError::ReaderNotFound);
+        for reader in readers {
+            self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => {
+                    debug!("Card reader: {:?}", reader);
+                    Some(card)
+                },
+                _ => None
+            };
+
+            if self.card.is_some() {
+                break;
             }
-        };
+        }
 
-        // Connect to the card.
-        self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
-            Ok(card) => {
-                Some(card)
-            },
-            Err(pcsc::Error::NoSmartcard) => {
-                return Err(ReaderError::CardNotFound);
-            },
-            Err(err) => {
-                return Err(ReaderError::CardConnectionFailed(format!("Could not connect to the card: {}", err)));
-            }
-        };
+        if self.card.is_some() {
+            const MAX_NAME_SIZE : usize = 2048;
+            let mut names_buffer = [0; MAX_NAME_SIZE];
+            let mut atr_buffer = [0; MAX_ATR_SIZE];
+            let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
 
-        const MAX_NAME_SIZE : usize = 2048;
-        let mut names_buffer = [0; MAX_NAME_SIZE];
-        let mut atr_buffer = [0; MAX_ATR_SIZE];
-        let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
-
-        // https://www.eftlab.com/knowledge-base/171-atr-list-full/
-        debug!("Card reader: {:?}", reader);
-        debug!("Card ATR:\n{}", HexViewBuilder::new(card_status.atr()).finish());
-        debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
+            // https://www.eftlab.com/knowledge-base/171-atr-list-full/
+            debug!("Card ATR:\n{}", HexViewBuilder::new(card_status.atr()).finish());
+            debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
+        } else {
+            return Err(ReaderError::CardNotFound);
+        }
 
         Ok(())
     }
@@ -1105,6 +1102,7 @@ impl EmvConnection<'_> {
     pub fn handle_select_payment_system_environment(&mut self) -> Result<Vec<EmvApplication>, ()> {
         debug!("Selecting Payment System Environment (PSE):");
         let contact_pse_name = "1PAY.SYS.DDF01";
+        let _contactless_pse_name = "2PAY.SYS.DDF01";
 
         let pse_name = contact_pse_name;
 
