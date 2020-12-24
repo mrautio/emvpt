@@ -190,6 +190,9 @@
 '9F4C':
   tag: '9F4C'
   name: 'ICC Dynamic Number'
+'9F4D':
+  tag: '9F4D'
+  name: 'Log Entry'
 '9F33':
   tag: '9F33'
   name: 'Terminal Capabilities'

@@ -427,6 +427,7 @@ pub struct EmvConnection<'a> {
     ctx : Option<Context>,
     card : Option<Card>,
     pub interface : Option<ApduInterface<'a>>,
+    contactless : bool,
     emv_tags : HashMap<String, EmvTag>,
     pub settings : Settings,
     pub icc : Icc,
@@ -456,6 +457,7 @@ impl EmvConnection<'_> {
             settings : settings,
             icc : Icc::new(),
             interface : None,
+            contactless : false,
             pin_callback : None,
             amount_callback : None,
             pse_application_select_callback : None,
@@ -986,6 +988,13 @@ impl EmvConnection<'_> {
 
     // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
     fn send_generate_ac(&mut self, requested_cryptogram_type : CryptogramType, cdol_tag : &str) -> Result<CryptogramType, ()> {
+
+        // GET CHALLENGE might be needed to the 9F4C value
+        if let None = self.get_tag_value("9F4C") {
+            let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
+            self.add_tag("9F4C", tag_9f4c_icc_dynamic_number);
+        }
+
         let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
 
@@ -1102,33 +1111,30 @@ impl EmvConnection<'_> {
     pub fn handle_select_payment_system_environment(&mut self) -> Result<Vec<EmvApplication>, ()> {
         debug!("Selecting Payment System Environment (PSE):");
         let contact_pse_name = "1PAY.SYS.DDF01";
-        let _contactless_pse_name = "2PAY.SYS.DDF01";
+        let contactless_pse_name = "2PAY.SYS.DDF01";
 
         let pse_name = contact_pse_name;
 
-        let (response_trailer, _) = self.send_apdu_select(&pse_name.as_bytes());
+        if pse_name.eq(contactless_pse_name) {
+            self.contactless = true;
+        }
+
+        let (response_trailer, response_data) = self.send_apdu_select(&pse_name.as_bytes());
         if !is_success_response(&response_trailer) {
             warn!("Could not select {:?}", pse_name);
             return Err(());
         }
 
-        let sfi_data = self.get_tag_value("88").unwrap().clone();
-        assert_eq!(sfi_data.len(), 1);
-        let short_file_identifier = sfi_data[0];
 
-        debug!("Read available AIDs:");
+
 
         let mut all_applications : Vec<EmvApplication> = Vec::new();
 
-        for record_index in 0x01..0xFF {
-            match self.read_record(short_file_identifier, record_index) {
-                Some(data) => {
-                    if data[0] != 0x70 {
-                        warn!("Expected template data");
-                        return Err(());
-                    }
-
-                    if let Value::Constructed(application_templates) = parse_tlv(&data).unwrap().value() {
+        if self.contactless {
+            //EMV Contactless Book B, Entry Point Specification v2.6, Table3-2: SELECT Response Message Data Field (FCI) of the PPSE
+            match find_tlv_tag(&response_data, "BF0C") {
+                Some(tag_bf0c) => {
+                    if let Value::Constructed(application_templates) = tag_bf0c.value() {
                         for tag_61_application_template in application_templates {
                             if let Value::Constructed(application_template) = tag_61_application_template.value() {
                                 self.tags.clear();
@@ -1140,26 +1146,89 @@ impl EmvConnection<'_> {
                                     }
                                 }
 
-                                let tag_4f_aid = self.get_tag_value("4F").unwrap();
-                                let tag_50_label = self.get_tag_value("50").unwrap();
-                                
-                                if let Some(tag_87_priority) = self.get_tag_value("87") {
-                                    all_applications.push(EmvApplication {
-                                        aid: tag_4f_aid.clone(),
-                                        label: tag_50_label.clone(),
-                                        priority: tag_87_priority.clone()
-                                    });
-                                } else {
-                                    debug!("Skipping application. AID:{:02X?}, label:{:?}", tag_4f_aid, str::from_utf8(&tag_50_label).unwrap());
-                                }
 
+
+                                let tag_4f_aid = self.get_tag_value("4F").unwrap();
+                                let tag_50_label = match self.get_tag_value("50") {
+                                    Some(v) => v,
+                                    None => "UNKNOWN".as_bytes()
+                                };
+
+                                //EMV Contactless Book B, Entry Point Specification v2.6, Table3-3: Format of Application Priority Indicator
+                                let tag_87_priority = match self.get_tag_value("87") {
+                                    Some(v) => v,
+                                    None => "01".as_bytes()
+                                };
+                                
+                                all_applications.push(EmvApplication {
+                                    aid: tag_4f_aid.clone(),
+                                    label: tag_50_label.to_vec(),
+                                    priority: tag_87_priority.to_vec()
+                                });
+
+                                // TODO: Since in NFC we're interested only of a single application
+                                //       However we should select the one with the best priority
+
+                                break;
                             }
                         }
                     }
-
                 },
-                None => break
-            };
+                None => {
+                    warn!("Expected tag BF0C not found! pse:{}", pse_name);
+                    return Err(());
+                }
+            }
+
+        } else {
+            let sfi_data = self.get_tag_value("88").unwrap().clone();
+            assert_eq!(sfi_data.len(), 1);
+            let short_file_identifier = sfi_data[0];
+
+            debug!("Read available AIDs:");
+
+            for record_index in 0x01..0xFF {
+                match self.read_record(short_file_identifier, record_index) {
+                    Some(data) => {
+                        if data[0] != 0x70 {
+                            warn!("Expected template data");
+                            return Err(());
+                        }
+
+                        if let Value::Constructed(application_templates) = parse_tlv(&data).unwrap().value() {
+                            for tag_61_application_template in application_templates {
+                                if let Value::Constructed(application_template) = tag_61_application_template.value() {
+                                    self.tags.clear();
+
+                                    for application_template_child_tag in application_template {
+                                        if let Value::Primitive(value) = application_template_child_tag.value() {
+                                            let tag_name = hex::encode(application_template_child_tag.tag().to_bytes()).to_uppercase();
+                                            self.add_tag(&tag_name, value.to_vec());
+                                        }
+                                    }
+
+                                    let tag_4f_aid = self.get_tag_value("4F").unwrap();
+                                    let tag_50_label = self.get_tag_value("50").unwrap();
+                                    
+                                    if let Some(tag_87_priority) = self.get_tag_value("87") {
+                                        all_applications.push(EmvApplication {
+                                            aid: tag_4f_aid.clone(),
+                                            label: tag_50_label.clone(),
+                                            priority: tag_87_priority.clone()
+                                        });
+                                    } else {
+                                        debug!("Skipping application. AID:{:02X?}, label:{:?}", tag_4f_aid, str::from_utf8(&tag_50_label).unwrap());
+                                    }
+
+                                }
+                            }
+                        }
+
+                    },
+                    None => break
+                };
+            }
+
         }
 
         if all_applications.is_empty() {
@@ -1943,6 +2012,50 @@ fn parse_tlv(raw_data : &[u8]) -> Option<Tlv> {
 
     return tlv_data;
 }
+
+fn find_tlv_tag(buf: &[u8], tag: &str) -> Option<Tlv> {
+    let mut read_buffer = buf;
+
+    loop {
+        let (tlv_data, leftover_buffer) = Tlv::parse(read_buffer);
+
+        let tlv_data : Tlv = match tlv_data {
+            Ok(tlv) => tlv,
+            Err(err) => {
+                if leftover_buffer.len() > 0 {
+                    trace!("Could not parse as TLV! error:{:?}, data: {:02X?}", err, read_buffer);
+                }
+
+                break;
+            }
+
+        };
+
+        read_buffer = leftover_buffer;
+
+        let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
+
+        if tag_name.eq(tag) {
+            return Some(tlv_data);
+        }
+
+        if let Value::Constructed(v) = tlv_data.value() {
+            for tlv_tag in v {
+                let child_tlv : Option<Tlv> = find_tlv_tag(&tlv_tag.to_vec(), tag);
+                if child_tlv.is_some() {
+                    return child_tlv;
+                }
+            }
+        }
+
+        if leftover_buffer.len() == 0 {
+            break;
+        }
+    }
+
+    None
+}
+
 
 pub fn get_ca_public_key<'a>(ca_data : &'a HashMap<String, CertificateAuthority>, rid : &[u8], index : &[u8]) -> Option<&'a RsaPublicKey> {
     match ca_data.get(&hex::encode_upper(&rid)) {
