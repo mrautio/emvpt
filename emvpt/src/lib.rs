@@ -882,19 +882,20 @@ impl EmvConnection<'_> {
         // bit 1 = RFU
         self.icc.capabilities.cda = get_bit!(auc_b1, 0);
 
-        let tag_9f07_application_usage_control = self.get_tag_value("9F07").unwrap();
-        let auc_b1 : u8 = tag_9f07_application_usage_control[0];
-        let auc_b2 : u8 = tag_9f07_application_usage_control[1];
-        self.icc.usage.domestic_cash_transactions = get_bit!(auc_b1, 7);
-        self.icc.usage.international_cash_transactions = get_bit!(auc_b1, 6);
-        self.icc.usage.domestic_goods = get_bit!(auc_b1, 5);
-        self.icc.usage.international_goods = get_bit!(auc_b1, 4);
-        self.icc.usage.domestic_services = get_bit!(auc_b1, 3);
-        self.icc.usage.international_services = get_bit!(auc_b1, 2);
-        self.icc.usage.atms = get_bit!(auc_b1, 1);
-        self.icc.usage.terminals_other_than_atms = get_bit!(auc_b1, 0);
-        self.icc.usage.domestic_cashback = get_bit!(auc_b2, 7);
-        self.icc.usage.international_cashback = get_bit!(auc_b2, 6);
+        if let Some(tag_9f07_application_usage_control) = self.get_tag_value("9F07") {
+            let auc_b1 : u8 = tag_9f07_application_usage_control[0];
+            let auc_b2 : u8 = tag_9f07_application_usage_control[1];
+            self.icc.usage.domestic_cash_transactions = get_bit!(auc_b1, 7);
+            self.icc.usage.international_cash_transactions = get_bit!(auc_b1, 6);
+            self.icc.usage.domestic_goods = get_bit!(auc_b1, 5);
+            self.icc.usage.international_goods = get_bit!(auc_b1, 4);
+            self.icc.usage.domestic_services = get_bit!(auc_b1, 3);
+            self.icc.usage.international_services = get_bit!(auc_b1, 2);
+            self.icc.usage.atms = get_bit!(auc_b1, 1);
+            self.icc.usage.terminals_other_than_atms = get_bit!(auc_b1, 0);
+            self.icc.usage.domestic_cashback = get_bit!(auc_b2, 7);
+            self.icc.usage.international_cashback = get_bit!(auc_b2, 6);
+        }
 
         debug!("{:?}", self.icc);
 
@@ -1057,22 +1058,23 @@ impl EmvConnection<'_> {
     }
 
     // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
+    // ref. EMV Contactless Book C-2, 7.6 Procedure – Prepare Generate AC Command
     fn send_generate_ac(&mut self, requested_cryptogram_type : CryptogramType, cdol_tag : &str) -> Result<CryptogramType, ()> {
 
-        // GET CHALLENGE might be needed to the 9F4C value
-        if let None = self.get_tag_value("9F4C") {
-            let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
-            self.add_tag("9F4C", tag_9f4c_icc_dynamic_number);
+        let mut p1_reference_control_parameter : u8 = requested_cryptogram_type.into();
+        if self.icc.capabilities.cda {
+            set_bit!(p1_reference_control_parameter, 4, self.settings.terminal.capabilities.cda);
+
+            // GET CHALLENGE might be needed to the 9F4C value
+            if let None = self.get_tag_value("9F4C") {
+                let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
+                self.add_tag("9F4C", tag_9f4c_icc_dynamic_number);
+            }
         }
 
         let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
         assert!(cdol_data.len() <= 0xFF);
 
-        let mut p1_reference_control_parameter : u8 = requested_cryptogram_type.into();
-        if self.icc.capabilities.cda {
-            // TODO: implement CDA
-            set_bit!(p1_reference_control_parameter, 4, self.settings.terminal.capabilities.cda);
-        }
 
         let apdu_command_generate_ac = b"\x80\xAE";
         let mut generate_ac_command = apdu_command_generate_ac.to_vec();
@@ -1582,9 +1584,10 @@ impl EmvConnection<'_> {
 
         checksum_data.extend_from_slice(data_authentication);
 
-        let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&self.get_tag_value("9F4A").unwrap()[..]).unwrap();
-
-        checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
+        if let Some(tag_9f4a_static_data_authentication_tag_list) = self.get_tag_value("9F4A") {
+            let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&tag_9f4a_static_data_authentication_tag_list[..]).unwrap();
+            checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
+        }
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
 
