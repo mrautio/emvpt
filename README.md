@@ -1,8 +1,8 @@
 ![Build and test](https://github.com/mrautio/emvpt/workflows/Docker%20Image%20CI/badge.svg)
 
-# emvpt
+# emvpt - Minimum Viable Payment Terminal
 
-Minimum Viable Payment Terminal
+Project's intention is to support simple EMV transaction cases for chip and NFC.
 
 ## Terminal simulator run
 
@@ -33,6 +33,9 @@ terminalsimulator$ cargo upgrade && cargo update && cargo audit
 
 ## References
 
-* http://www.fintrnmsgtool.com/iso-processing-code.html
-* https://www.currency-iso.org/dam/downloads/lists/list_one.xml
-* https://www.iso.org/obp/ui/#iso:code:3166:FI
+* [EMV Contact Specifications](https://www.emvco.com/emv-technologies/contact/)
+* [EMV Contactless Specifications](https://www.emvco.com/emv-technologies/contactless/)
+* ISO codes
+  * [Processing codes](http://www.fintrnmsgtool.com/iso-processing-code.html)
+  * [Country codes](https://www.currency-iso.org/dam/downloads/lists/list_one.xml)
+    * [FI country code](https://www.iso.org/obp/ui/#iso:code:3166:FI)
