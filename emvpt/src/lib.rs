@@ -1830,6 +1830,8 @@ impl EmvConnection<'_> {
     }
 
     fn get_tag_list_tag_values(&self, tag_list : &[u8]) -> Result<Vec<u8>, ()> {
+        // EMV Book 3, 5.4 Rules for Using a Data Object List (DOL)
+
         let mut output : Vec<u8> = Vec::new();
 
         if tag_list.len() < 2 {
@@ -1864,14 +1866,17 @@ impl EmvConnection<'_> {
                     }
                 }
 
+                let default_value : Vec<u8> = vec![0; tag_value_length];
                 let value = match self.get_tag_value(&tag_name) {
                     Some(value) => value,
                     None => {
-                        warn!("tag {:?} has no value", tag_name);
-                        return Err(());
+                        debug!("tag {:?} has no value, filling with zeros", tag_name);
+                        
+                        &default_value
                     }
                 };
 
+                // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
                 if value.len() != tag_value_length {
                     warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", tag_name, value.len(), tag_value_length);
                     return Err(());
