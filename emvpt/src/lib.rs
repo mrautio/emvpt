@@ -294,6 +294,70 @@ impl Icc {
     }
 }
 
+// EMV Contactless Book A, Table 5-4: Terminal Transaction Qualifier (TTQ)
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct TerminalTransactionQualifiers {
+    //byte 1
+    pub mag_stripe_mode_supported : bool,
+    //7bit rfu
+    pub emv_mode_supported : bool,
+    pub emv_contact_chip_supported : bool,
+    pub offline_only_reader : bool,
+    pub online_pin_supported : bool,
+    pub signature_supported : bool,
+    pub offline_data_authentication_for_online_authorizations_supported : bool,
+
+    //byte 2
+    pub online_cryptogram_required : bool,
+    pub cvm_required : bool,
+    pub contact_chip_offline_pin_supported : bool,
+    //5-1 bits RFU
+
+    //byte 3
+    pub issuer_update_processing_supported : bool,
+    pub consumer_device_cvm_supported : bool
+    //6-1 bits RFU
+
+    //byte 4 RFU
+}
+
+impl From<TerminalTransactionQualifiers> for Vec<u8> {
+    fn from(ttq: TerminalTransactionQualifiers) -> Self {
+        // EMV Contactless Book A, Table 5-4: Terminal Transaction Qualifier (TTQ)
+        let mut b1 : u8 = 0b0000_0000;
+        let mut b2 : u8 = 0b0000_0000;
+        let mut b3 : u8 = 0b0000_0000;
+        let     b4 : u8 = 0b0000_0000; //byte 4 RFU
+
+        set_bit!(b1, 7, ttq.mag_stripe_mode_supported);
+        //7 bit RFU
+        set_bit!(b1, 5, ttq.emv_mode_supported);
+        set_bit!(b1, 4, ttq.emv_contact_chip_supported);
+        set_bit!(b1, 3, ttq.offline_only_reader);
+        set_bit!(b1, 2, ttq.online_pin_supported);
+        set_bit!(b1, 1, ttq.signature_supported);
+        set_bit!(b1, 0, ttq.offline_data_authentication_for_online_authorizations_supported);
+
+        set_bit!(b2, 7, ttq.online_cryptogram_required);
+        set_bit!(b2, 6, ttq.cvm_required);
+        set_bit!(b2, 5, ttq.contact_chip_offline_pin_supported);
+        //5-1 bits RFU
+
+        set_bit!(b3, 7, ttq.issuer_update_processing_supported);
+        set_bit!(b3, 6, ttq.consumer_device_cvm_supported);
+        //6-1 bits RFU
+
+        let mut value : Vec<u8> = Vec::new();
+        value.push(b1);
+        value.push(b2);
+        value.push(b3);
+        value.push(b4);
+
+        value
+    }
+}
+
+
 // TODO: support EMV Book 4, A2 Terminal Capabilities (a.k.a. 9F33)
 #[derive(Serialize, Deserialize)]
 pub struct Terminal {
@@ -301,7 +365,8 @@ pub struct Terminal {
     pub capabilities : Capabilities,
     pub tvr : TerminalVerificationResults,
     pub cryptogram_type : CryptogramType,
-    pub cryptogram_type_arqc : CryptogramType
+    pub cryptogram_type_arqc : CryptogramType,
+    pub terminal_transaction_qualifiers : TerminalTransactionQualifiers
 }
 
 // EMV Book 3, C5 Terminal Verification Results
@@ -1151,8 +1216,6 @@ impl EmvConnection<'_> {
                                     }
                                 }
 
-
-
                                 let tag_4f_aid = self.get_tag_value("4F").unwrap();
                                 let tag_50_label = match self.get_tag_value("50") {
                                     Some(v) => v,
@@ -1294,6 +1357,11 @@ impl EmvConnection<'_> {
         if !self.get_tag_value("8A").is_some() {
             // ref. EMV Book 4, A6 Authorisation Response Code
             self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
+        }
+
+        if !self.get_tag_value("9F66").is_some() {
+            let tag_9f66_ttq : Vec<u8> = self.settings.terminal.terminal_transaction_qualifiers.into();
+            self.add_tag("9F66", tag_9f66_ttq);
         }
 
         Ok(())

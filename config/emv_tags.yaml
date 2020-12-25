@@ -217,6 +217,9 @@
 '9F2D':
   tag: '9F2D'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate'
+'9F66':
+  tag: '9F66'
+  name: 'Terminal Transaction Qualifiers (TTQ)'
 '9F69':
   tag: '9F69'
   name: 'Card Authentication Related Data'
