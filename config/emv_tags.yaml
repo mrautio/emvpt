@@ -154,6 +154,9 @@
 '9F38':
   tag: '9F38'
   name: 'Processing Options Data Object List (PDOL)'
+'83':
+  tag: '83'
+  name: 'Command Template'
 '8A':
   tag: '8A'
   name: 'Authorisation Response Code'

@@ -706,19 +706,24 @@ impl EmvConnection<'_> {
         let apdu_command_get_processing_options = b"\x80\xA8\x00\x00";
         let mut get_processing_options_command = apdu_command_get_processing_options.to_vec();
 
-        let tag_9f38_pdol = self.get_tag_value("9F38");
-        if tag_9f38_pdol.is_some() {
-            get_processing_options_command.push((tag_9f38_pdol.unwrap().len() + 2) as u8); // lc
-            get_processing_options_command.push(0x83); // data
-            get_processing_options_command.extend_from_slice(&tag_9f38_pdol.unwrap()[..]); // data
-            get_processing_options_command.push(0x00); // le
-        } else {
-            get_processing_options_command.push(0x02); // lc
-            get_processing_options_command.push(0x83); // data
-            get_processing_options_command.push(0x00); // le
+        match self.get_tag_value("9F38") {
+            Some(tag_9f38_pdol) => {
+                let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol[..]).unwrap();
+
+                get_processing_options_command.push((pdol_data.len() + 2) as u8); // lc
+                // data
+                get_processing_options_command.push(0x83); // tag 83
+                get_processing_options_command.push(pdol_data.len() as u8); // tag 83 length
+                get_processing_options_command.extend_from_slice(&pdol_data[..]); // pdol list
+                get_processing_options_command.push(0x00); // le
+            },
+            None => {
+                get_processing_options_command.push(0x02); // lc
+                get_processing_options_command.push(0x83); // data
+                get_processing_options_command.push(0x00); // le
+            }
         }
 
-        let get_processing_options_command = b"\x80\xA8\x00\x00\x02\x83\x00".to_vec();
         let (response_trailer, response_data) = self.send_apdu(&get_processing_options_command);
         if !is_success_response(&response_trailer) {
             warn!("Could not get processing options");
