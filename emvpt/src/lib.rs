@@ -1641,37 +1641,62 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_dynamic_data_authentication(&mut self) -> Result<(),()> {
-        debug!("Perform Dynamic Data Authentication (DDA):");
-
-        let ddol_default_value = b"\x9f\x37\x04".to_vec();
-        let tag_9f49_ddol = match self.get_tag_value("9F49") {
-            Some(ddol) => ddol,
-            // fall-back to a default DDOL
-            None => &ddol_default_value
-        };
-
-        let ddol_data = self.get_tag_list_tag_values(&tag_9f49_ddol[..]).unwrap();
 
         let mut auth_data : Vec<u8> = Vec::new();
-        auth_data.extend_from_slice(&ddol_data[..]);
 
-        let apdu_command_internal_authenticate = b"\x00\x88\x00\x00";
-        let mut internal_authenticate_command = apdu_command_internal_authenticate.to_vec();
-        internal_authenticate_command.push(auth_data.len() as u8);
-        internal_authenticate_command.extend_from_slice(&auth_data[..]);
-        internal_authenticate_command.push(0x00);
+        if let Some(tag_9f69_card_authentication_related_data) = self.get_tag_value("9F69") {
+            // ref. EMV Contactless Book C-3, Annex C Fast Dynamic Data Authentication (fDDA)
+            // ref. EMV Contactless Book C-7, Annex B Fast Dynamic Data Authentication (fDDA)
 
-        let (response_trailer, response_data) = self.send_apdu(&internal_authenticate_command);
-        if !is_success_response(&response_trailer) {
-            warn!("Could not process internal authenticate");
-            return Err(());
-        }
+            debug!("Perform Fast Dynamic Data Authentication (fDDA):");
 
-        if response_data[0] == 0x80 {
-            self.add_tag("9F4B", response_data[3..].to_vec());
-        } else if response_data[0] != 0x77 {
-            warn!("Unrecognized response");
-            return Err(());
+            if !self.contactless {
+                warn!("fDDA expected only for contactless");
+                return Err(());
+            }
+
+            if tag_9f69_card_authentication_related_data[0] != 0x01 {
+                warn!("fDDA version not recognized:{}",tag_9f69_card_authentication_related_data[0]);
+                return Err(());
+            }
+
+            auth_data.extend_from_slice(&self.get_tag_value("9F37").unwrap()[..]);
+            auth_data.extend_from_slice(&self.get_tag_value("9F02").unwrap()[..]);
+            auth_data.extend_from_slice(&self.get_tag_value("5F2A").unwrap()[..]);
+            auth_data.extend_from_slice(&tag_9f69_card_authentication_related_data[..]);
+
+        } else {
+            debug!("Perform Dynamic Data Authentication (DDA):");
+
+            let ddol_default_value = b"\x9f\x37\x04".to_vec();
+            let tag_9f49_ddol = match self.get_tag_value("9F49") {
+                Some(ddol) => ddol,
+                // fall-back to a default DDOL
+                None => &ddol_default_value
+            };
+
+            let ddol_data = self.get_tag_list_tag_values(&tag_9f49_ddol[..]).unwrap();
+
+            auth_data.extend_from_slice(&ddol_data[..]);
+
+            let apdu_command_internal_authenticate = b"\x00\x88\x00\x00";
+            let mut internal_authenticate_command = apdu_command_internal_authenticate.to_vec();
+            internal_authenticate_command.push(auth_data.len() as u8);
+            internal_authenticate_command.extend_from_slice(&auth_data[..]);
+            internal_authenticate_command.push(0x00);
+
+            let (response_trailer, response_data) = self.send_apdu(&internal_authenticate_command);
+            if !is_success_response(&response_trailer) {
+                warn!("Could not process internal authenticate");
+                return Err(());
+            }
+
+            if response_data[0] == 0x80 {
+                self.add_tag("9F4B", response_data[3..].to_vec());
+            } else if response_data[0] != 0x77 {
+                warn!("Unrecognized response");
+                return Err(());
+            }
         }
 
         let tag_9f4b_signed_data_decrypted_dynamic_data = self.validate_signed_dynamic_application_data(&auth_data[..]).unwrap();
