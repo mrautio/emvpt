@@ -1057,6 +1057,27 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    fn validate_ac(&self, requested_cryptogram_type : CryptogramType) -> Result<CryptogramType, ()> {
+        if let CryptogramType::ApplicationAuthenticationCryptogram = requested_cryptogram_type {
+            warn!("Transaction declined by terminal (AAC)");
+            return Err(());
+        }
+
+        let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
+        let icc_cryptogram_type = CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
+
+        if let CryptogramType::ApplicationAuthenticationCryptogram = icc_cryptogram_type {
+            warn!("Transaction declined by ICC (AAC)");
+            return Err(());
+        }
+
+        let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
+        let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
+        let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
+
+        Ok(icc_cryptogram_type)
+    }
+
     // ref. EMV Book 3, 6.5.5 GENERATE APPLICATION CRYPTOGRAM
     // ref. EMV Contactless Book C-2, 7.6 Procedure – Prepare Generate AC Command
     fn send_generate_ac(&mut self, requested_cryptogram_type : CryptogramType, cdol_tag : &str) -> Result<CryptogramType, ()> {
@@ -1103,40 +1124,30 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        if let CryptogramType::ApplicationAuthenticationCryptogram = requested_cryptogram_type {
-            warn!("Transaction declined by terminal (AAC)");
-            return Err(());
-        }
-
-        let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
-        let icc_cryptogram_type = CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
-
-        if let CryptogramType::ApplicationAuthenticationCryptogram = icc_cryptogram_type {
-            warn!("Transaction declined by ICC (AAC)");
-            return Err(());
-        }
-
         if get_bit!(p1_reference_control_parameter, 4) {
             self.handle_application_cryptogram_card_authentication(&response_data[3..], cdol_tag)?;
         }
 
-        let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
-        let _tag_9f26_application_cryptogram = self.get_tag_value("9F26");
-        let _tag_9f10_issuer_application_data = self.get_tag_value("9F10");
-
-        Ok(icc_cryptogram_type)
+        self.validate_ac(requested_cryptogram_type)
     }
 
     pub fn handle_1st_generate_ac(&mut self) -> Result<CryptogramType, ()> {
         debug!("Generate Application Cryptogram (GENERATE AC) - first issuance:");
 
-        let icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C")?;
-        
-        if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
-            // handle_2nd_generate_ac needed
-        } else if let CryptogramType::AuthorisationRequestCryptogram = self.settings.terminal.cryptogram_type {
-            warn!("Transaction terminated by terminal - ARQC requested but got unexpected return type from ICC");
-            return Err(());
+        let icc_cryptogram_type;
+        if self.contactless && self.get_tag_value("9F26").is_some() {
+            debug!("Application Cryptogram returned in GET PROCESSING OPTIONS");
+            // ref. EMV Contactless Book C-3, A.2 Data Elements by Name - cryptogram returned in GET PROCESSING OPTIONS (Kernel 3, Visa)
+            icc_cryptogram_type = self.validate_ac(self.settings.terminal.cryptogram_type)?;
+        } else {
+            icc_cryptogram_type = self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C")?;
+            
+            if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
+                // handle_2nd_generate_ac needed
+            } else if let CryptogramType::AuthorisationRequestCryptogram = self.settings.terminal.cryptogram_type {
+                warn!("Transaction terminated by terminal - ARQC requested but got unexpected return type from ICC");
+                return Err(());
+            }
         }
 
         Ok(icc_cryptogram_type)

@@ -35,6 +35,8 @@ terminalsimulator$ cargo upgrade && cargo update && cargo audit
 
 * [EMV Contact Specifications](https://www.emvco.com/emv-technologies/contact/)
 * [EMV Contactless Specifications](https://www.emvco.com/emv-technologies/contactless/)
+  * EMV Contactless Book C-2 - Kernel 2 (MasterCard)
+  * EMV Contactless Book C-3 - Kernel 3 (Visa)
 * ISO codes
   * [Processing codes](http://www.fintrnmsgtool.com/iso-processing-code.html)
   * [Country codes](https://www.currency-iso.org/dam/downloads/lists/list_one.xml)
