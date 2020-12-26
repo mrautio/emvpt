@@ -1425,6 +1425,11 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_public_keys(&mut self, application : &EmvApplication) -> Result<(), ()> {
+        if self.get_tag_value("8F").is_none() {
+            debug!("Card does not support offline data authentication");
+            return Ok(());
+        }
+
         let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application)?;
         self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..]));
 
