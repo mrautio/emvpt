@@ -37,7 +37,7 @@ terminal:
     default_tdol_used: false
     issuer_authentication_failed: false
     script_processing_failed_before_final_generate_ac: false
-    script_processing_failed_after_final_generate_ac : false
+    script_processing_failed_after_final_generate_ac: false
   terminal_transaction_qualifiers:
     mag_stripe_mode_supported: false
     emv_mode_supported: true
@@ -54,11 +54,7 @@ terminal:
   cryptogram_type: 'AuthorisationRequestCryptogram'
   cryptogram_type_arqc: 'TransactionCertificate'
 default_tags:
-  '9F03': '000000000000'
   '9F1A': '0246'
   '5F2A': 0978
   '9C': '21'
   '9F35': '23'
-  '9F45': '0000'
-  '91': '00000000000000000000'
-  '9F7C': '0000000000000000000000000000000000000000'
