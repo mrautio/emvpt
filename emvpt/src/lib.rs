@@ -17,6 +17,7 @@ use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Timelike, Datelike, Utc};
+use regex::Regex;
 
 pub mod bcdutil;
 
@@ -308,8 +309,8 @@ pub struct TerminalTransactionQualifiers {
     pub offline_data_authentication_for_online_authorizations_supported : bool,
 
     //byte 2
-    pub online_cryptogram_required : bool,
-    pub cvm_required : bool,
+    pub online_cryptogram_required : bool, // transient value
+    pub cvm_required : bool, // transient value
     pub contact_chip_offline_pin_supported : bool,
     //5-1 bits RFU
 
@@ -540,6 +541,15 @@ impl EmvConnection<'_> {
 
     }
 
+    fn is_contactless_reader(&self, reader_name : &str) -> bool {
+        if Regex::new(r"^ACS ACR12").unwrap().is_match(reader_name) {
+            debug!("Card reader is deemed contactless");
+            return true;
+        }
+
+        false
+    }
+
     pub fn connect_to_card(&mut self) -> Result<(), ReaderError> {
         if !self.ctx.is_some() {
             self.ctx = match Context::establish(Scope::User) {
@@ -569,7 +579,10 @@ impl EmvConnection<'_> {
         for reader in readers {
             self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
                 Ok(card) => {
-                    debug!("Card reader: {:?}", reader);
+                    self.contactless = self.is_contactless_reader(reader.to_str().unwrap());
+
+                    debug!("Card reader: {:?}, contactless:{}", reader, self.contactless);
+
                     Some(card)
                 },
                 _ => None
@@ -1196,10 +1209,11 @@ impl EmvConnection<'_> {
         let contact_pse_name = "1PAY.SYS.DDF01";
         let contactless_pse_name = "2PAY.SYS.DDF01";
 
-        let pse_name = contact_pse_name;
+        let mut pse_name = contact_pse_name;
 
-        if pse_name.eq(contactless_pse_name) {
+        if self.contactless {
             self.contactless = true;
+            pse_name = contactless_pse_name;
         }
 
         let (response_trailer, response_data) = self.send_apdu_select(&pse_name.as_bytes());
@@ -1207,9 +1221,6 @@ impl EmvConnection<'_> {
             warn!("Could not select {:?}", pse_name);
             return Err(());
         }
-
-
-
 
         let mut all_applications : Vec<EmvApplication> = Vec::new();
 
@@ -2230,6 +2241,8 @@ mod tests {
 
     static SETTINGS_FILE : &str = "../config/settings.yaml";
 
+    static mut TEST_DATA_FILE : &str = "test_data.yaml";
+
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
         req : String,
@@ -2257,7 +2270,7 @@ mod tests {
 
         let mut response = b"\x6A\x82".to_vec(); // file not found error
 
-        let test_data : Vec<ApduRequestResponse> = serde_yaml::from_str(&fs::read_to_string("test_data.yaml").unwrap()).unwrap();
+        let test_data : Vec<ApduRequestResponse> = serde_yaml::from_str(&fs::read_to_string(unsafe { TEST_DATA_FILE }).unwrap()).unwrap();
 
         if let Some(req) = find_dummy_apdu(&test_data, &apdu[..]) {
             response = ApduRequestResponse::to_raw_vec(&req.res);
@@ -2343,6 +2356,11 @@ mod tests {
     }
 
     fn setup_connection(connection : &mut EmvConnection) -> Result<(), ()> {
+        unsafe {
+            TEST_DATA_FILE = "test_data.yaml";    
+        }
+        
+        connection.contactless = false;
         connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
         connection.pse_application_select_callback = Some(&pse_application_select);
         connection.pin_callback = Some(&pin_entry);
