@@ -9,7 +9,6 @@ edition = "2018"
 [dev-dependencies]
 
 [dependencies]
-pcsc = "2.4.0"
 iso7816-tlv = "0.4.1"
 hexplay = "0.2.1"
 asn1_der = "0.7.2"
@@ -24,4 +23,3 @@ rand = "0.8.0"
 openssl-sys = "0.9.59"
 openssl = "0.10.31"
 chrono = "0.4.19"
-regex = "1.4.3"

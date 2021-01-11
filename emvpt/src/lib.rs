@@ -1,4 +1,3 @@
-use pcsc::{Context, Card, Scope, ShareMode, Protocols, MAX_BUFFER_SIZE, MAX_ATR_SIZE};
 use hexplay::HexViewBuilder;
 use iso7816_tlv::ber::{Tlv, Tag, Value};
 use std::collections::HashMap;
@@ -17,33 +16,8 @@ use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Timelike, Datelike, Utc};
-use regex::Regex;
 
 pub mod bcdutil;
-
-type ApduInterfaceCustomFunction = fn(&[u8]) -> Result<Vec<u8>, ()>;
-
-pub enum ApduInterface<'a> {
-    Pcsc(&'a Option<&'a Card>),
-    Function(ApduInterfaceCustomFunction)
-}
-
-
-fn send_apdu_raw<'apdu>(interface : &ApduInterface, apdu : &'apdu [u8]) -> Result<Vec<u8>, ()> {
-    let mut output : Vec<u8> = Vec::new();
-
-    match interface {
-        ApduInterface::Pcsc(card) => {
-            let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
-            output.extend_from_slice(card.unwrap().transmit(apdu, &mut apdu_response_buffer).unwrap());
-        },
-        ApduInterface::Function(function) => {
-            output.extend_from_slice(&function(apdu).unwrap()[..]);
-        }
-    }
-
-    Ok(output)
-}
 
 macro_rules! get_bit {
     ($byte:expr, $bit:expr) => (if $byte & (1 << $bit) != 0 { true } else { false });
@@ -474,7 +448,6 @@ impl From<TerminalVerificationResults> for Vec<u8> {
     }
 }
 
-
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationFiles {
     emv_tags : String,
@@ -488,12 +461,14 @@ pub struct Settings {
     default_tags : HashMap<String, String>
 }
 
+pub trait ApduInterface {
+    fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()>;
+}
+
 pub struct EmvConnection<'a> {
     pub tags : HashMap<String, Vec<u8>>,
-    ctx : Option<Context>,
-    card : Option<Card>,
-    pub interface : Option<ApduInterface<'a>>,
-    contactless : bool,
+    pub interface : Option<&'a dyn ApduInterface>,
+    pub contactless : bool,
     emv_tags : HashMap<String, EmvTag>,
     pub settings : Settings,
     pub icc : Icc,
@@ -503,13 +478,6 @@ pub struct EmvConnection<'a> {
     pub start_transaction_callback : Option<&'a dyn Fn(&mut EmvConnection) -> Result<(), ()>>
 }
 
-pub enum ReaderError {
-    ReaderConnectionFailed(String),
-    ReaderNotFound,
-    CardConnectionFailed(String),
-    CardNotFound
-}
-
 impl EmvConnection<'_> {
     pub fn new(settings_file : &str) -> Result<EmvConnection<'static>, String> {
         let settings : Settings = serde_yaml::from_str(&fs::read_to_string(settings_file).unwrap()).unwrap();
@@ -517,8 +485,6 @@ impl EmvConnection<'_> {
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
-            ctx : None,
-            card : None,
             emv_tags : emv_tags,
             settings : settings,
             icc : Icc::new(),
@@ -539,74 +505,6 @@ impl EmvConnection<'_> {
             info!("value: {:02X?} = {}", value, String::from_utf8_lossy(&value).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
         }
 
-    }
-
-    fn is_contactless_reader(&self, reader_name : &str) -> bool {
-        if Regex::new(r"^ACS ACR12").unwrap().is_match(reader_name) {
-            debug!("Card reader is deemed contactless");
-            return true;
-        }
-
-        false
-    }
-
-    pub fn connect_to_card(&mut self) -> Result<(), ReaderError> {
-        if !self.ctx.is_some() {
-            self.ctx = match Context::establish(Scope::User) {
-                Ok(ctx) => Some(ctx),
-                Err(err) => {
-                    return Err(ReaderError::ReaderConnectionFailed(format!("Failed to establish context: {}", err)));
-                }
-            };
-        }
-
-        let ctx = self.ctx.as_ref().unwrap();
-        let readers_size = match ctx.list_readers_len() {
-            Ok(readers_size) => readers_size,
-            Err(err) => {
-                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers size: {}", err)));
-            }
-        };
-
-        let mut readers_buf = vec![0; readers_size];
-        let readers = match ctx.list_readers(&mut readers_buf) {
-            Ok(readers) => readers,
-            Err(err) => {
-                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
-            }
-        };
-
-        for reader in readers {
-            self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
-                Ok(card) => {
-                    self.contactless = self.is_contactless_reader(reader.to_str().unwrap());
-
-                    debug!("Card reader: {:?}, contactless:{}", reader, self.contactless);
-
-                    Some(card)
-                },
-                _ => None
-            };
-
-            if self.card.is_some() {
-                break;
-            }
-        }
-
-        if self.card.is_some() {
-            const MAX_NAME_SIZE : usize = 2048;
-            let mut names_buffer = [0; MAX_NAME_SIZE];
-            let mut atr_buffer = [0; MAX_ATR_SIZE];
-            let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
-
-            // https://www.eftlab.com/knowledge-base/171-atr-list-full/
-            debug!("Card ATR:\n{}", HexViewBuilder::new(card_status.atr()).finish());
-            debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
-        } else {
-            return Err(ReaderError::CardNotFound);
-        }
-
-        Ok(())
     }
 
     pub fn get_tag_value(&self, tag_name : &str) -> Option<&Vec<u8>> {
@@ -642,18 +540,11 @@ impl EmvConnection<'_> {
         let mut new_apdu_command;
         let mut apdu_command = apdu;
 
-
-        let card = &self.card.as_ref();
-        let mut interface : &ApduInterface = &ApduInterface::Pcsc(card);
-        if self.interface.is_some() {
-            interface = self.interface.as_ref().unwrap();
-        }
-
         loop {
             // Send an APDU command.
             debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
 
-            let apdu_response = send_apdu_raw(interface, apdu_command).unwrap();
+            let apdu_response = self.interface.unwrap().send_apdu(apdu_command).unwrap();
 
             response_data.extend_from_slice(&apdu_response[0..apdu_response.len()-2]);
 
@@ -2241,8 +2132,6 @@ mod tests {
 
     static SETTINGS_FILE : &str = "../config/settings.yaml";
 
-    static mut TEST_DATA_FILE : &str = "test_data.yaml";
-
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
         req : String,
@@ -2255,29 +2144,37 @@ mod tests {
         }
     }
 
-    fn find_dummy_apdu<'a>(test_data : &'a Vec<ApduRequestResponse>, apdu : &[u8]) -> Option<&'a ApduRequestResponse> {
-        for data in test_data {
-            if &apdu[..] == &ApduRequestResponse::to_raw_vec(&data.req)[..] {
-                return Some(data);
-            }
-        }
-
-        None
+    struct DummySmartCardConnection {
+        test_data_file : String
     }
 
-    fn dummy_card_apdu_interface(apdu : &[u8]) -> Result<Vec<u8>, ()> {
-        let mut output : Vec<u8> = Vec::new();
+    impl DummySmartCardConnection {
+        fn find_dummy_apdu<'a>(test_data : &'a Vec<ApduRequestResponse>, apdu : &[u8]) -> Option<&'a ApduRequestResponse> {
+            for data in test_data {
+                if &apdu[..] == &ApduRequestResponse::to_raw_vec(&data.req)[..] {
+                    return Some(data);
+                }
+            }
 
-        let mut response = b"\x6A\x82".to_vec(); // file not found error
-
-        let test_data : Vec<ApduRequestResponse> = serde_yaml::from_str(&fs::read_to_string(unsafe { TEST_DATA_FILE }).unwrap()).unwrap();
-
-        if let Some(req) = find_dummy_apdu(&test_data, &apdu[..]) {
-            response = ApduRequestResponse::to_raw_vec(&req.res);
+            None
         }
+    }
 
-        output.extend_from_slice(&response[..]);
-        Ok(output)
+    impl ApduInterface for DummySmartCardConnection {
+        fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()> {
+            let mut output : Vec<u8> = Vec::new();
+
+            let mut response = b"\x6A\x82".to_vec(); // file not found error
+
+            let test_data : Vec<ApduRequestResponse> = serde_yaml::from_str(&fs::read_to_string(&self.test_data_file).unwrap()).unwrap();
+
+            if let Some(req) = DummySmartCardConnection::find_dummy_apdu(&test_data, &apdu[..]) {
+                response = ApduRequestResponse::to_raw_vec(&req.res);
+            }
+
+            output.extend_from_slice(&response[..]);
+            Ok(output)
+        }
     }
 
     fn init_logging() {
@@ -2356,12 +2253,7 @@ mod tests {
     }
 
     fn setup_connection(connection : &mut EmvConnection) -> Result<(), ()> {
-        unsafe {
-            TEST_DATA_FILE = "test_data.yaml";    
-        }
-        
         connection.contactless = false;
-        connection.interface = Some(ApduInterface::Function(dummy_card_apdu_interface));
         connection.pse_application_select_callback = Some(&pse_application_select);
         connection.pin_callback = Some(&pin_entry);
         connection.amount_callback = Some(&amount_entry);
@@ -2375,6 +2267,8 @@ mod tests {
         init_logging();
 
         let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let smart_card_connection = DummySmartCardConnection { test_data_file: "test_data.yaml".to_string()};
+        connection.interface = Some(&smart_card_connection);
         setup_connection(&mut connection)?;
 
         connection.select_payment_application()?;
@@ -2390,6 +2284,8 @@ mod tests {
         init_logging();
 
         let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let smart_card_connection = DummySmartCardConnection { test_data_file: "test_data.yaml".to_string()};
+        connection.interface = Some(&smart_card_connection);
         setup_connection(&mut connection)?;
 
         let application = connection.select_payment_application()?;
@@ -2409,6 +2305,8 @@ mod tests {
         init_logging();
 
         let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let smart_card_connection = DummySmartCardConnection { test_data_file: "test_data.yaml".to_string()};
+        connection.interface = Some(&smart_card_connection);
         setup_connection(&mut connection)?;
 
         let amount = connection.amount_callback.unwrap()()?;

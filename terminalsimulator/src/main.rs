@@ -1,4 +1,6 @@
-use log::{error, warn, info};
+use pcsc::{Context, Card, Scope, ShareMode, Protocols, MAX_BUFFER_SIZE, MAX_ATR_SIZE};
+use regex::Regex;
+use log::{error, warn, info, debug};
 use log4rs;
 use clap::{App, Arg};
 use std::io::{self};
@@ -9,6 +11,108 @@ use emvpt::*;
 
 static mut INTERACTIVE : bool = false;
 static mut PIN_OPTION : Option<String> = None;
+
+pub enum ReaderError {
+    ReaderConnectionFailed(String),
+    ReaderNotFound,
+    CardConnectionFailed(String),
+    CardNotFound
+}
+
+pub struct SmartCardConnection {
+    ctx : Option<Context>,
+    card : Option<Card>,
+    pub contactless : bool
+}
+
+impl ApduInterface for SmartCardConnection {
+    fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()> {
+        let mut output : Vec<u8> = Vec::new();
+
+        let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
+        output.extend_from_slice(self.card.as_ref().unwrap().transmit(apdu, &mut apdu_response_buffer).unwrap());
+
+        Ok(output)
+    }
+}
+
+impl SmartCardConnection {
+    pub fn new() -> SmartCardConnection {
+        SmartCardConnection {
+            ctx : None,
+            card : None,
+            contactless : false
+        }
+    }
+
+    fn is_contactless_reader(&self, reader_name : &str) -> bool {
+        if Regex::new(r"^ACS ACR12").unwrap().is_match(reader_name) {
+            debug!("Card reader is deemed contactless");
+            return true;
+        }
+
+        false
+    }
+
+    pub fn connect_to_card(&mut self) -> Result<(), ReaderError> {
+        if !self.ctx.is_some() {
+            self.ctx = match Context::establish(Scope::User) {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    return Err(ReaderError::ReaderConnectionFailed(format!("Failed to establish context: {}", err)));
+                }
+            };
+        }
+
+        let ctx = self.ctx.as_ref().unwrap();
+        let readers_size = match ctx.list_readers_len() {
+            Ok(readers_size) => readers_size,
+            Err(err) => {
+                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers size: {}", err)));
+            }
+        };
+
+        let mut readers_buf = vec![0; readers_size];
+        let readers = match ctx.list_readers(&mut readers_buf) {
+            Ok(readers) => readers,
+            Err(err) => {
+                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
+            }
+        };
+
+        for reader in readers {
+            self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
+                Ok(card) => {
+                    self.contactless = self.is_contactless_reader(reader.to_str().unwrap());
+
+                    debug!("Card reader: {:?}, contactless:{}", reader, self.contactless);
+
+                    Some(card)
+                },
+                _ => None
+            };
+
+            if self.card.is_some() {
+                break;
+            }
+        }
+
+        if self.card.is_some() {
+            const MAX_NAME_SIZE : usize = 2048;
+            let mut names_buffer = [0; MAX_NAME_SIZE];
+            let mut atr_buffer = [0; MAX_ATR_SIZE];
+            let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
+
+            // https://www.eftlab.com/knowledge-base/171-atr-list-full/
+            debug!("Card ATR:\n{:?}", card_status.atr());
+            debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
+        } else {
+            return Err(ReaderError::CardNotFound);
+        }
+
+        Ok(())
+    }
+}
 
 fn pse_application_select(applications : &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
     let user_interactive = unsafe { INTERACTIVE };
@@ -111,14 +215,16 @@ fn run() -> Result<Option<String>, String> {
 
     let purchase_amount = connection.amount_callback.unwrap()().unwrap();
 
-    if let Err(err) = connection.connect_to_card() {
+    let mut smart_card_connection = SmartCardConnection::new();
+
+    if let Err(err) = smart_card_connection.connect_to_card() {
         match err {
             ReaderError::CardNotFound => {
                 if user_interactive {
                     println!("Please insert card");
 
                     loop {
-                        match connection.connect_to_card() {
+                        match smart_card_connection.connect_to_card() {
                             Ok(_) => break,
                             Err(err) => {
                                 match err {
@@ -137,6 +243,9 @@ fn run() -> Result<Option<String>, String> {
             _ => return Err("Could not connect to the reader".to_string())
         }
     }
+
+    connection.contactless = smart_card_connection.contactless;
+    connection.interface = Some(&smart_card_connection);
 
     let application = connection.select_payment_application().unwrap();
 
