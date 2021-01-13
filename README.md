@@ -2,11 +2,13 @@
 
 # emvpt - Minimum Viable Payment Terminal
 
-Project's intention is to support simple EMV transaction cases for chip and NFC.
+Project's intention is to support simple EMV transaction cases for chip and contactless/NFC.
 
 ## Terminal simulator run
 
-Note! You'll need a smart card reader device to run the simulator.
+Note!
+- You'll need a smart card reader device.
+- If you need a test payment card, you can check [emv-card-simulator](https://github.com/mrautio/emv-card-simulator) project out.
 
 ```sh
 terminalsimulator$ cargo run -- --help
