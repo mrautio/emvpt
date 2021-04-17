@@ -339,12 +339,13 @@ pub struct Terminal {
     pub use_random : bool,
     pub capabilities : Capabilities,
     pub tvr : TerminalVerificationResults,
+    pub tsi : TransactionStatusInformation,
     pub cryptogram_type : CryptogramType,
     pub cryptogram_type_arqc : CryptogramType,
     pub terminal_transaction_qualifiers : TerminalTransactionQualifiers
 }
 
-// EMV Book 3, C5 Terminal Verification Results
+// EMV Book 3, C5 Terminal Verification Results (TVR)
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct TerminalVerificationResults {
     //TVR byte 1
@@ -443,6 +444,42 @@ impl From<TerminalVerificationResults> for Vec<u8> {
         output.push(b3);
         output.push(b4);
         output.push(b5);
+
+        output
+    }
+}
+
+// EMV Book 3, C6 Transaction Status Information (TSI)
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct TransactionStatusInformation {
+    //TSI byte 1
+    pub offline_data_authentication_was_performed : bool,
+    pub cardholder_verification_was_performed : bool,
+    pub card_risk_management_was_performed : bool,
+    pub issuer_authentication_was_performed : bool,
+    pub terminal_risk_management_was_performed : bool,
+    pub script_processing_was_performed : bool
+    //RFU
+    //RFU
+
+    //TSI byte 2 - RFU
+}
+
+impl From<TransactionStatusInformation> for Vec<u8> {
+    fn from(tsi: TransactionStatusInformation) -> Self {
+        let mut b1 : u8 = 0b0000_0000;
+        let b2 : u8 = 0b0000_0000;
+
+        set_bit!(b1, 7, tsi.offline_data_authentication_was_performed);
+        set_bit!(b1, 6, tsi.cardholder_verification_was_performed);
+        set_bit!(b1, 5, tsi.card_risk_management_was_performed);
+        set_bit!(b1, 4, tsi.issuer_authentication_was_performed);
+        set_bit!(b1, 3, tsi.terminal_risk_management_was_performed);
+        set_bit!(b1, 2, tsi.script_processing_was_performed);
+
+        let mut output : Vec<u8> = Vec::new();
+        output.push(b1);
+        output.push(b2);
 
         output
     }
@@ -1800,6 +1837,8 @@ impl EmvConnection<'_> {
             }
         }
 
+        self.settings.terminal.tsi.cardholder_verification_was_performed = true;
+
         if ! self.get_tag_value("9F34").is_some() {
             self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
 
@@ -1821,7 +1860,9 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
-    pub fn handle_terminal_action_analysis(&mut self) -> Result<(),()> {
+    pub fn handle_offline_data_authentication(&mut self) -> Result<(),()> {
+        //ref. EMV 4.3 Book 3 - 10.3 Offline Data Authentication
+
         if !(self.settings.terminal.capabilities.cda && self.icc.capabilities.cda) {
             if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
                 if let Err(_) = self.handle_dynamic_data_authentication() {
@@ -1833,6 +1874,13 @@ impl EmvConnection<'_> {
                 }
             }
         }
+
+        self.settings.terminal.tsi.offline_data_authentication_was_performed = true;
+
+        Ok(())
+    }
+
+    pub fn handle_terminal_action_analysis(&mut self) -> Result<(),()> {
 
         let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
         self.add_tag("95", tag_95_tvr);
@@ -2327,6 +2375,8 @@ mod tests {
         connection.handle_card_verification_methods()?;
 
         connection.handle_terminal_risk_management()?;
+
+        connection.handle_offline_data_authentication()?;
 
         connection.handle_terminal_action_analysis()?;
 
