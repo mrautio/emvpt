@@ -1811,22 +1811,29 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_terminal_risk_management(&mut self) -> Result<(),()> {
-        if self.settings.terminal.capabilities.sda && self.icc.capabilities.sda {
-            if let Err(_) = self.handle_signed_static_application_data(&self.icc.data_authentication.as_ref().unwrap().clone()[..]) {
-                self.settings.terminal.tvr.sda_failed = true;
-            }
-        }
 
-        if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
-            if let Err(_) = self.handle_dynamic_data_authentication() {
-                self.settings.terminal.tvr.dda_failed = true;
-            }
-        }
+        //ref. EMV 4.3 Book 3 - 10.6 Terminal Risk Management
+        //risk management for online transaction:
+        //- check terminal floor limit
+        //- random transaction selection; select a transaction randomly for online authorization
+        //- velocity checking; check offline transaction counter / limits from the card
 
         Ok(())
     }
 
     pub fn handle_terminal_action_analysis(&mut self) -> Result<(),()> {
+        if !(self.settings.terminal.capabilities.cda && self.icc.capabilities.cda) {
+            if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
+                if let Err(_) = self.handle_dynamic_data_authentication() {
+                    self.settings.terminal.tvr.dda_failed = true;
+                }
+            } else if self.settings.terminal.capabilities.sda && self.icc.capabilities.sda {
+                if let Err(_) = self.handle_signed_static_application_data(&self.icc.data_authentication.as_ref().unwrap().clone()[..]) {
+                    self.settings.terminal.tvr.sda_failed = true;
+                }
+            }
+        }
+
         let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
         self.add_tag("95", tag_95_tvr);
         debug!("{:?}", self.settings.terminal.tvr);
