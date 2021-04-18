@@ -226,3 +226,6 @@
 '9F7C':
   tag: '9F7C'
   name: 'Customer Exclusive Data'
+'91':
+  tag: '91'
+  name: 'Issuer Authentication Data'

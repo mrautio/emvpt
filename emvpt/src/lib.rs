@@ -2024,6 +2024,31 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    pub fn handle_issuer_authentication_data(&mut self) -> Result<(),()> {
+        // ref. EMV 4.3 Book 3 - 10.9 Online Processing
+        // ref. EMV 4.3 Book 3 - 6.5.4 EXTERNAL AUTHENTICATE Command-Response APDUs
+
+        let tag_91_issuer_authentication_data = self.get_tag_value("91");
+        if !self.icc.capabilities.issuer_authentication && tag_91_issuer_authentication_data.is_none() {
+            return Ok(());
+        }
+
+        debug!("Validating issuer authentication data");
+        // TODO: call external authenticate
+        let apdu_command_external_authenticate = b"\x00\x82\x00\x00"; // EXTERNAL AUTHENTICATE
+        let mut external_authenticate_command = apdu_command_external_authenticate.to_vec();
+        external_authenticate_command.push(tag_91_issuer_authentication_data.unwrap().len() as u8);
+        external_authenticate_command.extend_from_slice(&tag_91_issuer_authentication_data.unwrap()[..]);
+
+        let (response_trailer, _response_data) = self.send_apdu(&external_authenticate_command);
+        if !is_success_response(&response_trailer) {
+            self.settings.terminal.tvr.issuer_authentication_failed = true;
+        }
+
+
+        Ok(())
+    }
+
     // EMV has some tags that don't conform to ISO/IEC 7816
     fn is_non_conforming_one_byte_tag(&self, tag : u8) -> bool {
         if tag == 0x95 {
@@ -2439,6 +2464,9 @@ mod tests {
         connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
         connection.settings.terminal.use_random = false;
 
+        // force issuer authentication data
+        connection.add_tag("91", b"\x12\x34\x56\x78\x12\x34\x56\x78".to_vec());
+
         Ok(())
     }
 
@@ -2517,6 +2545,9 @@ mod tests {
 
         match connection.handle_1st_generate_ac()? {
             CryptogramType::AuthorisationRequestCryptogram => {
+                connection.handle_issuer_authentication_data()?;
+                assert!(!connection.settings.terminal.tvr.issuer_authentication_failed);
+
                 match connection.handle_2nd_generate_ac()? {
                     CryptogramType::AuthorisationRequestCryptogram => { return Err(()); },
                     CryptogramType::TransactionCertificate => { /* Expected */ },
