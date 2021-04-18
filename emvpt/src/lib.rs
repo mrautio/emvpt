@@ -399,6 +399,79 @@ pub struct TerminalVerificationResults {
     //RFU
 }
 
+impl TerminalVerificationResults {
+    pub fn action_code_matches(tvr : &TerminalVerificationResults, iac : &TerminalVerificationResults, tac : &TerminalVerificationResults) -> bool {
+        if tvr.offline_data_authentication_was_not_performed && (iac.offline_data_authentication_was_not_performed || tac.offline_data_authentication_was_not_performed) { return true; }
+        if tvr.sda_failed && (iac.sda_failed || tac.sda_failed) { return true; }
+        if tvr.icc_data_missing && (iac.icc_data_missing || tac.icc_data_missing) { return true; }
+        if tvr.card_appears_on_terminal_exception_file && (iac.card_appears_on_terminal_exception_file || tac.card_appears_on_terminal_exception_file) { return true; }
+        if tvr.dda_failed && (iac.dda_failed || tac.dda_failed) { return true; }
+        if tvr.cda_failed && (iac.cda_failed || tac.cda_failed) { return true; }
+        if tvr.icc_and_terminal_have_different_application_versions && (iac.icc_and_terminal_have_different_application_versions || tac.icc_and_terminal_have_different_application_versions) { return true; }
+        if tvr.expired_application && (iac.expired_application || tac.expired_application) { return true; }
+        if tvr.application_not_yet_effective && (iac.application_not_yet_effective || tac.application_not_yet_effective) { return true; }
+        if tvr.requested_service_not_allowed_for_card_product && (iac.requested_service_not_allowed_for_card_product || tac.requested_service_not_allowed_for_card_product) { return true; }
+        if tvr.new_card && (iac.new_card || tac.new_card) { return true; }
+        if tvr.cardholder_verification_was_not_successful && (iac.cardholder_verification_was_not_successful || tac.cardholder_verification_was_not_successful) { return true; }
+        if tvr.unrecognised_cvm && (iac.unrecognised_cvm || tac.unrecognised_cvm) { return true; }
+        if tvr.pin_try_limit_exceeded && (iac.pin_try_limit_exceeded || tac.pin_try_limit_exceeded) { return true; }
+        if tvr.pin_entry_required_and_pin_pad_not_present_or_not_working && (iac.pin_entry_required_and_pin_pad_not_present_or_not_working || tac.pin_entry_required_and_pin_pad_not_present_or_not_working) { return true; }
+        if tvr.pin_entry_required_pin_pad_present_but_pin_was_not_entered && (iac.pin_entry_required_pin_pad_present_but_pin_was_not_entered || tac.pin_entry_required_pin_pad_present_but_pin_was_not_entered) { return true; }
+        if tvr.online_pin_entered && (iac.online_pin_entered || tac.online_pin_entered) { return true; }
+        if tvr.transaction_exceeds_floor_limit && (iac.transaction_exceeds_floor_limit || tac.transaction_exceeds_floor_limit) { return true; }
+        if tvr.lower_consecutive_offline_limit_exceeded && (iac.lower_consecutive_offline_limit_exceeded || tac.lower_consecutive_offline_limit_exceeded) { return true; }
+        if tvr.upper_consecutive_offline_limit_exceeded && (iac.upper_consecutive_offline_limit_exceeded || tac.upper_consecutive_offline_limit_exceeded) { return true; }
+        if tvr.transaction_selected_randomly_for_online_processing && (iac.transaction_selected_randomly_for_online_processing || tac.transaction_selected_randomly_for_online_processing) { return true; }
+        if tvr.merchant_forced_transaction_online && (iac.merchant_forced_transaction_online || tac.merchant_forced_transaction_online) { return true; }
+        if tvr.default_tdol_used && (iac.default_tdol_used || tac.default_tdol_used) { return true; }
+        if tvr.issuer_authentication_failed && (iac.issuer_authentication_failed || tac.issuer_authentication_failed) { return true; }
+        if tvr.script_processing_failed_before_final_generate_ac && (iac.script_processing_failed_before_final_generate_ac || tac.script_processing_failed_before_final_generate_ac) { return true; }
+        if tvr.script_processing_failed_after_final_generate_ac && (iac.script_processing_failed_after_final_generate_ac || tac.script_processing_failed_after_final_generate_ac) { return true; }
+
+        false
+    }
+}
+
+impl From<Vec<u8>> for TerminalVerificationResults {
+    fn from(data: Vec<u8>) -> Self {
+        let b1 : u8 = data[0];
+        let b2 : u8 = data[1];
+        let b3 : u8 = data[2];
+        let b4 : u8 = data[3];
+        let b5 : u8 = data[4];
+
+        TerminalVerificationResults {
+            offline_data_authentication_was_not_performed: get_bit!(b1, 7),
+            sda_failed: get_bit!(b1, 6),
+            icc_data_missing: get_bit!(b1, 5),
+            card_appears_on_terminal_exception_file: get_bit!(b1, 4),
+            dda_failed: get_bit!(b1, 3),
+            cda_failed: get_bit!(b1, 2),
+            icc_and_terminal_have_different_application_versions: get_bit!(b2, 7),
+            expired_application: get_bit!(b2, 6),
+            application_not_yet_effective: get_bit!(b2, 5),
+            requested_service_not_allowed_for_card_product: get_bit!(b2, 4),
+            new_card: get_bit!(b2, 3),
+            cardholder_verification_was_not_successful: get_bit!(b3, 7),
+            unrecognised_cvm: get_bit!(b3, 6),
+            pin_try_limit_exceeded: get_bit!(b3, 5),
+            pin_entry_required_and_pin_pad_not_present_or_not_working: get_bit!(b3, 4),
+            pin_entry_required_pin_pad_present_but_pin_was_not_entered: get_bit!(b3, 3),
+            online_pin_entered: get_bit!(b3, 2),
+            transaction_exceeds_floor_limit: get_bit!(b4, 7),
+            lower_consecutive_offline_limit_exceeded: get_bit!(b4, 6),
+            upper_consecutive_offline_limit_exceeded: get_bit!(b4, 5),
+            transaction_selected_randomly_for_online_processing: get_bit!(b4, 4),
+            merchant_forced_transaction_online: get_bit!(b4, 3),
+            default_tdol_used: get_bit!(b5, 7),
+            issuer_authentication_failed: get_bit!(b5, 6),
+            script_processing_failed_before_final_generate_ac: get_bit!(b5, 5),
+            script_processing_failed_after_final_generate_ac: get_bit!(b5, 4)
+        }
+    }
+}
+
+
 impl From<TerminalVerificationResults> for Vec<u8> {
     fn from(tvr: TerminalVerificationResults) -> Self {
         let mut b1 : u8 = 0b0000_0000;
@@ -1881,10 +1954,72 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_terminal_action_analysis(&mut self) -> Result<(),()> {
+        // ref. EMV 4.3 Book 3 - 10.7 Terminal Action Analysis
+        // Terminal & Issuer Action Code - Denial => default bits 0
+        // For each bit in the TVR that has a value of 1, the terminal shall check the corresponding bits in
+        // the Issuer Action Code - Denial and the Terminal Action Code - Denial. If the corresponding bit in either of the action codes
+        // is set to 1, it indicates that the issuer or the acquirer wishes the transaction to be rejected offlin
+        //  In this case, the terminal shall issue a GENERATE AC command to request an AAC from the ICC
+
+        // If the Issuer Action Code - Online is not present, a default value with all bits set to 1 shall be used in its place.
+        // Together, the Issuer Action Code - Online and the Terminal Action Code - Online specify the conditions that cause
+        // a transaction to be completed online.
+
+        // If the Issuer Action Code - Default is not present, a default value with all bits set to 1
+        //Action Code - Default are used only if the Issuer Action Code -Online and the Terminal Action Code - Online were not
+        //used (for example, in case of an offline-only terminal) or indicated a desire on the part of the issuer or the acquirer
+        //to process the transaction online but the terminal was unable to go online.
 
         let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
+        let tvr_len = tag_95_tvr.len();
         self.add_tag("95", tag_95_tvr);
         debug!("{:?}", self.settings.terminal.tvr);
+
+        let action_zero : TerminalVerificationResults = vec![0; tvr_len].into();
+        let action_one  : TerminalVerificationResults = vec![1; tvr_len].into();
+
+        let tag_9f0e_issuer_action_code_denial : TerminalVerificationResults = match self.get_tag_value("9F0E") {
+            Some(iac) => {
+                let ac : TerminalVerificationResults = iac.to_vec().into();
+                debug!("Action Code - Denial: {:?}", ac);
+                ac
+            },
+            None => action_zero.clone()
+        };
+        let tag_9f0f_issuer_action_code_online : TerminalVerificationResults = match self.get_tag_value("9F0F") {
+            Some(iac) => {
+                let ac : TerminalVerificationResults = iac.to_vec().into();
+                debug!("Action Code - Online: {:?}", ac);
+                ac
+            },
+            None => action_one.clone()
+        };
+        let tag_9f0d_issuer_action_code_default = match self.get_tag_value("9F0D") {
+            Some(iac) => {
+                let ac : TerminalVerificationResults = iac.to_vec().into();
+                debug!("Action Code - Default: {:?}", ac);
+                ac
+            },
+            None => action_one.clone()
+        };
+
+        let terminal_action_code_denial : TerminalVerificationResults = action_zero.clone();
+        let terminal_action_code_online : TerminalVerificationResults = action_zero.clone();
+        let terminal_action_code_default : TerminalVerificationResults = action_zero.clone();
+
+        // TODO: actually make the GENERATE AC happen
+
+        if TerminalVerificationResults::action_code_matches(&self.settings.terminal.tvr, &tag_9f0e_issuer_action_code_denial, &terminal_action_code_denial) {
+            debug!("Action Code - Denial matches => GENERATE AC AAC needed");
+        } else if TerminalVerificationResults::action_code_matches(&self.settings.terminal.tvr, &tag_9f0f_issuer_action_code_online, &terminal_action_code_online) {
+            // online action codes for online capable terminals
+            debug!("Action Code - Online matches => GENERATE AC ARQC needed");
+        } else if TerminalVerificationResults::action_code_matches(&self.settings.terminal.tvr, &tag_9f0d_issuer_action_code_default, &terminal_action_code_default) {
+            // TODO: offline-only terminals or if online authorization is not possible this is to be done
+            debug!("Action Code - Default matches => GENERATE AC AAC needed");
+        } else {
+            debug!("Action Codes vs. TVR are OK => GENERATE AC TC needed");
+        }
 
         Ok(())
     }
