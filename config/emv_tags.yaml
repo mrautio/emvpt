@@ -112,6 +112,9 @@
 '8D':
   tag: '8D'
   name: 'Card Risk Management Data Object List 2 (CDOL2)'
+'9F1D':
+  tag: '9F1D'
+  name: 'Terminal Risk Management Data'
 '5F28':
   tag: '5F28'
   name: 'Issuer Country Code'
