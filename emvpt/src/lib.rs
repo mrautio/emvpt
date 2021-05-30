@@ -27,6 +27,11 @@ macro_rules! set_bit {
     ($byte:expr, $bit:expr, $bit_value:expr) => (if $bit_value == true { $byte |= 1 << $bit; } else { $byte &= !(1 << $bit); });
 }
 
+macro_rules! serialize_yaml {
+    ($file:expr, $static_resource:expr) => { serde_yaml::from_str(&fs::read_to_string($file).unwrap_or(String::from_utf8_lossy(include_bytes!($static_resource)).to_string())).unwrap() }
+}
+
+
 #[repr(u8)]
 #[derive(Deserialize, Serialize, Debug, Copy, Clone)]
 pub enum CryptogramType {
@@ -591,8 +596,8 @@ pub struct EmvConnection<'a> {
 impl EmvConnection<'_> {
     pub fn new(settings_file : &str) -> Result<EmvConnection<'static>, String> {
 
-        let settings : Settings = serde_yaml::from_str(&fs::read_to_string(settings_file).unwrap_or(String::from_utf8_lossy(include_bytes!("config/settings.yaml")).to_string())).unwrap();
-        let emv_tags = serde_yaml::from_str(&fs::read_to_string(settings.configuration_files.emv_tags.clone()).unwrap_or(String::from_utf8_lossy(include_bytes!("config/emv_tags.yaml")).to_string())).unwrap();
+        let settings : Settings = serialize_yaml!(settings_file, "config/settings.yaml");
+        let emv_tags = serialize_yaml!(settings.configuration_files.emv_tags.clone(), "config/emv_tags.yaml");
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
@@ -1479,7 +1484,7 @@ impl EmvConnection<'_> {
     pub fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
 
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
-        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string(&self.settings.configuration_files.scheme_ca_public_keys).unwrap_or(String::from_utf8_lossy(include_bytes!("config/scheme_ca_public_keys_test.yaml")).to_string())).unwrap();
+        let ca_data : HashMap<String, CertificateAuthority> = serialize_yaml!(&self.settings.configuration_files.scheme_ca_public_keys, "config/scheme_ca_public_keys_test.yaml");
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92");
         let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
