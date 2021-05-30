@@ -1301,7 +1301,8 @@ impl EmvConnection<'_> {
                                     }
 
                                     let tag_4f_aid = self.get_tag_value("4F").unwrap();
-                                    let tag_50_label = self.get_tag_value("50").unwrap();
+                                    let default_label = "UNKNOWN".as_bytes().to_vec();
+                                    let tag_50_label = self.get_tag_value("50").unwrap_or(&default_label);
                                     
                                     if let Some(tag_87_priority) = self.get_tag_value("87") {
                                         all_applications.push(EmvApplication {
