@@ -590,8 +590,9 @@ pub struct EmvConnection<'a> {
 
 impl EmvConnection<'_> {
     pub fn new(settings_file : &str) -> Result<EmvConnection<'static>, String> {
-        let settings : Settings = serde_yaml::from_str(&fs::read_to_string(settings_file).unwrap()).unwrap();
-        let emv_tags = serde_yaml::from_str(&fs::read_to_string(settings.configuration_files.emv_tags.clone()).unwrap()).unwrap();
+
+        let settings : Settings = serde_yaml::from_str(&fs::read_to_string(settings_file).unwrap_or(String::from_utf8_lossy(include_bytes!("config/settings.yaml")).to_string())).unwrap();
+        let emv_tags = serde_yaml::from_str(&fs::read_to_string(settings.configuration_files.emv_tags.clone()).unwrap_or(String::from_utf8_lossy(include_bytes!("config/emv_tags.yaml")).to_string())).unwrap();
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
@@ -1478,7 +1479,7 @@ impl EmvConnection<'_> {
     pub fn get_issuer_public_key(&self, application : &EmvApplication) -> Result<(Vec<u8>, Vec<u8>), ()> {
 
         // ref. https://www.emvco.com/wp-content/uploads/2017/05/EMV_v4.3_Book_2_Security_and_Key_Management_20120607061923900.pdf - 6.3 Retrieval of Issuer Public Key
-        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string(&self.settings.configuration_files.scheme_ca_public_keys).unwrap()).unwrap();
+        let ca_data : HashMap<String, CertificateAuthority> = serde_yaml::from_str(&fs::read_to_string(&self.settings.configuration_files.scheme_ca_public_keys).unwrap_or(String::from_utf8_lossy(include_bytes!("config/scheme_ca_public_keys_test.yaml")).to_string())).unwrap();
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92");
         let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
@@ -2346,7 +2347,7 @@ mod tests {
 
     static LOGGING: Once = Once::new();
 
-    static SETTINGS_FILE : &str = "../config/settings.yaml";
+    static SETTINGS_FILE : &str = "config/settings.yaml";
 
     #[derive(Serialize, Deserialize, Clone)]
     struct ApduRequestResponse {
@@ -2417,9 +2418,9 @@ mod tests {
         // openssl genrsa -out AFFFFFFFFF_92_ca_private_key.pem -3 1408
         // openssl rsa -in AFFFFFFFFF_92_ca_private_key.pem -outform PEM -pubout -out AFFFFFFFFF_92_ca_key.pem
 
-        let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/AFFFFFFFFF_92_ca_private_key.pem").unwrap().as_bytes()).unwrap();
-        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/iin_313233343536_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
-        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("../config/icc_1234560012345608_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        let rsa = Rsa::private_key_from_pem(&fs::read_to_string("config/AFFFFFFFFF_92_ca_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("config/iin_313233343536_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
+        //let rsa = Rsa::private_key_from_pem(&fs::read_to_string("config/icc_1234560012345608_e_3_private_key.pem").unwrap().as_bytes()).unwrap();
         
         let public_key_modulus  = &rsa.n().to_vec()[..];
         let public_key_exponent = &rsa.e().to_vec()[..];

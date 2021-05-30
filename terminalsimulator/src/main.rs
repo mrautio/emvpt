@@ -172,7 +172,7 @@ fn amount_entry() -> Result<u64, ()> {
 }
 
 fn run() -> Result<Option<String>, String> {
-    log4rs::init_file("../config/log4rs.yaml", Default::default()).unwrap();
+    log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
 
     let matches = App::new("Minimum Viable Payment Terminal")
         .version("0.1")
@@ -207,7 +207,7 @@ fn run() -> Result<Option<String>, String> {
 
     let print_tags = matches.is_present("print-tags");
 
-    let mut connection = EmvConnection::new(&matches.value_of("settings").unwrap_or("../config/settings.yaml").to_string()).unwrap();
+    let mut connection = EmvConnection::new(&matches.value_of("settings").unwrap_or("config/settings.yaml").to_string()).unwrap();
 
     connection.pse_application_select_callback = Some(&pse_application_select);
     connection.pin_callback = Some(&pin_entry);
