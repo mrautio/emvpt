@@ -13,13 +13,13 @@ iso7816-tlv = "0.4.1"
 hexplay = "0.2.1"
 asn1_der = "0.7.4"
 hex = "0.4.3"
-serde = { version = "1.0.125", features = ["derive"] }
+serde = { version = "1.0.126", features = ["derive"] }
 serde_yaml = "0.8.17"
 log = "0.4.14"
 log4rs = "1.0.0"
 rand_chacha = "0.3.0"
 rand = "0.8.3"
 # NOTE: mingw pre built binaries here: https://bintray.com/vszakats/generic/openssl
-openssl-sys = "0.9.61"
-openssl = "0.10.33"
+openssl-sys = "0.9.63"
+openssl = "0.10.34"
 chrono = "0.4.19"
