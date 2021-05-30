@@ -1055,7 +1055,7 @@ impl EmvConnection<'_> {
         let tag_77_part1 : String = tag_77_hex_encoded.drain(..tag_77_hex_encoded.find(&tag_9f4b_signed_dynamic_application_data_hex_encoded).unwrap() - tag_9f4b_tlv_header_length).collect();
         checksum_data.extend_from_slice(&hex::decode(&tag_77_part1).unwrap()[..]);
 
-        let tag_9f4b_whole_size = tag_9f4b_signed_dynamic_application_data_hex_encoded.len() + tag_9f4b_tlv_header_length;
+        let tag_9f4b_whole_size = tag_9f4b_signed_dynamic_application_data_hex_encoded.len() + tag_9f4b_tlv_header_length + 2;
         if tag_77_hex_encoded.len() > tag_9f4b_whole_size {
             let tag_77_part2 : String = tag_77_hex_encoded.drain(tag_9f4b_whole_size..).collect();
             checksum_data.extend_from_slice(&hex::decode(&tag_77_part2).unwrap()[..]);
@@ -1145,7 +1145,15 @@ impl EmvConnection<'_> {
         }
 
         if get_bit!(p1_reference_control_parameter, 4) {
-            self.handle_application_cryptogram_card_authentication(&response_data[3..], cdol_tag)?;
+            let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
+            let icc_cryptogram_type = CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
+
+            match icc_cryptogram_type {
+                CryptogramType::TransactionCertificate | CryptogramType::AuthorisationRequestCryptogram => {
+                    self.handle_application_cryptogram_card_authentication(&response_data[3..], cdol_tag)?;
+                },
+                _ => {}
+            }
         }
 
         self.validate_ac(requested_cryptogram_type)
