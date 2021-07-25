@@ -28,10 +28,7 @@ docker build -t emvpt -f Dockerfile . && docker run --rm -t emvpt
 
 ## Update dependencies
 
-```sh
-emvpt$ cargo upgrade && cargo update && cargo audit
-terminalsimulator$ cargo upgrade && cargo update && cargo audit
-```
+Run the [GitHub Actions Workflow](https://github.com/mrautio/emvpt/actions/workflows/update-dependencies.yml).
 
 ## References
 
