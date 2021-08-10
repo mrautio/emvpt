@@ -34,8 +34,13 @@ Run the [GitHub Actions Workflow](https://github.com/mrautio/emvpt/actions/workf
 
 * [EMV Contact Specifications](https://www.emvco.com/emv-technologies/contact/)
 * [EMV Contactless Specifications](https://www.emvco.com/emv-technologies/contactless/)
+  * EMV Contactless Book C-1 - Kernel 1 (JCB and Visa)
   * EMV Contactless Book C-2 - Kernel 2 (MasterCard)
   * EMV Contactless Book C-3 - Kernel 3 (Visa)
+  * EMV Contactless Book C-4 - Kernel 4 (American Express)
+  * EMV Contactless Book C-5 - Kernel 5 (JCB)
+  * EMV Contactless Book C-6 - Kernel 6 (Discover)
+  * EMV Contactless Book C-7 - Kernel 7 (UnionPay)
 * ISO codes
   * [Processing codes](http://www.fintrnmsgtool.com/iso-processing-code.html)
   * [Country codes](https://www.currency-iso.org/dam/downloads/lists/list_one.xml)
