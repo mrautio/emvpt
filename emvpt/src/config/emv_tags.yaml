@@ -94,6 +94,9 @@
 '8E':
   tag: '8E'
   name: 'Cardholder Verification Method (CVM) List'
+'9F0A':
+  tag: '9F0A'
+  name: 'Application Selection Registered Proprietary Data'
 '9F0D':
   tag: '9F0D'
   name: 'Issuer Action Code – Default'
