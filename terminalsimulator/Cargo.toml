@@ -11,5 +11,5 @@ emvpt = { path = "../emvpt", version = "0.1.0" }
 log = "0.4.14"
 log4rs = "1.0.0"
 clap = "2.33.3"
-pcsc = "2.5.0"
+pcsc = "2.6.0"
 regex = "1.5.4"
