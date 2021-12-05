@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [ master ]
   # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+  workflow_dispatch: null
 
 jobs:
 
@@ -15,6 +15,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Build and test
-      run: docker build -t emvpt -f Dockerfile .
+      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # pin@v2
+      - name: Build and test
+        run: docker build -t emvpt -f Dockerfile .

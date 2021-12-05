@@ -1,7 +1,7 @@
 name: Update dependencies
 
 on:
-  workflow_dispatch:
+  ? workflow_dispatch
 
 jobs:
 
@@ -10,19 +10,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - run: sudo apt-get install -y libpcsclite-dev
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-    - run: cargo install cargo-edit cargo-audit
-    - run: cd emvpt && cargo upgrade && cargo update && cargo audit && cargo test
-    - run: cd terminalsimulator && cargo upgrade && cargo update && cargo audit && cargo test
-    - name: Create Pull Request
-      uses: peter-evans/create-pull-request@v3
-      with:
-        title: Update dependencies
-        commit-message: Update dependencies
-        delete-branch: true
+      - run: sudo apt-get install -y libpcsclite-dev
+      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # pin@v2
+        with:
+          submodules: true
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # pin@v1
+        with:
+          toolchain: stable
+      - run: cargo install cargo-edit cargo-audit
+      - run: cd emvpt && cargo upgrade && cargo update && cargo audit && cargo test
+      - run: cd terminalsimulator && cargo upgrade && cargo update && cargo audit &&
+          cargo test
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@67df31e08a133c6a77008b89689677067fef169e # pin@v3
+        with:
+          title: Update dependencies
+          commit-message: Update dependencies
+          delete-branch: true
