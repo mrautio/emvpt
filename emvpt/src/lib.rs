@@ -571,6 +571,7 @@ pub struct ConfigurationFiles {
 
 #[derive(Serialize, Deserialize)]
 pub struct Settings {
+    pub censor_sensitive_fields : bool,
     configuration_files : ConfigurationFiles,
     pub terminal : Terminal,
     default_tags : HashMap<String, String>
@@ -617,10 +618,9 @@ impl EmvConnection<'_> {
         for (key, value) in &self.tags {
             i += 1;
             let emv_tag = self.emv_tags.get(key);
-            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string() }).name);
-            info!("value: {:02X?} = {}", value, String::from_utf8_lossy(&value).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string(), sensitivity: None }).name);
+            self.print_tag_value(&emv_tag, value, 0);
         }
-
     }
 
     pub fn get_tag_value(&self, tag_name : &str) -> Option<&Vec<u8>> {
@@ -630,7 +630,11 @@ impl EmvConnection<'_> {
     pub fn add_tag(&mut self, tag_name : &str, value : Vec<u8>) {
         let old_tag = self.tags.get(tag_name);
         if old_tag.is_some() {
-            trace!("Overriding tag {:?} from {:02X?} to {:02X?}", tag_name, old_tag.unwrap(), value);
+            if self.settings.censor_sensitive_fields {
+                trace!("Overriding tag {:?}. Old size: {}, new size: {}", tag_name, old_tag.unwrap().len(), value.len());
+            } else {
+                trace!("Overriding tag {:?} from {:02X?} to {:02X?}", tag_name, old_tag.unwrap(), value);
+            }
         }
 
         self.tags.insert(tag_name.to_string(), value);
@@ -704,7 +708,9 @@ impl EmvConnection<'_> {
             }
         }
 
-        debug!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
+        if ! self.settings.censor_sensitive_fields {
+            debug!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
+        }
 
         if !response_data.is_empty() {
             debug!("APDU TLV parse:");
@@ -715,20 +721,50 @@ impl EmvConnection<'_> {
         (response_trailer, response_data)
     }
 
-    fn print_tag(emv_tag : &EmvTag, level: u8) {
+    fn print_tag(&self, emv_tag : &EmvTag, level: u8) {
         let mut padding = String::with_capacity(level as usize);
         for _ in 0..level {
             padding.push(' ');
         }
         debug!("{}-{}: {}", padding, emv_tag.tag, emv_tag.name);
     }
-    fn print_tag_value(v : &Vec<u8>, level: u8) {
+    fn print_tag_value(&self, emv_tag : &Option<&EmvTag>, v : &Vec<u8>, level: u8) {
         let mut padding = String::with_capacity(level as usize);
         for _ in 0..level {
             padding.push(' ');
         }
-        debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
 
+        if self.settings.censor_sensitive_fields {
+            match emv_tag {
+                Some(tag) => {
+                    match tag.sensitivity {
+                        Some(FieldSensitivity::PrimaryAccountNumber) => {
+                            // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
+                            // Going with "First 6, last 4" as it is applicable for all schemes
+                            let mut pan : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                            pan = pan.chars().enumerate().map(|(i, c)| if i >= 6 && i < pan.len()-4 { '*' } else { c }).collect();
+                            debug!("{}-data: {}", padding, pan);
+                        },
+                        Some(FieldSensitivity::SensitiveAuthenticationData) => {
+                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|_c: char| true, "*"));
+                        },
+                        Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
+                            // allowing punctuation is primarily to see cardholder name which is separated by '/'
+                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()), "*"));
+                        },
+                        _ => {
+                            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+                        }
+                    }
+                    
+                },
+                _ => {
+                    debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+                }
+            }
+        } else {
+            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+        }
     }
 
     pub fn process_tlv(&mut self, buf: &[u8], level: u8) {
@@ -754,15 +790,17 @@ impl EmvConnection<'_> {
 
             let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
 
-            match self.emv_tags.get(tag_name.as_str()) {
+            let emv_tag : Option<&EmvTag> = match self.emv_tags.get(tag_name.as_str()) {
                 Some(emv_tag) => {
-                    EmvConnection::print_tag(&emv_tag, level);
+                    self.print_tag(&emv_tag, level);
+                    Some(emv_tag)
                 },
                 _ => {
-                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string() };
-                    EmvConnection::print_tag(&unknown_tag, level);
+                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string(), sensitivity: None };
+                    self.print_tag(&unknown_tag, level);
+                    None
                 }
-            }
+            };
 
             match tlv_data.value() {
                 Value::Constructed(v) => {
@@ -771,9 +809,8 @@ impl EmvConnection<'_> {
                     }
                 },
                 Value::Primitive(v) => {
+                    self.print_tag_value(&emv_tag, v, level);
                     self.add_tag(&tag_name, v.to_vec());
-
-                    EmvConnection::print_tag_value(v, level);
                 }
             };
 
@@ -2145,10 +2182,19 @@ pub struct EmvApplication {
     pub priority : Vec<u8>
 }
 
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum FieldSensitivity {
+    Public,
+    SensitiveAuthenticationData,
+    PrimaryAccountNumber,
+    PersonallyIdentifiableInformation
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EmvTag {
     pub tag: String,
-    pub name: String
+    pub name: String,
+    pub sensitivity: Option<FieldSensitivity>
 }
  
 #[derive(Serialize, Deserialize, Debug, Clone)]

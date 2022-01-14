@@ -183,6 +183,12 @@ fn run() -> Result<Option<String>, String> {
         .arg(Arg::with_name("print-tags")
             .long("print-tags")
             .help("Print all read or generated tags"))
+        .arg(Arg::with_name("censor-sensitive-fields")
+            .long("censor-sensitive-fields")
+            .help("Censor sensitive data"))
+        .arg(Arg::with_name("stop-after-read")
+            .long("stop-after-read")
+            .help("Stop processing transaction after card data has been read"))
         .arg(Arg::with_name("pin")
             .short("p")
             .long("pin")
@@ -204,11 +210,13 @@ fn run() -> Result<Option<String>, String> {
         }
     }
     let user_interactive = unsafe { INTERACTIVE };
-
+    let censor_sensitive_fields = matches.is_present("censor-sensitive-fields");
+    let stop_after_read = matches.is_present("stop-after-read");
     let print_tags = matches.is_present("print-tags");
 
     let mut connection = EmvConnection::new(&matches.value_of("settings").unwrap_or("config/settings.yaml").to_string()).unwrap();
 
+    connection.settings.censor_sensitive_fields = censor_sensitive_fields;
     connection.pse_application_select_callback = Some(&pse_application_select);
     connection.pin_callback = Some(&pin_entry);
     connection.amount_callback = Some(&amount_entry);
@@ -254,30 +262,32 @@ fn run() -> Result<Option<String>, String> {
 
     connection.handle_get_processing_options().unwrap();
 
-    connection.handle_public_keys(&application).unwrap();
+    if ! stop_after_read {
+        connection.handle_public_keys(&application).unwrap();
 
-    connection.handle_card_verification_methods().unwrap();
+        connection.handle_card_verification_methods().unwrap();
 
-    connection.handle_terminal_risk_management().unwrap();
+        connection.handle_terminal_risk_management().unwrap();
 
-    connection.handle_terminal_action_analysis().unwrap();
+        connection.handle_terminal_action_analysis().unwrap();
 
-    let mut purchase_successful = false;
+        let mut purchase_successful = false;
 
-    match connection.handle_1st_generate_ac().unwrap() {
-        CryptogramType::AuthorisationRequestCryptogram => {
-            if let CryptogramType::TransactionCertificate = connection.handle_2nd_generate_ac().unwrap() {
-                purchase_successful = true;
-            }
-        },
-        CryptogramType::TransactionCertificate => { purchase_successful = true; },
-        CryptogramType::ApplicationAuthenticationCryptogram => { purchase_successful = false; }
-    }
+        match connection.handle_1st_generate_ac().unwrap() {
+            CryptogramType::AuthorisationRequestCryptogram => {
+                if let CryptogramType::TransactionCertificate = connection.handle_2nd_generate_ac().unwrap() {
+                    purchase_successful = true;
+                }
+            },
+            CryptogramType::TransactionCertificate => { purchase_successful = true; },
+            CryptogramType::ApplicationAuthenticationCryptogram => { purchase_successful = false; }
+        }
 
-    if purchase_successful {
-        info!("Purchase successful!");
-    } else {
-        warn!("Purchase unsuccessful!");
+        if purchase_successful {
+            info!("Purchase successful!");
+        } else {
+            warn!("Purchase unsuccessful!");
+        }
     }
 
     if print_tags {

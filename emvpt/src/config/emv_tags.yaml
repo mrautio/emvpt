@@ -4,6 +4,7 @@
 '57':
   tag: '57'
   name: 'Track 2 Equivalent Data'
+  sensitivity: 'SensitiveAuthenticationData'
 '61':
   tag: '61'
   name: 'Application Template'
@@ -61,9 +62,11 @@
 '5F20':
   tag: '5F20'
   name: 'Cardholder Name'
+  sensitivity: 'PersonallyIdentifiableInformation'
 '9F1F':
   tag: '9F1F'
   name: 'Track 1 Discretionary Data'
+  sensitivity: 'SensitiveAuthenticationData'
 '8F':
   tag: '8F'
   name: 'Certification Authority Public Key Index'
@@ -85,6 +88,7 @@
 '5A':
   tag: '5A'
   name: 'Application Primary Account Number (PAN)'
+  sensitivity: 'PrimaryAccountNumber'
 '5F34':
   tag: '5F34'
   name: 'Application Primary Account Number (PAN) Sequence Number'
