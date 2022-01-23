@@ -18,12 +18,14 @@ jobs:
         with:
           toolchain: stable
       - run: cargo install cargo-edit cargo-audit
-      - run: cd emvpt && cargo upgrade && cargo update && cargo audit && cargo test
-      - run: cd terminalsimulator && cargo upgrade && cargo update && cargo audit &&
-          cargo test
+      - run: cd emvpt && cargo upgrade && cargo update && cargo test
+      - run: cd terminalsimulator && cargo upgrade && cargo update && cargo test
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@67df31e08a133c6a77008b89689677067fef169e # pin@v3
         with:
           title: Update dependencies
           commit-message: Update dependencies
           delete-branch: true
+      # Not all cargo audit findings can be fixed, hence create PR first
+      - run: cd emvpt && cargo audit
+      - run: cd terminalsimulator && cargo audit
