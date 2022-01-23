@@ -641,13 +641,19 @@ impl EmvConnection<'_> {
     }
 
     fn send_apdu_select(&mut self, aid : &[u8]) -> (Vec<u8>, Vec<u8>) {
+        //ref. EMV Book 1, 11.3.2 Command message
         self.tags.clear();
 
-        let apdu_command_select = b"\x00\xA4\x04\x00";
+        let apdu_command_select = b"\x00\xA4";
+        let p1_reference_control_parameter : u8 = 0b0000_0100; // "Select by name"
+        let p2_selection_options           : u8 = 0b0000_0000; // "First or only occurrence"
 
         let mut select_command = apdu_command_select.to_vec();
-        select_command.push(aid.len() as u8);
-        select_command.extend_from_slice(aid);
+        select_command.push(p1_reference_control_parameter);
+        select_command.push(p2_selection_options);
+        select_command.push(aid.len() as u8); // lc
+        select_command.extend_from_slice(aid); // data
+        select_command.push(0x00); // le
 
         self.send_apdu(&select_command)
     }
