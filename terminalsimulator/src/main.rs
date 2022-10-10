@@ -104,7 +104,7 @@ impl SmartCardConnection {
             let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
 
             // https://www.eftlab.com/knowledge-base/171-atr-list-full/
-            debug!("Card ATR:\n{:?}", card_status.atr());
+            debug!("Card ATR:\n{}", format!("{:02X?}", card_status.atr()).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_whitespace()), ""));
             debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
         } else {
             return Err(ReaderError::CardNotFound);
