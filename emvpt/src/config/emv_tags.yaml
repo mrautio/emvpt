@@ -89,6 +89,9 @@
   tag: '5A'
   name: 'Application Primary Account Number (PAN)'
   sensitivity: 'PrimaryAccountNumber'
+'5F30':
+  tag: '5F30'
+  name: 'Service Code'
 '5F34':
   tag: '5F34'
   name: 'Application Primary Account Number (PAN) Sequence Number'
