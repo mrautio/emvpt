@@ -8,8 +8,8 @@ edition = "2018"
 
 [dependencies]
 emvpt = { path = "../emvpt", version = "0.1.0" }
-log = "0.4.14"
-log4rs = "1.0.0"
-clap = "3.0.10"
-pcsc = "2.6.0"
-regex = "1.5.4"
+log = "0.4.17"
+log4rs = "1.1.1"
+clap = { version = "4.0.11", features = ["derive"] }
+pcsc = "2.7.0"
+regex = "1.6.0"

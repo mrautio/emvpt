@@ -2,10 +2,11 @@ use pcsc::{Context, Card, Scope, ShareMode, Protocols, MAX_BUFFER_SIZE, MAX_ATR_
 use regex::Regex;
 use log::{error, warn, info, debug};
 use log4rs;
-use clap::{App, Arg};
+use clap::Parser;
 use std::io::{self};
 use std::{thread, time};
 use std::str;
+use std::path::PathBuf;
 
 use emvpt::*;
 
@@ -171,50 +172,50 @@ fn amount_entry() -> Result<u64, ()> {
     Ok(1)
 }
 
+#[derive(Parser)]
+#[command(version = "0.1")]
+#[command(about = "EMV transaction simulation", long_about = None)]
+struct Args {
+    /// Simulate payment terminal purchase sequence
+    #[arg(long, default_value_t = false)]
+    interactive: bool,
+
+    /// Print all read or generated tags
+    #[arg(long="print-tags", default_value_t = false)]
+    print_tags: bool,
+
+    /// Censor sensitive data from the output
+    #[arg(long="censor-sensitive-fields", default_value_t = false)]
+    censor_sensitive_fields: bool,
+
+    /// Stop processing transaction after card data has been read
+    #[arg(long="stop-after-read", default_value_t = false)]
+    stop_after_read: bool,
+
+    /// Card PIN code to be used when PIN code is required
+    #[arg(short, long, value_name="PIN CODE")]
+    pin: Option<String>,
+
+    /// Card PIN code to be used when PIN code is required
+    #[arg(short, long, value_name="settings file", default_value = "config/settings.yaml")]
+    settings: PathBuf
+}
+
 fn run() -> Result<Option<String>, String> {
     log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
 
-    let matches = App::new("Minimum Viable Payment Terminal")
-        .version("0.1")
-        .about("EMV transaction simulation")
-        .arg(Arg::new("interactive")
-            .long("interactive")
-            .help("Simulate payment terminal purchase sequence"))
-        .arg(Arg::new("print-tags")
-            .long("print-tags")
-            .help("Print all read or generated tags"))
-        .arg(Arg::new("censor-sensitive-fields")
-            .long("censor-sensitive-fields")
-            .help("Censor sensitive data"))
-        .arg(Arg::new("stop-after-read")
-            .long("stop-after-read")
-            .help("Stop processing transaction after card data has been read"))
-        .arg(Arg::new("pin")
-            .short('p')
-            .long("pin")
-            .value_name("PIN CODE")
-            .help("Card PIN code")
-            .takes_value(true))
-        .arg(Arg::new("settings")
-            .short('s')
-            .long("settings")
-            .value_name("settings file")
-            .help("Settings file location")
-            .takes_value(true))
-        .get_matches();
+    let args = Args::parse();
 
     unsafe {
-        INTERACTIVE = matches.is_present("interactive");
-        if matches.is_present("pin") {
-            PIN_OPTION = Some(matches.value_of("pin").unwrap().to_string());
-        }
+        INTERACTIVE = args.interactive;
+        PIN_OPTION = args.pin;
     }
     let user_interactive = unsafe { INTERACTIVE };
-    let censor_sensitive_fields = matches.is_present("censor-sensitive-fields");
-    let stop_after_read = matches.is_present("stop-after-read");
-    let print_tags = matches.is_present("print-tags");
+    let censor_sensitive_fields = args.censor_sensitive_fields;
+    let stop_after_read = args.stop_after_read;
+    let print_tags = args.print_tags;
 
-    let mut connection = EmvConnection::new(&matches.value_of("settings").unwrap_or("config/settings.yaml").to_string()).unwrap();
+    let mut connection = EmvConnection::new(&args.settings.as_path().to_str().unwrap()).unwrap();
 
     connection.settings.censor_sensitive_fields = censor_sensitive_fields;
     connection.pse_application_select_callback = Some(&pse_application_select);
