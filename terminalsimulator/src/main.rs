@@ -188,6 +188,10 @@ struct Args {
     #[arg(long="censor-sensitive-fields", default_value_t = false)]
     censor_sensitive_fields: bool,
 
+    /// Exit after connecting the card 
+    #[arg(long="stop-after-connect", default_value_t = false)]
+    stop_after_connect: bool,
+
     /// Stop processing transaction after card data has been read
     #[arg(long="stop-after-read", default_value_t = false)]
     stop_after_read: bool,
@@ -212,6 +216,7 @@ fn run() -> Result<Option<String>, String> {
     }
     let user_interactive = unsafe { INTERACTIVE };
     let censor_sensitive_fields = args.censor_sensitive_fields;
+    let stop_after_connect = args.stop_after_connect;
     let stop_after_read = args.stop_after_read;
     let print_tags = args.print_tags;
 
@@ -251,6 +256,10 @@ fn run() -> Result<Option<String>, String> {
             },
             _ => return Err("Could not connect to the reader".to_string())
         }
+    }
+
+    if stop_after_connect {
+        return Ok(None);
     }
 
     connection.contactless = smart_card_connection.contactless;
