@@ -234,6 +234,27 @@ pub struct UsageControl {
     pub international_cashback : bool
 }
 
+impl From<Vec<u8>> for UsageControl {
+    fn from(data: Vec<u8>) -> Self {
+        let b1 : u8 = data[0];
+        let b2 : u8 = data[1];
+
+        UsageControl {
+            domestic_cash_transactions: get_bit!(b1, 7),
+            international_cash_transactions: get_bit!(b1, 6),
+            domestic_goods: get_bit!(b1, 5),
+            international_goods: get_bit!(b1, 4),
+            domestic_services: get_bit!(b1, 3),
+            international_services: get_bit!(b1, 2),
+            atms: get_bit!(b1, 1),
+            terminals_other_than_atms: get_bit!(b1, 0),
+            domestic_cashback: get_bit!(b2, 7),
+            international_cashback: get_bit!(b2, 6)
+        }
+    }
+}
+
+
 #[derive(Debug)]
 pub struct Icc {
     pub capabilities : Capabilities,
@@ -618,7 +639,7 @@ impl EmvConnection<'_> {
         for (key, value) in &self.tags {
             i += 1;
             let emv_tag = self.emv_tags.get(key);
-            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string(), sensitivity: None }).name);
+            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None }).name);
             self.print_tag_value(&emv_tag, value, 0);
         }
     }
@@ -740,36 +761,52 @@ impl EmvConnection<'_> {
             padding.push(' ');
         }
 
-        if self.settings.censor_sensitive_fields {
-            match emv_tag {
-                Some(tag) => {
-                    match tag.sensitivity {
-                        Some(FieldSensitivity::PrimaryAccountNumber) => {
-                            // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
-                            // Going with "First 6, last 4" as it is applicable for all schemes
-                            let mut pan : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
-                            pan = pan.chars().enumerate().map(|(i, c)| if i >= 6 && i < pan.len()-4 { '*' } else { c }).collect();
-                            debug!("{}-data: {}", padding, pan);
-                        },
-                        Some(FieldSensitivity::SensitiveAuthenticationData) => {
-                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|_c: char| true, "*"));
-                        },
-                        Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
-                            // allowing punctuation is primarily to see cardholder name which is separated by '/'
-                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()), "*"));
-                        },
-                        _ => {
-                            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
-                        }
-                    }
-                    
+        let mut value : String = String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), ".");
+        if let Some(tag) = emv_tag {
+            match tag.format {
+                Some(FieldFormat::CompressedNumeric) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
                 },
-                _ => {
-                    debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
-                }
+                Some(FieldFormat::Alphanumeric) | Some(FieldFormat::AlphanumericSpecial) => {
+                    value = String::from_utf8_lossy(&v).to_string();
+                },
+                Some(FieldFormat::TerminalVerificationResults) => {
+                    let tvr : TerminalVerificationResults = v.to_vec().into();
+                    value = format!("{:08b} {:08b} {:08b} {:08b} {:08b} => {:#?}", v[0], v[1], v[2], v[3], v[4], tvr);
+                },
+                Some(FieldFormat::ApplicationUsageControl) => {
+                    let auc : UsageControl = v.to_vec().into();
+                    value = format!("{:08b} {:08b} => {:#?}", v[0], v[1], auc);
+                },
+                _ => { /* NOP */ }
             }
+        }
+
+        if self.settings.censor_sensitive_fields {
+            if let Some(tag) = emv_tag {
+                match tag.sensitivity {
+                    Some(FieldSensitivity::PrimaryAccountNumber) => {
+                        // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
+                        // Going with "First 6, last 4" as it is applicable for all schemes
+                        let masked_pan : String = value.chars().enumerate().map(|(i, c)| if i >= 6 && i < value.len()-4 { '*' } else { c }).collect();
+                        debug!("{}-data: {}", padding, masked_pan);
+                    },
+                    Some(FieldSensitivity::SensitiveAuthenticationData) => {
+                        debug!("{}-data: {}", padding, value.replace(|_c: char| true, "*"));
+                    },
+                    Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
+                        // allowing punctuation is primarily to see cardholder name which is separated by '/'
+                        debug!("{}-data: {}", padding, value.replace(|c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()), "*"));
+                    },
+                    _ => {
+                        debug!("{}-data: {:02X?} = {}", padding, v, value);
+                    }
+                }
+            } else {
+                debug!("{}-data: {:02X?} = {}", padding, v, value);
+            }                    
         } else {
-            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+            debug!("{}-data: {:02X?} = {}", padding, v, value);
         }
     }
 
@@ -802,7 +839,7 @@ impl EmvConnection<'_> {
                     Some(emv_tag)
                 },
                 _ => {
-                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string(), sensitivity: None };
+                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None };
                     self.print_tag(&unknown_tag, level);
                     None
                 }
@@ -946,18 +983,7 @@ impl EmvConnection<'_> {
         self.icc.capabilities.cda = get_bit!(auc_b1, 0);
 
         if let Some(tag_9f07_application_usage_control) = self.get_tag_value("9F07") {
-            let auc_b1 : u8 = tag_9f07_application_usage_control[0];
-            let auc_b2 : u8 = tag_9f07_application_usage_control[1];
-            self.icc.usage.domestic_cash_transactions = get_bit!(auc_b1, 7);
-            self.icc.usage.international_cash_transactions = get_bit!(auc_b1, 6);
-            self.icc.usage.domestic_goods = get_bit!(auc_b1, 5);
-            self.icc.usage.international_goods = get_bit!(auc_b1, 4);
-            self.icc.usage.domestic_services = get_bit!(auc_b1, 3);
-            self.icc.usage.international_services = get_bit!(auc_b1, 2);
-            self.icc.usage.atms = get_bit!(auc_b1, 1);
-            self.icc.usage.terminals_other_than_atms = get_bit!(auc_b1, 0);
-            self.icc.usage.domestic_cashback = get_bit!(auc_b2, 7);
-            self.icc.usage.international_cashback = get_bit!(auc_b2, 6);
+            self.icc.usage = tag_9f07_application_usage_control.to_vec().into();
         }
 
         debug!("{:?}", self.icc);
@@ -2196,11 +2222,24 @@ pub enum FieldSensitivity {
     PersonallyIdentifiableInformation
 }
 
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum FieldFormat {
+    CompressedNumeric,
+    Binary,
+    Alphanumeric,
+    AlphanumericSpecial,
+    TerminalVerificationResults,
+    ApplicationUsageControl
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EmvTag {
     pub tag: String,
     pub name: String,
-    pub sensitivity: Option<FieldSensitivity>
+    pub sensitivity: Option<FieldSensitivity>,
+    pub format: Option<FieldFormat>,
+    pub min: Option<u8>,
+    pub max: Option<u8>
 }
  
 #[derive(Serialize, Deserialize, Debug, Clone)]

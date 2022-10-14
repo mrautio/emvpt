@@ -1,6 +1,9 @@
 '50':
   tag: '50'
   name: 'Application Label'
+  format: 'AlphanumericSpecial'
+  min: 1
+  max: 16
 '57':
   tag: '57'
   name: 'Track 2 Equivalent Data'
@@ -44,6 +47,9 @@
 '95':
   tag: '95'
   name: 'Terminal Verification Results'
+  format: 'TerminalVerificationResults'
+  min: 5
+  max: 5
 '6F':
   tag: '6F'
   name: 'File Control Information (FCI) Template'
@@ -89,6 +95,9 @@
   tag: '5A'
   name: 'Application Primary Account Number (PAN)'
   sensitivity: 'PrimaryAccountNumber'
+  format: 'CompressedNumeric'
+  min: 0
+  max: 10
 '5F30':
   tag: '5F30'
   name: 'Service Code'
@@ -98,6 +107,9 @@
 '9F07':
   tag: '9F07'
   name: 'Application Usage Control'
+  format: 'ApplicationUsageControl'
+  min: 2
+  max: 2
 '8E':
   tag: '8E'
   name: 'Cardholder Verification Method (CVM) List'
@@ -107,12 +119,21 @@
 '9F0D':
   tag: '9F0D'
   name: 'Issuer Action Code – Default'
+  format: 'TerminalVerificationResults'
+  min: 5
+  max: 5
 '9F0E':
   tag: '9F0E'
   name: 'Issuer Action Code – Denial'
+  format: 'TerminalVerificationResults'
+  min: 5
+  max: 5
 '9F0F':
   tag: '9F0F'
   name: 'Issuer Action Code – Online'
+  format: 'TerminalVerificationResults'
+  min: 5
+  max: 5
 '9F4A':
   tag: '9F4A'
   name: 'Static Data Authentication Tag List'
