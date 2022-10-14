@@ -7,6 +7,7 @@ use std::io::{self};
 use std::{thread, time};
 use std::str;
 use std::path::PathBuf;
+use hex;
 
 use emvpt::*;
 
@@ -202,7 +203,11 @@ struct Args {
 
     /// Card PIN code to be used when PIN code is required
     #[arg(short, long, value_name="settings file", default_value = "config/settings.yaml")]
-    settings: PathBuf
+    settings: PathBuf,
+
+    /// Print TLV data in human readable form
+    #[arg(long, value_name="TLV")]
+    print_tlv: Option<String>
 }
 
 fn run() -> Result<Option<String>, String> {
@@ -219,6 +224,7 @@ fn run() -> Result<Option<String>, String> {
     let stop_after_connect = args.stop_after_connect;
     let stop_after_read = args.stop_after_read;
     let print_tags = args.print_tags;
+    let print_tlv = args.print_tlv;
 
     let mut connection = EmvConnection::new(&args.settings.as_path().to_str().unwrap()).unwrap();
 
@@ -226,6 +232,13 @@ fn run() -> Result<Option<String>, String> {
     connection.pse_application_select_callback = Some(&pse_application_select);
     connection.pin_callback = Some(&pin_entry);
     connection.amount_callback = Some(&amount_entry);
+
+    if print_tlv.is_some() {
+        let tlv_hex_data = print_tlv.unwrap().replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+        info!("input TLV: {}", tlv_hex_data);
+        connection.process_tlv(&hex::decode(&tlv_hex_data).unwrap()[..], 0);
+        return Ok(None);
+    }
 
     let purchase_amount = connection.amount_callback.unwrap()().unwrap();
 
