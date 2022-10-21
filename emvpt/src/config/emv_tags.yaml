@@ -4,112 +4,185 @@
   format: 'AlphanumericSpecial'
   min: 1
   max: 16
+  source: 'Icc'
 '57':
   tag: '57'
   name: 'Track 2 Equivalent Data'
   sensitivity: 'Track2'
   format: 'Track2'
+  max: 19
+  source: 'Icc'
 '61':
   tag: '61'
   name: 'Application Template'
+  source: 'Icc'
 '70':
   tag: '70'
   name: 'EMV Proprietary Template'
+  source: 'Icc'
 '73':
   tag: '73'
   name: 'Directory Discretionary Template'
+  source: 'Icc'
 '77':
   tag: '77'
   name: 'Response Message Template Format 2'
+  source: 'Icc'
 '80':
   tag: '80'
   name: 'Response Message Template Format 1'
+  source: 'Icc'
 '82':
   tag: '82'
   name: 'Application Interchange Profile (AIP)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 2
 '84':
   tag: '84'
   name: 'Dedicated File (DF) Name'
+  format: 'Binary'
+  source: 'Icc'
+  min: 5
+  max: 16
 '87':
   tag: '87'
   name: 'Application Priority Indicator'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 1
 '88':
   tag: '88'
   name: 'Short File Identifier (SFI)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 1
 '90':
   tag: '90'
   name: 'Issuer Public Key Certificate'
   format: 'KeyCertificate'
+  source: 'Icc'
 '92':
   tag: '92'
   name: 'Issuer Public Key Remainder'
+  format: 'Binary'
+  source: 'Icc'
 '94':
   tag: '94'
   name: 'Application File Locator (AFL)'
+  format: 'Binary'
 '95':
   tag: '95'
   name: 'Terminal Verification Results'
   format: 'TerminalVerificationResults'
+  source: 'Terminal'
   min: 5
   max: 5
 '6F':
   tag: '6F'
   name: 'File Control Information (FCI) Template'
+  source: 'Icc'
 'A5':
   tag: 'A5'
   name: 'File Control Information (FCI) Proprietary Template'
+  source: 'Icc'
 '5F2D':
   tag: '5F2D'
   name: 'Language Preference'
+  format: 'Alphanumeric'
+  source: 'Icc'
+  min: 2
+  max: 8
 'BF0C':
   tag: 'BF0C'
   name: 'File Control Information (FCI) Issuer Discretionary Data'
+  source: 'Icc'
 '4F':
   tag: '4F'
   name: 'Application Identifier (AID)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 5
+  max: 16
 '5F20':
   tag: '5F20'
   name: 'Cardholder Name'
   sensitivity: 'PersonallyIdentifiableInformation'
+  format: 'Alphanumeric'
+  source: 'Icc'
+  min: 2
+  max: 26
 '9F1F':
   tag: '9F1F'
   name: 'Track 1 Discretionary Data'
   sensitivity: 'SensitiveAuthenticationData'
+  format: 'AlphanumericSpecial'
+  source: 'Icc'
 '8F':
   tag: '8F'
   name: 'Certification Authority Public Key Index'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 1
 '9F32':
   tag: '9F32'
   name: 'Issuer Public Key Exponent'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 3
 '9F47':
   tag: '9F47'
   name: 'Integrated Circuit Card (ICC) Public Key Exponent'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 3
 '9F46':
   tag: '9F46'
   name: 'Integrated Circuit Card (ICC) Public Key Certificate'
   format: 'KeyCertificate'
+  source: 'Icc'
 '5F25':
   tag: '5F25'
   name: 'Application Effective Date'
+  format: 'Date'
+  source: 'Icc'
+  min: 3
+  max: 3
 '5F24':
   tag: '5F24'
   name: 'Application Expiration Date'
+  format: 'Date'
+  source: 'Icc'
+  min: 3
+  max: 3
 '5A':
   tag: '5A'
   name: 'Application Primary Account Number (PAN)'
   sensitivity: 'PrimaryAccountNumber'
   format: 'CompressedNumeric'
+  source: 'Icc'
   min: 0
   max: 10
 '5F30':
   tag: '5F30'
   name: 'Service Code'
   format: 'ServiceCodeIso7813'
+  source: 'Icc'
   min: 3
   max: 3
 '5F34':
   tag: '5F34'
   name: 'Application Primary Account Number (PAN) Sequence Number'
+  format: 'CompressedNumeric'
+  source: 'Icc'
+  min: 1
+  max: 1
 '9F07':
   tag: '9F07'
   name: 'Application Usage Control'
@@ -119,6 +192,8 @@
 '8E':
   tag: '8E'
   name: 'Cardholder Verification Method (CVM) List'
+  format: 'Binary'
+  source: 'Icc'
 '9F0A':
   tag: '9F0A'
   name: 'Application Selection Registered Proprietary Data'
@@ -126,152 +201,272 @@
   tag: '9F0D'
   name: 'Issuer Action Code – Default'
   format: 'TerminalVerificationResults'
+  source: 'Icc'
   min: 5
   max: 5
 '9F0E':
   tag: '9F0E'
   name: 'Issuer Action Code – Denial'
   format: 'TerminalVerificationResults'
+  source: 'Icc'
   min: 5
   max: 5
 '9F0F':
   tag: '9F0F'
   name: 'Issuer Action Code – Online'
   format: 'TerminalVerificationResults'
+  source: 'Icc'
   min: 5
   max: 5
 '9F4A':
   tag: '9F4A'
   name: 'Static Data Authentication Tag List'
   format: 'DataObjectList'
+  source: 'Icc'
 '8C':
   tag: '8C'
   name: 'Card Risk Management Data Object List 1 (CDOL1)'
   format: 'DataObjectList'
+  source: 'Icc'
 '8D':
   tag: '8D'
   name: 'Card Risk Management Data Object List 2 (CDOL2)'
   format: 'DataObjectList'
+  source: 'Icc'
 '9F1D':
   tag: '9F1D'
   name: 'Terminal Risk Management Data'
+  format: 'Binary'
+  source: 'Terminal'
+  min: 1
+  max: 5
 '5F28':
   tag: '5F28'
   name: 'Issuer Country Code'
   format: 'NumericCountryCode'
+  source: 'Icc'
   min: 2
   max: 2
 '9F42':
   tag: '9F42'
   name: 'Application Currency Code'
   format: 'NumericCurrencyCode'
+  source: 'Icc'
+  min: 2
+  max: 2
 '9F44':
   tag: '9F44'
   name: 'Application Currency Exponent'
+  format: 'CompressedNumeric'
+  source: 'Icc'
+  min: 1
+  max: 1
 '9F49':
   tag: '9F49'
   name: 'Dynamic Data Authentication Data Object List (DDOL)'
   format: 'DataObjectList'
+  source: 'Icc'
 '9F08':
   tag: '9F08'
   name: 'Application Version Number'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 2
 '9F02':
   tag: '9F02'
   name: 'Amount, Authorised (Numeric)'
+  format: 'CompressedNumeric'
+  source: 'Terminal'
+  min: 6
+  max: 6
 '9F03':
   tag: '9F03'
   name: 'Amount, Other (Numeric)'
+  format: 'CompressedNumeric'
+  source: 'Terminal'
+  min: 6
+  max: 6
 '9F1A':
   tag: '9F1A'
   name: 'Terminal Country Code'
   format: 'NumericCountryCode'
+  source: 'Terminal'
+  min: 2
+  max: 2
 '5F2A':
   tag: '5F2A'
   name: 'Transaction Currency Code'
   format: 'NumericCurrencyCode'
+  source: 'Terminal'
+  min: 2
+  max: 2
 '93':
   tag: '93'
   name: 'Signed Static Application Data'
+  format: 'Binary'
+  source: 'Icc'
 '9A':
   tag: '9A'
   name: 'Transaction Date'
+  format: 'Date'
+  source: 'Terminal'
+  min: 3
+  max: 3
 '9C':
   tag: '9C'
   name: 'Transaction Type'
+  format: 'CompressedNumeric'
+  source: 'Terminal'
+  min: 1
+  max: 1
 '9F37':
   tag: '9F37'
   name: 'Unpredictable Number'
+  format: 'Binary'
+  source: 'Terminal'
+  min: 4
+  max: 4
 '9F38':
   tag: '9F38'
   name: 'Processing Options Data Object List (PDOL)'
   format: 'DataObjectList'
+  source: 'Icc'
 '83':
   tag: '83'
   name: 'Command Template'
+  format: 'Binary'
+  source: 'Terminal'
 '8A':
   tag: '8A'
   name: 'Authorisation Response Code'
+  format: 'Alphanumeric'
+  source: 'IssuerOrTerminal'
+  min: 2
+  max: 2
 '9F4B':
   tag: '9F4B'
   name: 'Signed Dynamic Application Data'
+  format: 'Binary'
+  source: 'Icc'
 '9F48':
   tag: '9F48'
   name: 'Integrated Circuit Card (ICC) Public Key Remainder'
+  format: 'Binary'
+  source: 'Icc'
 '9F27':
   tag: '9F27'
   name: 'Cryptogram Information Data (CID)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 1
+  max: 1
 '9F36':
   tag: '9F36'
   name: 'Application Transaction Counter (ATC)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 2
 '9F21':
   tag: '9F21'
   name: 'Transaction Time'
+  format: 'Time'
+  source: 'Icc'
+  min: 3
+  max: 3
 '9F26':
   tag: '9F26'
   name: 'Application Cryptogram (AC)'
+  format: 'Binary'
+  source: 'Icc'
+  min: 8
+  max: 8
 '9F24':
   tag: '9F24'
   name: 'PAR Data'
 '9F10':
   tag: '9F10'
   name: 'Issuer Application Data (IAD)'
+  format: 'Binary'
+  source: 'Icc'
+  max: 32
 '9F35':
   tag: '9F35'
   name: 'Terminal Type'
+  format: 'CompressedNumeric'
+  source: 'Terminal'
+  min: 1
+  max: 1
 '9F45':
   tag: '9F45'
   name: 'Data Authentication Code'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 2
 '9F4C':
   tag: '9F4C'
   name: 'ICC Dynamic Number'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 8
 '9F4D':
   tag: '9F4D'
   name: 'Log Entry'
+  format: 'Binary'
+  source: 'Icc'
+  min: 2
+  max: 2
 '9F33':
   tag: '9F33'
   name: 'Terminal Capabilities'
+  format: 'Binary'
+  source: 'Terminal'
+  min: 3
+  max: 3
 '9F34':
   tag: '9F34'
   name: 'Cardholder Verification Method (CVM) Results'
+  format: 'Binary'
+  source: 'Terminal'
+  min: 3
+  max: 3
 '9F11':
   tag: '9F11'
   name: 'Issuer Code Table Index'
+  format: 'CompressedNumeric'
+  source: 'Icc'
+  min: 1
+  max: 1
 '9F12':
   tag: '9F12'
   name: 'Application Preferred Name'
+  format: 'AlphanumericSpecial'
+  source: 'Icc'
+  min: 1
+  max: 16
 '9F2E':
   tag: '9F2E'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Exponent'
+  format: 'Binary'
+  source: 'Icc'
 '9F2F':
   tag: '9F2F'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Remainder'
+  format: 'Binary'
+  source: 'Icc'
 '9F2D':
   tag: '9F2D'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate'
   format: 'KeyCertificate'
+  source: 'Icc'
 '9F66':
   tag: '9F66'
   name: 'Terminal Transaction Qualifiers (TTQ)'
+  format: 'Binary'
+  source: 'Terminal'
 '9F69':
   tag: '9F69'
   name: 'Card Authentication Related Data'
@@ -281,3 +476,7 @@
 '91':
   tag: '91'
   name: 'Issuer Authentication Data'
+  format: 'Binary'
+  source: 'Issuer'
+  min: 8
+  max: 16

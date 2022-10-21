@@ -700,7 +700,7 @@ impl DataObject {
     pub fn new(emv_connection : &EmvConnection, tag_name : &str, length : usize) -> DataObject {
         DataObject {
             emv_tag: emv_connection.get_emv_tag(tag_name)
-                .unwrap_or(&EmvTag { tag: tag_name.to_string(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None }).clone(),
+                .unwrap_or(&EmvTag::new(tag_name)).clone(),
             length: length
         }
     }
@@ -798,7 +798,7 @@ impl DataObjectList {
             };
 
             // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
-            if value.len() != data_object.length {
+            if data_object.length > 0 && value.len() != data_object.length {
                 warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", data_object.emv_tag.tag, value.len(), data_object.length);
                 //return Err(());
             }
@@ -856,7 +856,7 @@ impl EmvConnection<'_> {
         for (key, value) in &self.tags {
             i += 1;
             let emv_tag = self.emv_tags.get(key);
-            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None }).name);
+            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag::new(&key.clone())).name);
             self.print_tag_value(&emv_tag, value, 0);
         }
     }
@@ -1064,6 +1064,24 @@ impl EmvConnection<'_> {
                     let track2 : Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
                     value = format!("{}", track2);
                 },
+                Some(FieldFormat::Date) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                    let yy = &value[0..2];
+                    let mm = &value[2..4];
+                    let dd = &value[4..6];
+
+                    // FIXME: date format does not take into consideration pre 2000s dates
+                    value = format!("20{}-{}-{}", yy, mm, dd);
+
+                },
+                Some(FieldFormat::Time) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                    let hh = &value[0..2];
+                    let mm = &value[2..4];
+                    let ss = &value[4..6];
+
+                    value = format!("{}:{}:{}", hh, mm, ss);
+                },
                 _ => { /* NOP */ }
             }
         }
@@ -1118,11 +1136,9 @@ impl EmvConnection<'_> {
 
                     break;
                 }
-
             };
 
             read_buffer = leftover_buffer;
-
 
             let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
 
@@ -1132,7 +1148,7 @@ impl EmvConnection<'_> {
                     Some(emv_tag)
                 },
                 _ => {
-                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None };
+                    let unknown_tag = EmvTag::new(&tag_name.clone());
                     self.print_tag(&unknown_tag, level);
                     None
                 }
@@ -2456,7 +2472,17 @@ pub enum FieldFormat {
     NumericCountryCode,
     NumericCurrencyCode,
     DataObjectList,
-    Track2
+    Track2,
+    Date,
+    Time
+}
+
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum FieldSource {
+    Icc,
+    Terminal,
+    Issuer,
+    IssuerOrTerminal
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2466,9 +2492,24 @@ pub struct EmvTag {
     pub sensitivity: Option<FieldSensitivity>,
     pub format: Option<FieldFormat>,
     pub min: Option<u8>,
-    pub max: Option<u8>
+    pub max: Option<u8>,
+    pub source: Option<FieldSource>
 }
- 
+
+impl EmvTag {
+    pub fn new(tag_name : &str) -> EmvTag {
+        EmvTag {
+            tag: tag_name.to_string(),
+            name: "Unknown tag".to_string(),
+            sensitivity: None,
+            format: None,
+            min: None,
+            max: None,
+            source: None   
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RsaPublicKey {
     pub modulus: String,
