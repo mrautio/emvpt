@@ -5,6 +5,7 @@ use std::str;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::error;
+use std::fmt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self};
 use log::{info, warn, debug, trace};
@@ -16,6 +17,7 @@ use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Timelike, Datelike, Utc};
+use regex::Regex;
 
 pub mod bcdutil;
 
@@ -31,6 +33,86 @@ macro_rules! serialize_yaml {
     ($file:expr, $static_resource:expr) => { serde_yaml::from_str(&fs::read_to_string($file).unwrap_or(String::from_utf8_lossy(include_bytes!($static_resource)).to_string())).unwrap() }
 }
 
+
+#[derive(Debug, Clone)]
+pub struct Track1 {
+    pub primary_account_number : String,
+    pub last_name : String,
+    pub first_name : String,
+    pub expiry_year : String,
+    pub expiry_month : String,
+    pub service_code : String,
+    pub discretionary_data : String
+}
+
+impl Track1 {
+    pub fn new(track_data : &str) -> Track1 {
+        // %B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?
+        println!("Track: {}", track_data);
+        let re = Regex::new(r"^(%B)?(\d+)\^(.+)?/(.+)?\^(\d{2})(\d{2})(\d{3})(\d+)\??$").unwrap();
+        let cap = re.captures(track_data).unwrap();
+
+        Track1 {
+            primary_account_number: cap.get(2).unwrap().as_str().to_string(),
+            last_name: cap.get(3).unwrap().as_str().to_string(),
+            first_name: cap.get(4).unwrap().as_str().to_string(),
+            expiry_year: cap.get(5).unwrap().as_str().to_string(),
+            expiry_month: cap.get(6).unwrap().as_str().to_string(),
+            service_code: cap.get(7).unwrap().as_str().to_string(),
+            discretionary_data: cap.get(8).unwrap().as_str().to_string()
+        }
+    }
+
+    pub fn censor(&mut self) {
+        self.primary_account_number = self.primary_account_number.chars().enumerate().map(|(i, c)| if i >= 6 && i < self.primary_account_number.len()-4 { '*' } else { c }).collect();
+        self.last_name = self.last_name.replace(|_c: char| true, "*");
+        self.first_name = self.first_name.replace(|_c: char| true, "*");
+        self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
+    }
+}
+
+impl fmt::Display for Track1 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "%B{}^{}/{}^{}{}{}{}?", self.primary_account_number, self.last_name, self.first_name, self.expiry_year, self.expiry_month, self.service_code, self.discretionary_data)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Track2 {
+    pub primary_account_number : String,
+    pub expiry_year : String,
+    pub expiry_month : String,
+    pub service_code : String,
+    pub discretionary_data : String
+}
+
+impl Track2 {
+    pub fn new(track_data : &str) -> Track2 {
+        // ;4321432143214321=2612101123456789123?
+        println!("Track: {}", track_data);
+        let re = Regex::new(r"^;?(\d+)=(\d{2})(\d{2})(\d{3})(\d+)\??$").unwrap();
+        let cap = re.captures(track_data).unwrap();
+
+        Track2 {
+            primary_account_number: cap.get(1).unwrap().as_str().to_string(),
+            expiry_year: cap.get(2).unwrap().as_str().to_string(),
+            expiry_month: cap.get(3).unwrap().as_str().to_string(),
+            service_code: cap.get(4).unwrap().as_str().to_string(),
+            discretionary_data: cap.get(5).unwrap().as_str().to_string()
+        }
+    }
+
+    pub fn censor(&mut self) {
+        self.primary_account_number = self.primary_account_number.chars().enumerate().map(|(i, c)| if i >= 6 && i < self.primary_account_number.len()-4 { '*' } else { c }).collect();
+        self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
+    }
+}
+
+impl fmt::Display for Track2 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, ";{}={}{}{}{}?", self.primary_account_number, self.expiry_year, self.expiry_month, self.service_code, self.discretionary_data)
+    }
+}   
 
 #[repr(u8)]
 #[derive(Deserialize, Serialize, Debug, Copy, Clone)]
@@ -587,7 +669,8 @@ impl From<TransactionStatusInformation> for Vec<u8> {
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationFiles {
     emv_tags : String,
-    scheme_ca_public_keys : String
+    scheme_ca_public_keys : String,
+    constants : String
 }
 
 #[derive(Serialize, Deserialize)]
@@ -598,8 +681,139 @@ pub struct Settings {
     default_tags : HashMap<String, String>
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Constants {
+    pub numeric_country_codes : HashMap<String, String>,
+    pub numeric_currency_codes : HashMap<String, String>
+}
+
 pub trait ApduInterface {
     fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()>;
+}
+
+pub struct DataObject {
+    pub emv_tag : EmvTag,
+    pub length : usize
+}
+
+impl DataObject {
+    pub fn new(emv_connection : &EmvConnection, tag_name : &str, length : usize) -> DataObject {
+        DataObject {
+            emv_tag: emv_connection.get_emv_tag(tag_name)
+                .unwrap_or(&EmvTag { tag: tag_name.to_string(), name: "Unknown tag".to_string(), sensitivity: None, format: None, min: None, max: None }).clone(),
+            length: length
+        }
+    }
+}
+
+pub struct DataObjectList {
+    data_objects : Vec<DataObject>
+}
+
+impl fmt::Display for DataObjectList {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for data_object in &self.data_objects {
+            if let Err(e) = write!(f, "{} - {} ({}b); ", data_object.emv_tag.tag, data_object.emv_tag.name, data_object.length) {
+                return Err(e)
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// EMV Book 3, 5.4 Rules for Using a Data Object List (DOL)
+impl DataObjectList {
+    // EMV has some tags that don't conform to ISO/IEC 7816
+    fn is_non_conforming_one_byte_tag(tag : u8) -> bool {
+        if tag == 0x95 {
+            return true;
+        }
+
+        false
+    }
+
+    fn new() -> DataObjectList {
+        DataObjectList {
+            data_objects: Vec::new()
+        }
+    }
+
+    fn push(&mut self, data_object : DataObject) {
+        self.data_objects.push(data_object);
+    }
+
+    pub fn process_data_object_list(emv_connection : &EmvConnection, tag_list : &[u8]) -> Result<DataObjectList, ()> {
+        let mut dol : DataObjectList = DataObjectList::new();
+
+        // FIXME: This parsing is complete BS
+        // - Check if "Tag List" and "Data Object List" are same or different types
+        // - Parse TLV tags appropriately...
+        if tag_list.len() < 2 {
+            let tag_name = hex::encode(&tag_list[0..1]).to_uppercase();
+            dol.push(DataObject::new(emv_connection, &tag_name, 0));
+        } else {
+            let mut i = 0;
+            loop {
+                let tag_value_length : usize;
+
+                let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
+
+                if Tag::try_from(tag_name.as_str()).is_ok() || DataObjectList::is_non_conforming_one_byte_tag(tag_list[i]) {
+                    tag_value_length = tag_list[i+1] as usize;
+                    i += 2;
+                } else {
+                    tag_name = hex::encode(&tag_list[i..i+2]).to_uppercase();
+                    if Tag::try_from(tag_name.as_str()).is_ok() {
+                        tag_value_length = tag_list[i+2] as usize;
+                        i += 3;
+                    } else {
+                        warn!("Incorrect tag {:?}", tag_name);
+                        return Err(());
+                    }
+                }
+
+                dol.push(DataObject::new(emv_connection, &tag_name, tag_value_length));
+                
+                if i >= tag_list.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(dol)
+    }
+
+    pub fn get_tag_list_tag_values(&self, emv_connection : &EmvConnection) -> Vec<u8> {
+        let mut output : Vec<u8> = Vec::new();
+        for data_object in &self.data_objects {
+            let default_value : Vec<u8> = vec![0; data_object.length];
+            let value = match emv_connection.get_tag_value(&data_object.emv_tag.tag) {
+                Some(value) => value,
+                None => {
+                    debug!("tag {:?} has no value, filling with zeros", data_object.emv_tag.tag);
+                    
+                    &default_value
+                }
+            };
+
+            // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
+            if value.len() != data_object.length {
+                warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", data_object.emv_tag.tag, value.len(), data_object.length);
+                //return Err(());
+            }
+
+            let mut len = data_object.length;
+            if len == 0 { // at least 9F4A does not provide length information
+                len = value.len();
+            }
+
+            output.extend_from_slice(&value[..len]);
+        }
+
+
+        output
+    }
 }
 
 pub struct EmvConnection<'a> {
@@ -607,6 +821,7 @@ pub struct EmvConnection<'a> {
     pub interface : Option<&'a dyn ApduInterface>,
     pub contactless : bool,
     emv_tags : HashMap<String, EmvTag>,
+    constants : Constants,
     pub settings : Settings,
     pub icc : Icc,
     pub pin_callback : Option<&'a dyn Fn() -> Result<String, ()>>,
@@ -620,10 +835,12 @@ impl EmvConnection<'_> {
 
         let settings : Settings = serialize_yaml!(settings_file, "config/settings.yaml");
         let emv_tags = serialize_yaml!(settings.configuration_files.emv_tags.clone(), "config/emv_tags.yaml");
+        let constants = serialize_yaml!(settings.configuration_files.constants.clone(), "config/constants.yaml");
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
             emv_tags : emv_tags,
+            constants : constants,
             settings : settings,
             icc : Icc::new(),
             interface : None,
@@ -644,7 +861,11 @@ impl EmvConnection<'_> {
         }
     }
 
-    pub fn get_tag_value(&self, tag_name : &str) -> Option<&Vec<u8>> {
+    pub fn get_emv_tag(&self, tag_name: &str) -> Option<&EmvTag> {
+        self.emv_tags.get(tag_name)
+    }
+
+    pub fn get_tag_value(&self, tag_name: &str) -> Option<&Vec<u8>> {
         self.tags.get(tag_name)
     }
 
@@ -778,6 +999,59 @@ impl EmvConnection<'_> {
                     let auc : UsageControl = v.to_vec().into();
                     value = format!("{:08b} {:08b} => {:#?}", v[0], v[1], auc);
                 },
+                Some(FieldFormat::KeyCertificate) => {
+                    value = format!("{} bit key", v.len() * 8);
+                },
+                Some(FieldFormat::ServiceCodeIso7813) => {
+                    let position_1_interchange : String = match v[0] {
+                        1 => "International".to_string(),
+                        2 => "International (prefer ICC)".to_string(),
+                        5 => "National".to_string(),
+                        6 => "National (prefer ICC)".to_string(),
+                        7 => "Private".to_string(),
+                        9 => "Test".to_string(),
+                        _ => format!("N/A {}", v[0])
+                    };
+
+                    let position_2 : u8 = v[1] >> 4;
+                    let position_2_authorization_processing : String = match position_2 {
+                        0 => "Normal".to_string(),
+                        2 => "By Issuer".to_string(),
+                        4 => "By Issuer (unless bileteral agreement exists)".to_string(),
+                        _ => format!("N/A {}", position_2)
+                    };
+
+                    let position_3 : u8 = v[1] & 0b0000_1111;
+                    let position_3_allowed_services : String = match position_3 {
+                        0 => "No restrictions (PIN required)".to_string(),
+                        1 => "No restrictions".to_string(),
+                        2 => "Goods and services only".to_string(),
+                        3 => "ATM only (PIN required)".to_string(),
+                        4 => "Cash only".to_string(),
+                        5 => "Goods and services only (PIN required)".to_string(),
+                        6 => "No restrictions (PIN prompt if PED)".to_string(),
+                        7 => "Goods and services only (PIN prompt if PED)".to_string(),
+                        _ => format!("N/A {}", position_3)
+                    };
+
+                    value = format!("{}{:02X} - {}, {}, {}", v[0], v[1], position_1_interchange, position_2_authorization_processing, position_3_allowed_services);
+                },
+                Some(FieldFormat::NumericCountryCode) => {
+                    let numeric_country_code : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..].to_string();
+                    value = format!("{} - {}", numeric_country_code, self.constants.numeric_country_codes[&numeric_country_code]);
+                },
+                Some(FieldFormat::NumericCurrencyCode) => {
+                    let numeric_currency_code : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..].to_string();
+                    value = format!("{} - {}", numeric_currency_code, self.constants.numeric_currency_codes[&numeric_currency_code]);
+                },
+                Some(FieldFormat::DataObjectList) => {
+                    let dol : DataObjectList = DataObjectList::process_data_object_list(self, &v[..]).unwrap();
+                    value = format!("{}", dol);
+                },
+                Some(FieldFormat::Track2) => {
+                    let track2 : Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
+                    value = format!("{}", track2);
+                },
                 _ => { /* NOP */ }
             }
         }
@@ -790,6 +1064,13 @@ impl EmvConnection<'_> {
                         // Going with "First 6, last 4" as it is applicable for all schemes
                         let masked_pan : String = value.chars().enumerate().map(|(i, c)| if i >= 6 && i < value.len()-4 { '*' } else { c }).collect();
                         debug!("{}-data: {}", padding, masked_pan);
+                    },
+                    Some(FieldSensitivity::Track2) => {
+                        let mut track2 : Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
+                        track2.censor();
+                        value = format!("{}", track2);
+
+                        debug!("{}-data: {}", padding, value);
                     },
                     Some(FieldSensitivity::SensitiveAuthenticationData) => {
                         debug!("{}-data: {}", padding, value.replace(|_c: char| true, "*"));
@@ -873,7 +1154,7 @@ impl EmvConnection<'_> {
 
         match self.get_tag_value("9F38") {
             Some(tag_9f38_pdol) => {
-                let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol[..]).unwrap();
+                let pdol_data = DataObjectList::process_data_object_list(self, &tag_9f38_pdol[..]).unwrap().get_tag_list_tag_values(self);
 
                 get_processing_options_command.push((pdol_data.len() + 2) as u8); // lc
                 // data
@@ -1101,17 +1382,17 @@ impl EmvConnection<'_> {
 
         let tag_9f38_pdol = self.get_tag_value("9F38");
         if tag_9f38_pdol.is_some() {
-            let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol.unwrap()[..]).unwrap();
+            let pdol_data = DataObjectList::process_data_object_list(self, &tag_9f38_pdol.unwrap()[..]).unwrap().get_tag_list_tag_values(self);
             assert!(pdol_data.len() <= 0xFF);
             checksum_data.extend_from_slice(&pdol_data);
         }
 
-        let cdol1_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
+        let cdol1_data = DataObjectList::process_data_object_list(self, &self.get_tag_value("8C").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         assert!(cdol1_data.len() <= 0xFF);
         checksum_data.extend_from_slice(&cdol1_data);
 
         if cdol_tag == "8D" {
-            let cdol2_data = self.get_tag_list_tag_values(&self.get_tag_value("8D").unwrap()[..]).unwrap();
+            let cdol2_data = DataObjectList::process_data_object_list(self, &self.get_tag_value("8D").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
             assert!(cdol2_data.len() <= 0xFF);
             checksum_data.extend_from_slice(&cdol2_data);
         }
@@ -1182,7 +1463,7 @@ impl EmvConnection<'_> {
             }
         }
 
-        let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
+        let cdol_data = DataObjectList::process_data_object_list(self, &self.get_tag_value(cdol_tag).unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         assert!(cdol_data.len() <= 0xFF);
 
 
@@ -1697,7 +1978,7 @@ impl EmvConnection<'_> {
         checksum_data.extend_from_slice(data_authentication);
 
         if let Some(tag_9f4a_static_data_authentication_tag_list) = self.get_tag_value("9F4A") {
-            let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&tag_9f4a_static_data_authentication_tag_list[..]).unwrap();
+            let static_data_authentication_tag_list_tag_values = DataObjectList::process_data_object_list(self, &tag_9f4a_static_data_authentication_tag_list[..]).unwrap().get_tag_list_tag_values(self);
             checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
         }
 
@@ -1802,7 +2083,7 @@ impl EmvConnection<'_> {
         let mut checksum_data : Vec<u8> = Vec::new();
         checksum_data.extend_from_slice(&tag_93_ssad_decrypted[1 .. tag_93_ssad_decrypted.len() - 22]);
         checksum_data.extend_from_slice(data_authentication);
-        let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&self.get_tag_value("9F4A").unwrap()[..]).unwrap();
+        let static_data_authentication_tag_list_tag_values = DataObjectList::process_data_object_list(self, &self.get_tag_value("9F4A").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
 
         let ssad_checksum_calculated = sha::sha1(&checksum_data[..]);
@@ -1858,7 +2139,7 @@ impl EmvConnection<'_> {
                 None => &ddol_default_value
             };
 
-            let ddol_data = self.get_tag_list_tag_values(&tag_9f49_ddol[..]).unwrap();
+            let ddol_data = DataObjectList::process_data_object_list(self, &tag_9f49_ddol[..]).unwrap().get_tag_list_tag_values(self);
 
             auth_data.extend_from_slice(&ddol_data[..]);
 
@@ -2132,79 +2413,6 @@ impl EmvConnection<'_> {
 
         Ok(())
     }
-
-    // EMV has some tags that don't conform to ISO/IEC 7816
-    fn is_non_conforming_one_byte_tag(&self, tag : u8) -> bool {
-        if tag == 0x95 {
-            return true;
-        }
-
-        false
-    }
-
-    fn get_tag_list_tag_values(&self, tag_list : &[u8]) -> Result<Vec<u8>, ()> {
-        // EMV Book 3, 5.4 Rules for Using a Data Object List (DOL)
-
-        let mut output : Vec<u8> = Vec::new();
-
-        if tag_list.len() < 2 {
-            let tag_name = hex::encode(&tag_list[0..1]).to_uppercase();
-            let value = match self.get_tag_value(&tag_name) {
-                Some(value) => value,
-                None => {
-                    warn!("tag {:?} has no value", tag_name);
-                    return Err(());
-                }
-            };
-
-            output.extend_from_slice(&value[..]);
-        } else {
-            let mut i = 0;
-            loop {
-                let tag_value_length : usize;
-
-                let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
-
-                if Tag::try_from(tag_name.as_str()).is_ok() || self.is_non_conforming_one_byte_tag(tag_list[i]) {
-                    tag_value_length = tag_list[i+1] as usize;
-                    i += 2;
-                } else {
-                    tag_name = hex::encode(&tag_list[i..i+2]).to_uppercase();
-                    if Tag::try_from(tag_name.as_str()).is_ok() {
-                        tag_value_length = tag_list[i+2] as usize;
-                        i += 3;
-                    } else {
-                        warn!("Incorrect tag {:?}", tag_name);
-                        return Err(());
-                    }
-                }
-
-                let default_value : Vec<u8> = vec![0; tag_value_length];
-                let value = match self.get_tag_value(&tag_name) {
-                    Some(value) => value,
-                    None => {
-                        debug!("tag {:?} has no value, filling with zeros", tag_name);
-                        
-                        &default_value
-                    }
-                };
-
-                // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
-                if value.len() != tag_value_length {
-                    warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", tag_name, value.len(), tag_value_length);
-                    return Err(());
-                }
-
-                output.extend_from_slice(&value[..]);
-
-                if i >= tag_list.len() {
-                    break;
-                }
-            }
-        }
-
-        Ok(output)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2218,6 +2426,7 @@ pub struct EmvApplication {
 pub enum FieldSensitivity {
     Public,
     SensitiveAuthenticationData,
+    Track2,
     PrimaryAccountNumber,
     PersonallyIdentifiableInformation
 }
@@ -2229,10 +2438,16 @@ pub enum FieldFormat {
     Alphanumeric,
     AlphanumericSpecial,
     TerminalVerificationResults,
-    ApplicationUsageControl
+    ApplicationUsageControl,
+    KeyCertificate,
+    ServiceCodeIso7813,
+    NumericCountryCode,
+    NumericCurrencyCode,
+    DataObjectList,
+    Track2
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EmvTag {
     pub tag: String,
     pub name: String,
@@ -2666,4 +2881,101 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_data_object_list_processing() -> Result<(), ()> {
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+
+        let cdol1 : [u8; 39] = [
+            //tag       length
+            0x9F,0x02,  0x06,
+            0x9F,0x03,  0x06,
+            0x9F,0x1A,  0x02,
+            0x95,       0x05,
+            0x5F,0x2A,  0x02,
+            0x9A,       0x03,
+            0x9C,       0x01,
+            0x9F,0x37,  0x04,
+            0x9F,0x35,  0x01,
+            0x9F,0x45,  0x02,
+            0x9F,0x4C,  0x08,
+            0x9F,0x34,  0x03,
+            0x9F,0x21,  0x03,
+            0x9F,0x7C,  0x14];
+
+        let dol1 : DataObjectList = DataObjectList::process_data_object_list(&connection, &cdol1).unwrap();
+
+
+        // Check zero padded DOL
+        let dol1_output : Vec<u8> = dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&dol1_output[..], [0; 66]);
+
+        // Fill couple of tags with information
+        connection.add_tag("9F02", ascii_to_bcd_n(format!("{}", 123456).as_bytes(), 6).unwrap());
+        connection.add_tag("9C", [0xFF].to_vec());
+
+        let tag_82_data : [u8; 2] = [0x39, 0x00];
+
+        connection.add_tag("82", tag_82_data.to_vec());
+
+        let dol1_output2 : Vec<u8> = dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&dol1_output2[..], [0, 0, 0, 18, 52, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // Curious case of static data authentication list (9F4A) which slightly differs from regular DOL by not providing tag length
+        let static_data_authentication_list : [u8; 1] = [0x82];
+        let static_dol1 : DataObjectList = DataObjectList::process_data_object_list(&connection, &static_data_authentication_list).unwrap();
+        let static_data_authentication_list_output : Vec<u8> = static_dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&static_data_authentication_list_output[..], tag_82_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_track2() -> Result<(), ()> {
+        let track2_data          = ";4321432143214321=2612101123456789123?";
+        let track2_data_censored = ";432143******4321=2612101************?";
+
+        let mut track2 : Track2 = Track2::new(track2_data);
+        assert_eq!(format!("{}", track2), track2_data);
+
+        assert_eq!(track2.primary_account_number, "4321432143214321");
+        assert_eq!(track2.expiry_year, "26");
+        assert_eq!(track2.expiry_month, "12");
+        assert_eq!(track2.service_code, "101");
+        assert_eq!(track2.discretionary_data, "123456789123");
+
+        track2.censor();
+        assert_eq!(format!("{}", track2), track2_data_censored);
+        assert_eq!(track2.primary_account_number, "432143******4321");
+        assert_eq!(track2.discretionary_data, "************");
+
+        Ok(())
+    }
+    
+    #[test]
+    fn test_track1() -> Result<(), ()> {
+        let track1_data          = "%B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?";
+        let track1_data_censored = "%B432143******4321^******/****^2609101************************?";
+
+        let mut track1 : Track1 = Track1::new(track1_data);
+        assert_eq!(format!("{}", track1), track1_data);
+
+        assert_eq!(track1.primary_account_number, "4321432143214321");
+        assert_eq!(track1.last_name, "Mc'Doe");
+        assert_eq!(track1.first_name, "JOHN");
+        assert_eq!(track1.expiry_year, "26");
+        assert_eq!(track1.expiry_month, "09");
+        assert_eq!(track1.service_code, "101");
+        assert_eq!(track1.discretionary_data, "123456789012345678901234");
+
+        track1.censor();
+        assert_eq!(format!("{}", track1), track1_data_censored);
+        assert_eq!(track1.primary_account_number, "432143******4321");
+        assert_eq!(track1.last_name, "******");
+        assert_eq!(track1.first_name, "****");
+        assert_eq!(track1.discretionary_data, "************************");
+
+        Ok(())
+    }
+    
 }

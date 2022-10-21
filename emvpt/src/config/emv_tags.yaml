@@ -7,7 +7,8 @@
 '57':
   tag: '57'
   name: 'Track 2 Equivalent Data'
-  sensitivity: 'SensitiveAuthenticationData'
+  sensitivity: 'Track2'
+  format: 'Track2'
 '61':
   tag: '61'
   name: 'Application Template'
@@ -38,6 +39,7 @@
 '90':
   tag: '90'
   name: 'Issuer Public Key Certificate'
+  format: 'KeyCertificate'
 '92':
   tag: '92'
   name: 'Issuer Public Key Remainder'
@@ -85,6 +87,7 @@
 '9F46':
   tag: '9F46'
   name: 'Integrated Circuit Card (ICC) Public Key Certificate'
+  format: 'KeyCertificate'
 '5F25':
   tag: '5F25'
   name: 'Application Effective Date'
@@ -101,6 +104,9 @@
 '5F30':
   tag: '5F30'
   name: 'Service Code'
+  format: 'ServiceCodeIso7813'
+  min: 3
+  max: 3
 '5F34':
   tag: '5F34'
   name: 'Application Primary Account Number (PAN) Sequence Number'
@@ -137,27 +143,35 @@
 '9F4A':
   tag: '9F4A'
   name: 'Static Data Authentication Tag List'
+  format: 'DataObjectList'
 '8C':
   tag: '8C'
   name: 'Card Risk Management Data Object List 1 (CDOL1)'
+  format: 'DataObjectList'
 '8D':
   tag: '8D'
   name: 'Card Risk Management Data Object List 2 (CDOL2)'
+  format: 'DataObjectList'
 '9F1D':
   tag: '9F1D'
   name: 'Terminal Risk Management Data'
 '5F28':
   tag: '5F28'
   name: 'Issuer Country Code'
+  format: 'NumericCountryCode'
+  min: 2
+  max: 2
 '9F42':
   tag: '9F42'
   name: 'Application Currency Code'
+  format: 'NumericCurrencyCode'
 '9F44':
   tag: '9F44'
   name: 'Application Currency Exponent'
 '9F49':
   tag: '9F49'
   name: 'Dynamic Data Authentication Data Object List (DDOL)'
+  format: 'DataObjectList'
 '9F08':
   tag: '9F08'
   name: 'Application Version Number'
@@ -170,9 +184,11 @@
 '9F1A':
   tag: '9F1A'
   name: 'Terminal Country Code'
+  format: 'NumericCountryCode'
 '5F2A':
   tag: '5F2A'
   name: 'Transaction Currency Code'
+  format: 'NumericCurrencyCode'
 '93':
   tag: '93'
   name: 'Signed Static Application Data'
@@ -188,6 +204,7 @@
 '9F38':
   tag: '9F38'
   name: 'Processing Options Data Object List (PDOL)'
+  format: 'DataObjectList'
 '83':
   tag: '83'
   name: 'Command Template'
@@ -251,6 +268,7 @@
 '9F2D':
   tag: '9F2D'
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate'
+  format: 'KeyCertificate'
 '9F66':
   tag: '9F66'
   name: 'Terminal Transaction Qualifiers (TTQ)'
