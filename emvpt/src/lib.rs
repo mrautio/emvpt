@@ -882,6 +882,18 @@ impl EmvConnection<'_> {
         self.tags.insert(tag_name.to_string(), value);
     }
 
+    pub fn process_tag_as_tlv(&mut self, tag_name : &str, value : Vec<u8>) {
+        let mut tlv : Vec<u8> = Vec::new();
+        tlv.extend_from_slice(&hex::decode(&tag_name).unwrap()[..]);
+        if value.len() >= 0x80 {
+            tlv.push(0x81 as u8);
+        }
+        tlv.push(value.len() as u8);
+        tlv.extend_from_slice(&value[..]);
+
+        self.process_tlv(&tlv[..], 1);
+    }
+
     fn send_apdu_select(&mut self, aid : &[u8]) -> (Vec<u8>, Vec<u8>) {
         //ref. EMV Book 1, 11.3.2 Command message
         self.tags.clear();
@@ -1177,8 +1189,8 @@ impl EmvConnection<'_> {
         }
 
         if response_data[0] == 0x80 {
-            self.add_tag("82", response_data[2..4].to_vec());
-            self.add_tag("94", response_data[4..].to_vec());
+            self.process_tag_as_tlv("82", response_data[2..4].to_vec());
+            self.process_tag_as_tlv("94", response_data[4..].to_vec());
         } else if response_data[0] != 0x77 {
             warn!("Unrecognized response");
             return Err(());
@@ -1422,7 +1434,7 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        self.add_tag("9F26", tag_9f26_application_cryptogram.to_vec());
+        self.process_tag_as_tlv("9F26", tag_9f26_application_cryptogram.to_vec());
 
         Ok(())
     }
@@ -1459,7 +1471,7 @@ impl EmvConnection<'_> {
             // GET CHALLENGE might be needed to the 9F4C value
             if let None = self.get_tag_value("9F4C") {
                 let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
-                self.add_tag("9F4C", tag_9f4c_icc_dynamic_number);
+                self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number);
             }
         }
 
@@ -1483,11 +1495,11 @@ impl EmvConnection<'_> {
         }
 
         if response_data[0] == 0x80 {
-            self.add_tag("9F27", response_data[2..3].to_vec());
-            self.add_tag("9F36", response_data[3..5].to_vec());
-            self.add_tag("9F26", response_data[5..13].to_vec());
+            self.process_tag_as_tlv("9F27", response_data[2..3].to_vec());
+            self.process_tag_as_tlv("9F36", response_data[3..5].to_vec());
+            self.process_tag_as_tlv("9F26", response_data[5..13].to_vec());
             if response_data.len() > 13 {
-                self.add_tag("9F10", response_data[13..].to_vec());
+                self.process_tag_as_tlv("9F10", response_data[13..].to_vec());
             } 
         } else if response_data[0] != 0x77 {
             warn!("Unrecognized response");
@@ -1721,37 +1733,37 @@ impl EmvConnection<'_> {
     pub fn process_settings(&mut self) -> Result<(), Box<dyn error::Error>> {
         let default_tags = self.settings.default_tags.clone();
         for (tag_name, tag_value) in default_tags.iter() {
-            self.add_tag(&tag_name, hex::decode(&tag_value.clone())?);
+            self.process_tag_as_tlv(&tag_name, hex::decode(&tag_value.clone())?);
         }
 
         let now = Utc::now().naive_utc();
         if !self.get_tag_value("9A").is_some() {
             let today = now.date();
             let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
-            self.add_tag("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+            self.process_tag_as_tlv("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F21").is_some() {
             let time = now.time();
             let transaction_time_ascii_hhmmss = format!("{:02}{:02}{:02}",time.hour(), time.minute(), time.second());
-            self.add_tag("9F21", bcdutil::ascii_to_bcd_cn(transaction_time_ascii_hhmmss.as_bytes(), 3).unwrap());
+            self.process_tag_as_tlv("9F21", bcdutil::ascii_to_bcd_cn(transaction_time_ascii_hhmmss.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F37").is_some() {
             let mut tag_9f37_unpredictable_number = [0u8; 4];
             self.fill_random(&mut tag_9f37_unpredictable_number[..]);
 
-            self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
+            self.process_tag_as_tlv("9F37", tag_9f37_unpredictable_number.to_vec());
         }
 
         if !self.get_tag_value("8A").is_some() {
             // ref. EMV Book 4, A6 Authorisation Response Code
-            self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
+            self.process_tag_as_tlv("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
         }
 
         if !self.get_tag_value("9F66").is_some() {
             let tag_9f66_ttq : Vec<u8> = self.settings.terminal.terminal_transaction_qualifiers.into();
-            self.add_tag("9F66", tag_9f66_ttq);
+            self.process_tag_as_tlv("9F66", tag_9f66_ttq);
         }
 
         Ok(())
@@ -2099,7 +2111,7 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        self.add_tag("9F45", tag_93_ssad_decrypted[3..5].to_vec());
+        self.process_tag_as_tlv("9F45", tag_93_ssad_decrypted[3..5].to_vec());
 
         Ok(())
     }
@@ -2156,7 +2168,7 @@ impl EmvConnection<'_> {
             }
 
             if response_data[0] == 0x80 {
-                self.add_tag("9F4B", response_data[3..].to_vec());
+                self.process_tag_as_tlv("9F4B", response_data[3..].to_vec());
             } else if response_data[0] != 0x77 {
                 warn!("Unrecognized response");
                 return Err(());
@@ -2166,7 +2178,7 @@ impl EmvConnection<'_> {
         let tag_9f4b_signed_data_decrypted_dynamic_data = self.validate_signed_dynamic_application_data(&auth_data[..]).unwrap();
 
         let tag_9f4c_icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[1..];
-        self.add_tag("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
+        self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
 
         Ok(())
     }
@@ -2263,11 +2275,11 @@ impl EmvConnection<'_> {
 
             if success {
                 self.settings.terminal.tvr.cardholder_verification_was_not_successful = false;
-                self.add_tag("9F34", CvmRule::into_9f34_value(Ok(rule)));
+                self.process_tag_as_tlv("9F34", CvmRule::into_9f34_value(Ok(rule)));
                 break;
             } else {
                 self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
-                self.add_tag("9F34", CvmRule::into_9f34_value(Err(rule)));
+                self.process_tag_as_tlv("9F34", CvmRule::into_9f34_value(Err(rule)));
 
                 if ! skip_if_not_supported {
                     break;
@@ -2281,7 +2293,7 @@ impl EmvConnection<'_> {
             self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
 
             // "no CVM performed"
-            self.add_tag("9F34", b"\x3F\x00\x01".to_vec());
+            self.process_tag_as_tlv("9F34", b"\x3F\x00\x01".to_vec());
         }
 
         Ok(())
@@ -2337,7 +2349,7 @@ impl EmvConnection<'_> {
 
         let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
         let tvr_len = tag_95_tvr.len();
-        self.add_tag("95", tag_95_tvr);
+        self.process_tag_as_tlv("95", tag_95_tvr);
         debug!("{:?}", self.settings.terminal.tvr);
 
         let action_zero : TerminalVerificationResults = vec![0; tvr_len].into();
@@ -2779,14 +2791,14 @@ mod tests {
 
     fn start_transaction(connection : &mut EmvConnection) -> Result<(), ()> {
         // force transaction date as 24.07.2020
-        connection.add_tag("9A", b"\x20\x07\x24".to_vec());
+        connection.process_tag_as_tlv("9A", b"\x20\x07\x24".to_vec());
 
         // force unpreditable number
-        connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
+        connection.process_tag_as_tlv("9F37", b"\x01\x23\x45\x67".to_vec());
         connection.settings.terminal.use_random = false;
 
         // force issuer authentication data
-        connection.add_tag("91", b"\x12\x34\x56\x78\x12\x34\x56\x78".to_vec());
+        connection.process_tag_as_tlv("91", b"\x12\x34\x56\x78\x12\x34\x56\x78".to_vec());
 
         Ok(())
     }
@@ -2854,7 +2866,7 @@ mod tests {
 
         connection.start_transaction(&application)?;
 
-        connection.add_tag("9F02", ascii_to_bcd_n(format!("{}", amount).as_bytes(), 6).unwrap());
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(format!("{}", amount).as_bytes(), 6).unwrap());
 
         connection.handle_card_verification_methods()?;
 
@@ -2911,12 +2923,12 @@ mod tests {
         assert_eq!(&dol1_output[..], [0; 66]);
 
         // Fill couple of tags with information
-        connection.add_tag("9F02", ascii_to_bcd_n(format!("{}", 123456).as_bytes(), 6).unwrap());
-        connection.add_tag("9C", [0xFF].to_vec());
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(format!("{}", 123456).as_bytes(), 6).unwrap());
+        connection.process_tag_as_tlv("9C", [0xFF].to_vec());
 
         let tag_82_data : [u8; 2] = [0x39, 0x00];
 
-        connection.add_tag("82", tag_82_data.to_vec());
+        connection.process_tag_as_tlv("82", tag_82_data.to_vec());
 
         let dol1_output2 : Vec<u8> = dol1.get_tag_list_tag_values(&connection);
         assert_eq!(&dol1_output2[..], [0, 0, 0, 18, 52, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
