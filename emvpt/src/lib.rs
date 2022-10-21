@@ -1084,6 +1084,15 @@ impl EmvConnection<'_> {
                 },
                 _ => { /* NOP */ }
             }
+
+            // Special rules here
+            match tag.tag.as_str() {
+                "9F27" => {
+                    let icc_cryptogram_type = CryptogramType::try_from(v[0] as u8).unwrap();
+                    value = format!("{:?}", icc_cryptogram_type);
+                },
+                _ => { /* NOP */ }
+            }
         }
 
         if self.settings.censor_sensitive_fields {
