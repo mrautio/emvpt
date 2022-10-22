@@ -684,7 +684,8 @@ pub struct Settings {
 #[derive(Serialize, Deserialize)]
 pub struct Constants {
     pub numeric_country_codes : HashMap<String, String>,
-    pub numeric_currency_codes : HashMap<String, String>
+    pub numeric_currency_codes : HashMap<String, String>,
+    pub apdu_status_codes : HashMap<String, String>
 }
 
 pub trait ApduInterface {
@@ -912,6 +913,23 @@ impl EmvConnection<'_> {
         self.send_apdu(&select_command)
     }
 
+    fn get_apdu_response_localization(&self, apdu_status : &[u8]) -> String {
+        assert_eq!(apdu_status.len(), 2);
+
+        let response_status_code = hex::encode_upper(apdu_status);
+
+        let response_localization : String;
+        if let Some(response_description) = self.constants.apdu_status_codes.get(&response_status_code) {
+            response_localization = format!("{} - {}", response_status_code, response_description);
+        } else if let Some(response_description) = self.constants.apdu_status_codes.get(&response_status_code[0..2]) {
+            response_localization = format!("{} - {}", response_status_code, response_description);
+        } else {
+            response_localization = format!("{}", response_status_code);
+        }
+
+        response_localization
+    }
+
     pub fn send_apdu<'apdu>(&mut self, apdu : &'apdu [u8]) -> (Vec<u8>, Vec<u8>) {
 
         let mut response_data : Vec<u8> = Vec::new();
@@ -930,7 +948,8 @@ impl EmvConnection<'_> {
 
             // response codes: https://www.eftlab.com/knowledge-base/complete-list-of-apdu-responses/
             response_trailer = vec![apdu_response[apdu_response.len()-2], apdu_response[apdu_response.len()-1]];
-            debug!("APDU response status: {:02X?}", response_trailer);
+            
+            debug!("APDU response status: {}", self.get_apdu_response_localization(&response_trailer[..]));
 
             // Automatically query more data, if available from the ICC
             const SW1_BYTES_AVAILABLE : u8 = 0x61;
