@@ -940,7 +940,11 @@ impl EmvConnection<'_> {
 
         loop {
             // Send an APDU command.
-            debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
+            if self.settings.censor_sensitive_fields {
+                debug!("Sending APDU: {:02X?}... ({} bytes)", &apdu_command[0..5], apdu_command.len());
+            } else {
+                debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
+            }
 
             let apdu_response = self.interface.unwrap().send_apdu(apdu_command).unwrap();
 
@@ -987,7 +991,9 @@ impl EmvConnection<'_> {
             }
         }
 
-        if ! self.settings.censor_sensitive_fields {
+        if self.settings.censor_sensitive_fields {
+            debug!("APDU response({} bytes)", response_data.len());
+        } else {
             debug!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
         }
 
@@ -1017,7 +1023,7 @@ impl EmvConnection<'_> {
         if let Some(tag) = emv_tag {
             match tag.format {
                 Some(FieldFormat::CompressedNumeric) => {
-                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "").trim_start_matches('0').to_string();
                 },
                 Some(FieldFormat::Alphanumeric) | Some(FieldFormat::AlphanumericSpecial) => {
                     value = String::from_utf8_lossy(&v).to_string();
@@ -1130,8 +1136,8 @@ impl EmvConnection<'_> {
 
                         debug!("{}-data: {}", padding, value);
                     },
-                    Some(FieldSensitivity::SensitiveAuthenticationData) => {
-                        debug!("{}-data: {}", padding, value.replace(|_c: char| true, "*"));
+                    Some(FieldSensitivity::SensitiveAuthenticationData | FieldSensitivity::Sensitive) => {
+                        debug!("{}-data: censored {} bytes", padding, v.len());
                     },
                     Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
                         // allowing punctuation is primarily to see cardholder name which is separated by '/'
@@ -1273,13 +1279,21 @@ impl EmvConnection<'_> {
                             data_authentication.extend_from_slice(&data[..]);
                         }
                         
-                        trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication);
+                        if self.settings.censor_sensitive_fields {
+                            trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{} bytes", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication.len());
+                        } else {
+                            trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication);
+                        }
                     }
                 }
             }
         }
 
-        debug!("AFL data authentication:\n{}", HexViewBuilder::new(&data_authentication).finish());
+        if self.settings.censor_sensitive_fields {
+            debug!("AFL data authentication: {} bytes", data_authentication.len());
+        } else {
+            debug!("AFL data authentication:\n{}", HexViewBuilder::new(&data_authentication).finish());
+        }
 
         let tag_82_aip = self.get_tag_value("82").unwrap();
 
@@ -1864,7 +1878,7 @@ impl EmvConnection<'_> {
         }
 
         let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application)?;
-        self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..]));
+        self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..], self.settings.censor_sensitive_fields));
 
         let data_authentication = &self.icc.data_authentication.as_ref().unwrap()[..];
 
@@ -1875,7 +1889,7 @@ impl EmvConnection<'_> {
             let (icc_pk_modulus, icc_pk_exponent) = self.get_icc_public_key(
                 tag_9f46_icc_pk_certificate.unwrap(), tag_9f47_icc_pk_exponent.unwrap(), tag_9f48_icc_pk_remainder,
                 data_authentication)?;
-            self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..]));
+            self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..], self.settings.censor_sensitive_fields));
             self.icc.icc_pin_pk = self.icc.icc_pk.clone();
         }
 
@@ -1889,7 +1903,7 @@ impl EmvConnection<'_> {
                 tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
                 data_authentication)?;
 
-            self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]));
+            self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..], self.settings.censor_sensitive_fields));
         }
 
         Ok(())
@@ -2007,7 +2021,14 @@ impl EmvConnection<'_> {
         let icc_certificate_pk_exp_length = &icc_certificate[20..21];
         let icc_certificate_pk_leftmost_digits = &icc_certificate[21..checksum_position];
 
-        debug!("ICC PAN:{:02X?}", icc_certificate_pan);
+
+        if self.settings.censor_sensitive_fields {
+            let pan : String = String::from_utf8_lossy(&bcdutil::bcd_to_ascii(&icc_certificate_pan).unwrap()).to_string();
+            let masked_pan: String = pan.chars().enumerate().map(|(i, c)| if i >= 6 && i < pan.len()-4 { '*' } else { c }).collect();
+            debug!("ICC PAN:{}", masked_pan);
+        } else {
+            debug!("ICC PAN:{:02X?}", icc_certificate_pan);
+        }
         debug!("ICC expiry:{:02X?}", icc_certificate_expiry);
         debug!("ICC serial:{:02X?}", icc_certificate_serial);
         debug!("ICC hash algo:{:02X?}", icc_certificate_hash_algo);
@@ -2042,7 +2063,9 @@ impl EmvConnection<'_> {
 
         let icc_certificate_checksum = &icc_certificate[checksum_position .. checksum_position + 20];
 
-        trace!("Checksum data: {:02X?}", &checksum_data[..]);
+        if !self.settings.censor_sensitive_fields {
+            trace!("Checksum data: {:02X?}", &checksum_data[..]);
+        }
         trace!("Calculated checksum: {:02X?}", cert_checksum);
         trace!("Stored ICC checksum: {:02X?}", icc_certificate_checksum);
         assert_eq!(cert_checksum, icc_certificate_checksum);
@@ -2482,6 +2505,7 @@ pub struct EmvApplication {
 pub enum FieldSensitivity {
     Public,
     SensitiveAuthenticationData,
+    Sensitive,
     Track2,
     PrimaryAccountNumber,
     PersonallyIdentifiableInformation
@@ -2541,12 +2565,13 @@ impl EmvTag {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RsaPublicKey {
     pub modulus: String,
-    pub exponent: String
+    pub exponent: String,
+    sensitive: Option<bool>
 }
 
 impl RsaPublicKey {
-    pub fn new(modulus : &[u8], exponent : &[u8]) -> RsaPublicKey {
-        RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent) }
+    pub fn new(modulus : &[u8], exponent : &[u8], sensitive : bool) -> RsaPublicKey {
+        RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent), sensitive: Some(sensitive) }
     }
 
     pub fn get_key_byte_size(&self) -> usize {
@@ -2573,7 +2598,11 @@ impl RsaPublicKey {
         let mut data = Vec::new();
         data.extend_from_slice(&encrypt_output[..length]);
 
-        trace!("Encrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        if let Some(true) = self.sensitive {
+            trace!("Encrypt result ({} bytes)", data.len());
+        } else {
+            trace!("Encrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        }
 
         if data.len() != pk_modulus_raw.len() {
             warn!("Data length discrepancy");
@@ -2603,7 +2632,11 @@ impl RsaPublicKey {
         let mut data = Vec::new();
         data.extend_from_slice(&decrypt_output[..length]);
 
-        trace!("Decrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        if let Some(true) = self.sensitive {
+            trace!("Decrypt result ({} bytes)", data.len());
+        } else {
+            trace!("Decrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        }
 
         if data.len() != pk_modulus_raw.len() {
             warn!("Data length discrepancy");
@@ -2826,7 +2859,7 @@ mod tests {
         let public_key_exponent = &rsa.e().to_vec()[..];
         let private_key_exponent = &rsa.d().to_vec()[..];
 
-        let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent);
+        let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent, false);
         debug!("modulus: {:02X?}, exponent: {:02X?}, private_exponent: {:02X?}", public_key_modulus, public_key_exponent, private_key_exponent);
 
         let mut encrypt_output = [0u8; KEY_BYTE_SIZE];

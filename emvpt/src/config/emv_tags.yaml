@@ -147,6 +147,7 @@
   name: 'Integrated Circuit Card (ICC) Public Key Certificate'
   format: 'KeyCertificate'
   source: 'Icc'
+  sensitivity: 'Sensitive'
 '5F25':
   tag: '5F25'
   name: 'Application Effective Date'
@@ -462,6 +463,7 @@
   name: 'Integrated Circuit Card (ICC) PIN Encipherment Public Key Certificate'
   format: 'KeyCertificate'
   source: 'Icc'
+  sensitivity: 'Sensitive'
 '9F66':
   tag: '9F66'
   name: 'Terminal Transaction Qualifiers (TTQ)'
