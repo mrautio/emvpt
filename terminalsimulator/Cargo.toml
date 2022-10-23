@@ -14,3 +14,4 @@ clap = { version = "4.0.11", features = ["derive"] }
 pcsc = "2.7.0"
 regex = "1.6.0"
 hex = "0.4.3"
+rpassword = "7.1.0"

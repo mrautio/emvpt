@@ -145,14 +145,11 @@ fn pin_entry() -> Result<String, ()> {
     }
 
 
-    let mut stdin_buffer = String::new();
     if user_interactive {
         println!("Enter PIN:");
         print!("> ");
 
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
-
-        return Ok(stdin_buffer.trim().to_string());
+        return Ok(rpassword::read_password().unwrap().trim().to_string());
     }
 
     Ok("".to_string())
