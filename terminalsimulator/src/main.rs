@@ -7,6 +7,7 @@ use std::io::{self};
 use std::{thread, time};
 use std::str;
 use std::path::PathBuf;
+use hex;
 
 use emvpt::*;
 
@@ -144,14 +145,11 @@ fn pin_entry() -> Result<String, ()> {
     }
 
 
-    let mut stdin_buffer = String::new();
     if user_interactive {
         println!("Enter PIN:");
         print!("> ");
 
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
-
-        return Ok(stdin_buffer.trim().to_string());
+        return Ok(rpassword::read_password().unwrap().trim().to_string());
     }
 
     Ok("".to_string())
@@ -188,6 +186,10 @@ struct Args {
     #[arg(long="censor-sensitive-fields", default_value_t = false)]
     censor_sensitive_fields: bool,
 
+    /// Exit after connecting the card 
+    #[arg(long="stop-after-connect", default_value_t = false)]
+    stop_after_connect: bool,
+
     /// Stop processing transaction after card data has been read
     #[arg(long="stop-after-read", default_value_t = false)]
     stop_after_read: bool,
@@ -198,7 +200,11 @@ struct Args {
 
     /// Card PIN code to be used when PIN code is required
     #[arg(short, long, value_name="settings file", default_value = "config/settings.yaml")]
-    settings: PathBuf
+    settings: PathBuf,
+
+    /// Print TLV data in human readable form
+    #[arg(long, value_name="TLV")]
+    print_tlv: Option<String>
 }
 
 fn run() -> Result<Option<String>, String> {
@@ -212,8 +218,10 @@ fn run() -> Result<Option<String>, String> {
     }
     let user_interactive = unsafe { INTERACTIVE };
     let censor_sensitive_fields = args.censor_sensitive_fields;
+    let stop_after_connect = args.stop_after_connect;
     let stop_after_read = args.stop_after_read;
     let print_tags = args.print_tags;
+    let print_tlv = args.print_tlv;
 
     let mut connection = EmvConnection::new(&args.settings.as_path().to_str().unwrap()).unwrap();
 
@@ -221,6 +229,13 @@ fn run() -> Result<Option<String>, String> {
     connection.pse_application_select_callback = Some(&pse_application_select);
     connection.pin_callback = Some(&pin_entry);
     connection.amount_callback = Some(&amount_entry);
+
+    if print_tlv.is_some() {
+        let tlv_hex_data = print_tlv.unwrap().replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+        info!("input TLV: {}", tlv_hex_data);
+        connection.process_tlv(&hex::decode(&tlv_hex_data).unwrap()[..], 0);
+        return Ok(None);
+    }
 
     let purchase_amount = connection.amount_callback.unwrap()().unwrap();
 
@@ -251,6 +266,10 @@ fn run() -> Result<Option<String>, String> {
             },
             _ => return Err("Could not connect to the reader".to_string())
         }
+    }
+
+    if stop_after_connect {
+        return Ok(None);
     }
 
     connection.contactless = smart_card_connection.contactless;

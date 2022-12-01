@@ -4,6 +4,7 @@ configuration_files:
   # If path is not found, default settings (test CAs) will be used
   emv_tags: 'emv_tags.yaml'
   scheme_ca_public_keys: 'scheme_ca_public_keys_test.yaml'
+  constants: 'constants.yaml'
 terminal:
   use_random: true
   capabilities:

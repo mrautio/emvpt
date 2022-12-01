@@ -5,6 +5,7 @@ use std::str;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::error;
+use std::fmt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self};
 use log::{info, warn, debug, trace};
@@ -16,6 +17,7 @@ use openssl::bn::BigNum;
 use openssl::sha;
 use hex;
 use chrono::{NaiveDate, Timelike, Datelike, Utc};
+use regex::Regex;
 
 pub mod bcdutil;
 
@@ -31,6 +33,86 @@ macro_rules! serialize_yaml {
     ($file:expr, $static_resource:expr) => { serde_yaml::from_str(&fs::read_to_string($file).unwrap_or(String::from_utf8_lossy(include_bytes!($static_resource)).to_string())).unwrap() }
 }
 
+
+#[derive(Debug, Clone)]
+pub struct Track1 {
+    pub primary_account_number : String,
+    pub last_name : String,
+    pub first_name : String,
+    pub expiry_year : String,
+    pub expiry_month : String,
+    pub service_code : String,
+    pub discretionary_data : String
+}
+
+impl Track1 {
+    pub fn new(track_data : &str) -> Track1 {
+        // %B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?
+        println!("Track: {}", track_data);
+        let re = Regex::new(r"^(%B)?(\d+)\^(.+)?/(.+)?\^(\d{2})(\d{2})(\d{3})(\d+)\??$").unwrap();
+        let cap = re.captures(track_data).unwrap();
+
+        Track1 {
+            primary_account_number: cap.get(2).unwrap().as_str().to_string(),
+            last_name: cap.get(3).unwrap().as_str().to_string(),
+            first_name: cap.get(4).unwrap().as_str().to_string(),
+            expiry_year: cap.get(5).unwrap().as_str().to_string(),
+            expiry_month: cap.get(6).unwrap().as_str().to_string(),
+            service_code: cap.get(7).unwrap().as_str().to_string(),
+            discretionary_data: cap.get(8).unwrap().as_str().to_string()
+        }
+    }
+
+    pub fn censor(&mut self) {
+        self.primary_account_number = self.primary_account_number.chars().enumerate().map(|(i, c)| if i >= 6 && i < self.primary_account_number.len()-4 { '*' } else { c }).collect();
+        self.last_name = self.last_name.replace(|_c: char| true, "*");
+        self.first_name = self.first_name.replace(|_c: char| true, "*");
+        self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
+    }
+}
+
+impl fmt::Display for Track1 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "%B{}^{}/{}^{}{}{}{}?", self.primary_account_number, self.last_name, self.first_name, self.expiry_year, self.expiry_month, self.service_code, self.discretionary_data)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Track2 {
+    pub primary_account_number : String,
+    pub expiry_year : String,
+    pub expiry_month : String,
+    pub service_code : String,
+    pub discretionary_data : String
+}
+
+impl Track2 {
+    pub fn new(track_data : &str) -> Track2 {
+        // ;4321432143214321=2612101123456789123?
+        println!("Track: {}", track_data);
+        let re = Regex::new(r"^;?(\d+)=(\d{2})(\d{2})(\d{3})(\d+)\??$").unwrap();
+        let cap = re.captures(track_data).unwrap();
+
+        Track2 {
+            primary_account_number: cap.get(1).unwrap().as_str().to_string(),
+            expiry_year: cap.get(2).unwrap().as_str().to_string(),
+            expiry_month: cap.get(3).unwrap().as_str().to_string(),
+            service_code: cap.get(4).unwrap().as_str().to_string(),
+            discretionary_data: cap.get(5).unwrap().as_str().to_string()
+        }
+    }
+
+    pub fn censor(&mut self) {
+        self.primary_account_number = self.primary_account_number.chars().enumerate().map(|(i, c)| if i >= 6 && i < self.primary_account_number.len()-4 { '*' } else { c }).collect();
+        self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
+    }
+}
+
+impl fmt::Display for Track2 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, ";{}={}{}{}{}?", self.primary_account_number, self.expiry_year, self.expiry_month, self.service_code, self.discretionary_data)
+    }
+}   
 
 #[repr(u8)]
 #[derive(Deserialize, Serialize, Debug, Copy, Clone)]
@@ -233,6 +315,27 @@ pub struct UsageControl {
     pub domestic_cashback : bool,
     pub international_cashback : bool
 }
+
+impl From<Vec<u8>> for UsageControl {
+    fn from(data: Vec<u8>) -> Self {
+        let b1 : u8 = data[0];
+        let b2 : u8 = data[1];
+
+        UsageControl {
+            domestic_cash_transactions: get_bit!(b1, 7),
+            international_cash_transactions: get_bit!(b1, 6),
+            domestic_goods: get_bit!(b1, 5),
+            international_goods: get_bit!(b1, 4),
+            domestic_services: get_bit!(b1, 3),
+            international_services: get_bit!(b1, 2),
+            atms: get_bit!(b1, 1),
+            terminals_other_than_atms: get_bit!(b1, 0),
+            domestic_cashback: get_bit!(b2, 7),
+            international_cashback: get_bit!(b2, 6)
+        }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct Icc {
@@ -566,7 +669,8 @@ impl From<TransactionStatusInformation> for Vec<u8> {
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationFiles {
     emv_tags : String,
-    scheme_ca_public_keys : String
+    scheme_ca_public_keys : String,
+    constants : String
 }
 
 #[derive(Serialize, Deserialize)]
@@ -577,8 +681,140 @@ pub struct Settings {
     default_tags : HashMap<String, String>
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Constants {
+    pub numeric_country_codes : HashMap<String, String>,
+    pub numeric_currency_codes : HashMap<String, String>,
+    pub apdu_status_codes : HashMap<String, String>
+}
+
 pub trait ApduInterface {
     fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()>;
+}
+
+pub struct DataObject {
+    pub emv_tag : EmvTag,
+    pub length : usize
+}
+
+impl DataObject {
+    pub fn new(emv_connection : &EmvConnection, tag_name : &str, length : usize) -> DataObject {
+        DataObject {
+            emv_tag: emv_connection.get_emv_tag(tag_name)
+                .unwrap_or(&EmvTag::new(tag_name)).clone(),
+            length: length
+        }
+    }
+}
+
+pub struct DataObjectList {
+    data_objects : Vec<DataObject>
+}
+
+impl fmt::Display for DataObjectList {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for data_object in &self.data_objects {
+            if let Err(e) = write!(f, "{} - {} ({}b); ", data_object.emv_tag.tag, data_object.emv_tag.name, data_object.length) {
+                return Err(e)
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// EMV Book 3, 5.4 Rules for Using a Data Object List (DOL)
+impl DataObjectList {
+    // EMV has some tags that don't conform to ISO/IEC 7816
+    fn is_non_conforming_one_byte_tag(tag : u8) -> bool {
+        if tag == 0x95 {
+            return true;
+        }
+
+        false
+    }
+
+    fn new() -> DataObjectList {
+        DataObjectList {
+            data_objects: Vec::new()
+        }
+    }
+
+    fn push(&mut self, data_object : DataObject) {
+        self.data_objects.push(data_object);
+    }
+
+    pub fn process_data_object_list(emv_connection : &EmvConnection, tag_list : &[u8]) -> Result<DataObjectList, ()> {
+        let mut dol : DataObjectList = DataObjectList::new();
+
+        // FIXME: This parsing is complete BS
+        // - Check if "Tag List" and "Data Object List" are same or different types
+        // - Parse TLV tags appropriately...
+        if tag_list.len() < 2 {
+            let tag_name = hex::encode(&tag_list[0..1]).to_uppercase();
+            dol.push(DataObject::new(emv_connection, &tag_name, 0));
+        } else {
+            let mut i = 0;
+            loop {
+                let tag_value_length : usize;
+
+                let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
+
+                if Tag::try_from(tag_name.as_str()).is_ok() || DataObjectList::is_non_conforming_one_byte_tag(tag_list[i]) {
+                    tag_value_length = tag_list[i+1] as usize;
+                    i += 2;
+                } else {
+                    tag_name = hex::encode(&tag_list[i..i+2]).to_uppercase();
+                    if Tag::try_from(tag_name.as_str()).is_ok() {
+                        tag_value_length = tag_list[i+2] as usize;
+                        i += 3;
+                    } else {
+                        warn!("Incorrect tag {:?}", tag_name);
+                        return Err(());
+                    }
+                }
+
+                dol.push(DataObject::new(emv_connection, &tag_name, tag_value_length));
+                
+                if i >= tag_list.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(dol)
+    }
+
+    pub fn get_tag_list_tag_values(&self, emv_connection : &EmvConnection) -> Vec<u8> {
+        let mut output : Vec<u8> = Vec::new();
+        for data_object in &self.data_objects {
+            let default_value : Vec<u8> = vec![0; data_object.length];
+            let value = match emv_connection.get_tag_value(&data_object.emv_tag.tag) {
+                Some(value) => value,
+                None => {
+                    debug!("tag {:?} has no value, filling with zeros", data_object.emv_tag.tag);
+                    
+                    &default_value
+                }
+            };
+
+            // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
+            if data_object.length > 0 && value.len() != data_object.length {
+                warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", data_object.emv_tag.tag, value.len(), data_object.length);
+                //return Err(());
+            }
+
+            let mut len = data_object.length;
+            if len == 0 { // at least 9F4A does not provide length information
+                len = value.len();
+            }
+
+            output.extend_from_slice(&value[..len]);
+        }
+
+
+        output
+    }
 }
 
 pub struct EmvConnection<'a> {
@@ -586,6 +822,7 @@ pub struct EmvConnection<'a> {
     pub interface : Option<&'a dyn ApduInterface>,
     pub contactless : bool,
     emv_tags : HashMap<String, EmvTag>,
+    constants : Constants,
     pub settings : Settings,
     pub icc : Icc,
     pub pin_callback : Option<&'a dyn Fn() -> Result<String, ()>>,
@@ -599,10 +836,12 @@ impl EmvConnection<'_> {
 
         let settings : Settings = serialize_yaml!(settings_file, "config/settings.yaml");
         let emv_tags = serialize_yaml!(settings.configuration_files.emv_tags.clone(), "config/emv_tags.yaml");
+        let constants = serialize_yaml!(settings.configuration_files.constants.clone(), "config/constants.yaml");
 
         Ok ( EmvConnection {
             tags : HashMap::new(),
             emv_tags : emv_tags,
+            constants : constants,
             settings : settings,
             icc : Icc::new(),
             interface : None,
@@ -618,12 +857,16 @@ impl EmvConnection<'_> {
         for (key, value) in &self.tags {
             i += 1;
             let emv_tag = self.emv_tags.get(key);
-            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag { tag: key.clone(), name: "Unknown tag".to_string(), sensitivity: None }).name);
+            info!("{:02}. tag: {} - {}", i, key, emv_tag.unwrap_or(&EmvTag::new(&key.clone())).name);
             self.print_tag_value(&emv_tag, value, 0);
         }
     }
 
-    pub fn get_tag_value(&self, tag_name : &str) -> Option<&Vec<u8>> {
+    pub fn get_emv_tag(&self, tag_name: &str) -> Option<&EmvTag> {
+        self.emv_tags.get(tag_name)
+    }
+
+    pub fn get_tag_value(&self, tag_name: &str) -> Option<&Vec<u8>> {
         self.tags.get(tag_name)
     }
 
@@ -638,6 +881,18 @@ impl EmvConnection<'_> {
         }
 
         self.tags.insert(tag_name.to_string(), value);
+    }
+
+    pub fn process_tag_as_tlv(&mut self, tag_name : &str, value : Vec<u8>) {
+        let mut tlv : Vec<u8> = Vec::new();
+        tlv.extend_from_slice(&hex::decode(&tag_name).unwrap()[..]);
+        if value.len() >= 0x80 {
+            tlv.push(0x81 as u8);
+        }
+        tlv.push(value.len() as u8);
+        tlv.extend_from_slice(&value[..]);
+
+        self.process_tlv(&tlv[..], 1);
     }
 
     fn send_apdu_select(&mut self, aid : &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -658,6 +913,23 @@ impl EmvConnection<'_> {
         self.send_apdu(&select_command)
     }
 
+    fn get_apdu_response_localization(&self, apdu_status : &[u8]) -> String {
+        assert_eq!(apdu_status.len(), 2);
+
+        let response_status_code = hex::encode_upper(apdu_status);
+
+        let response_localization : String;
+        if let Some(response_description) = self.constants.apdu_status_codes.get(&response_status_code) {
+            response_localization = format!("{} - {}", response_status_code, response_description);
+        } else if let Some(response_description) = self.constants.apdu_status_codes.get(&response_status_code[0..2]) {
+            response_localization = format!("{} - {}", response_status_code, response_description);
+        } else {
+            response_localization = format!("{}", response_status_code);
+        }
+
+        response_localization
+    }
+
     pub fn send_apdu<'apdu>(&mut self, apdu : &'apdu [u8]) -> (Vec<u8>, Vec<u8>) {
 
         let mut response_data : Vec<u8> = Vec::new();
@@ -668,7 +940,11 @@ impl EmvConnection<'_> {
 
         loop {
             // Send an APDU command.
-            debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
+            if self.settings.censor_sensitive_fields {
+                debug!("Sending APDU: {:02X?}... ({} bytes)", &apdu_command[0..5], apdu_command.len());
+            } else {
+                debug!("Sending APDU:\n{}", HexViewBuilder::new(&apdu_command).finish());
+            }
 
             let apdu_response = self.interface.unwrap().send_apdu(apdu_command).unwrap();
 
@@ -676,7 +952,8 @@ impl EmvConnection<'_> {
 
             // response codes: https://www.eftlab.com/knowledge-base/complete-list-of-apdu-responses/
             response_trailer = vec![apdu_response[apdu_response.len()-2], apdu_response[apdu_response.len()-1]];
-            debug!("APDU response status: {:02X?}", response_trailer);
+            
+            debug!("APDU response status: {}", self.get_apdu_response_localization(&response_trailer[..]));
 
             // Automatically query more data, if available from the ICC
             const SW1_BYTES_AVAILABLE : u8 = 0x61;
@@ -714,7 +991,9 @@ impl EmvConnection<'_> {
             }
         }
 
-        if ! self.settings.censor_sensitive_fields {
+        if self.settings.censor_sensitive_fields {
+            debug!("APDU response({} bytes)", response_data.len());
+        } else {
             debug!("APDU response({} bytes):\n{}", response_data.len(), HexViewBuilder::new(&response_data).finish());
         }
 
@@ -740,36 +1019,139 @@ impl EmvConnection<'_> {
             padding.push(' ');
         }
 
-        if self.settings.censor_sensitive_fields {
-            match emv_tag {
-                Some(tag) => {
-                    match tag.sensitivity {
-                        Some(FieldSensitivity::PrimaryAccountNumber) => {
-                            // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
-                            // Going with "First 6, last 4" as it is applicable for all schemes
-                            let mut pan : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
-                            pan = pan.chars().enumerate().map(|(i, c)| if i >= 6 && i < pan.len()-4 { '*' } else { c }).collect();
-                            debug!("{}-data: {}", padding, pan);
-                        },
-                        Some(FieldSensitivity::SensitiveAuthenticationData) => {
-                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|_c: char| true, "*"));
-                        },
-                        Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
-                            // allowing punctuation is primarily to see cardholder name which is separated by '/'
-                            debug!("{}-data: {}", padding, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()), "*"));
-                        },
-                        _ => {
-                            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
-                        }
-                    }
-                    
+        let mut value : String = String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), ".");
+        if let Some(tag) = emv_tag {
+            match tag.format {
+                Some(FieldFormat::CompressedNumeric) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "").trim_start_matches('0').to_string();
                 },
-                _ => {
-                    debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
-                }
+                Some(FieldFormat::Alphanumeric) | Some(FieldFormat::AlphanumericSpecial) => {
+                    value = String::from_utf8_lossy(&v).to_string();
+                },
+                Some(FieldFormat::TerminalVerificationResults) => {
+                    let tvr : TerminalVerificationResults = v.to_vec().into();
+                    value = format!("{:08b} {:08b} {:08b} {:08b} {:08b} => {:#?}", v[0], v[1], v[2], v[3], v[4], tvr);
+                },
+                Some(FieldFormat::ApplicationUsageControl) => {
+                    let auc : UsageControl = v.to_vec().into();
+                    value = format!("{:08b} {:08b} => {:#?}", v[0], v[1], auc);
+                },
+                Some(FieldFormat::KeyCertificate) => {
+                    value = format!("{} bit key", v.len() * 8);
+                },
+                Some(FieldFormat::ServiceCodeIso7813) => {
+                    let position_1_interchange : String = match v[0] {
+                        1 => "International".to_string(),
+                        2 => "International (prefer ICC)".to_string(),
+                        5 => "National".to_string(),
+                        6 => "National (prefer ICC)".to_string(),
+                        7 => "Private".to_string(),
+                        9 => "Test".to_string(),
+                        _ => format!("N/A {}", v[0])
+                    };
+
+                    let position_2 : u8 = v[1] >> 4;
+                    let position_2_authorization_processing : String = match position_2 {
+                        0 => "Normal".to_string(),
+                        2 => "By Issuer".to_string(),
+                        4 => "By Issuer (unless bileteral agreement exists)".to_string(),
+                        _ => format!("N/A {}", position_2)
+                    };
+
+                    let position_3 : u8 = v[1] & 0b0000_1111;
+                    let position_3_allowed_services : String = match position_3 {
+                        0 => "No restrictions (PIN required)".to_string(),
+                        1 => "No restrictions".to_string(),
+                        2 => "Goods and services only".to_string(),
+                        3 => "ATM only (PIN required)".to_string(),
+                        4 => "Cash only".to_string(),
+                        5 => "Goods and services only (PIN required)".to_string(),
+                        6 => "No restrictions (PIN prompt if PED)".to_string(),
+                        7 => "Goods and services only (PIN prompt if PED)".to_string(),
+                        _ => format!("N/A {}", position_3)
+                    };
+
+                    value = format!("{}{:02X} - {}, {}, {}", v[0], v[1], position_1_interchange, position_2_authorization_processing, position_3_allowed_services);
+                },
+                Some(FieldFormat::NumericCountryCode) => {
+                    let numeric_country_code : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..].to_string();
+                    value = format!("{} - {}", numeric_country_code, self.constants.numeric_country_codes[&numeric_country_code]);
+                },
+                Some(FieldFormat::NumericCurrencyCode) => {
+                    let numeric_currency_code : String = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..].to_string();
+                    value = format!("{} - {}", numeric_currency_code, self.constants.numeric_currency_codes[&numeric_currency_code]);
+                },
+                Some(FieldFormat::DataObjectList) => {
+                    let dol : DataObjectList = DataObjectList::process_data_object_list(self, &v[..]).unwrap();
+                    value = format!("{}", dol);
+                },
+                Some(FieldFormat::Track2) => {
+                    let track2 : Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
+                    value = format!("{}", track2);
+                },
+                Some(FieldFormat::Date) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                    let yy = &value[0..2];
+                    let mm = &value[2..4];
+                    let dd = &value[4..6];
+
+                    // FIXME: date format does not take into consideration pre 2000s dates
+                    value = format!("20{}-{}-{}", yy, mm, dd);
+
+                },
+                Some(FieldFormat::Time) => {
+                    value = format!("{:02X?}", v).replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+                    let hh = &value[0..2];
+                    let mm = &value[2..4];
+                    let ss = &value[4..6];
+
+                    value = format!("{}:{}:{}", hh, mm, ss);
+                },
+                _ => { /* NOP */ }
             }
+
+            // Special rules here
+            match tag.tag.as_str() {
+                "9F27" => {
+                    let icc_cryptogram_type = CryptogramType::try_from(v[0] as u8).unwrap();
+                    value = format!("{:?}", icc_cryptogram_type);
+                },
+                _ => { /* NOP */ }
+            }
+        }
+
+        if self.settings.censor_sensitive_fields {
+            if let Some(tag) = emv_tag {
+                match tag.sensitivity {
+                    Some(FieldSensitivity::PrimaryAccountNumber) => {
+                        // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
+                        // Going with "First 6, last 4" as it is applicable for all schemes
+                        let masked_pan : String = value.chars().enumerate().map(|(i, c)| if i >= 6 && i < value.len()-4 { '*' } else { c }).collect();
+                        debug!("{}-data: {}", padding, masked_pan);
+                    },
+                    Some(FieldSensitivity::Track2) => {
+                        let mut track2 : Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
+                        track2.censor();
+                        value = format!("{}", track2);
+
+                        debug!("{}-data: {}", padding, value);
+                    },
+                    Some(FieldSensitivity::SensitiveAuthenticationData | FieldSensitivity::Sensitive) => {
+                        debug!("{}-data: censored {} bytes", padding, v.len());
+                    },
+                    Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
+                        // allowing punctuation is primarily to see cardholder name which is separated by '/'
+                        debug!("{}-data: {}", padding, value.replace(|c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()), "*"));
+                    },
+                    _ => {
+                        debug!("{}-data: {:02X?} = {}", padding, v, value);
+                    }
+                }
+            } else {
+                debug!("{}-data: {:02X?} = {}", padding, v, value);
+            }                    
         } else {
-            debug!("{}-data: {:02X?} = {}", padding, v, String::from_utf8_lossy(&v).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_punctuation()), "."));
+            debug!("{}-data: {:02X?} = {}", padding, v, value);
         }
     }
 
@@ -788,11 +1170,9 @@ impl EmvConnection<'_> {
 
                     break;
                 }
-
             };
 
             read_buffer = leftover_buffer;
-
 
             let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
 
@@ -802,7 +1182,7 @@ impl EmvConnection<'_> {
                     Some(emv_tag)
                 },
                 _ => {
-                    let unknown_tag = EmvTag { tag: tag_name.clone(), name: "Unknown tag".to_string(), sensitivity: None };
+                    let unknown_tag = EmvTag::new(&tag_name.clone());
                     self.print_tag(&unknown_tag, level);
                     None
                 }
@@ -836,7 +1216,7 @@ impl EmvConnection<'_> {
 
         match self.get_tag_value("9F38") {
             Some(tag_9f38_pdol) => {
-                let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol[..]).unwrap();
+                let pdol_data = DataObjectList::process_data_object_list(self, &tag_9f38_pdol[..]).unwrap().get_tag_list_tag_values(self);
 
                 get_processing_options_command.push((pdol_data.len() + 2) as u8); // lc
                 // data
@@ -859,8 +1239,8 @@ impl EmvConnection<'_> {
         }
 
         if response_data[0] == 0x80 {
-            self.add_tag("82", response_data[2..4].to_vec());
-            self.add_tag("94", response_data[4..].to_vec());
+            self.process_tag_as_tlv("82", response_data[2..4].to_vec());
+            self.process_tag_as_tlv("94", response_data[4..].to_vec());
         } else if response_data[0] != 0x77 {
             warn!("Unrecognized response");
             return Err(());
@@ -899,13 +1279,21 @@ impl EmvConnection<'_> {
                             data_authentication.extend_from_slice(&data[..]);
                         }
                         
-                        trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication);
+                        if self.settings.censor_sensitive_fields {
+                            trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{} bytes", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication.len());
+                        } else {
+                            trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, record_index_end, data_authentication);
+                        }
                     }
                 }
             }
         }
 
-        debug!("AFL data authentication:\n{}", HexViewBuilder::new(&data_authentication).finish());
+        if self.settings.censor_sensitive_fields {
+            debug!("AFL data authentication: {} bytes", data_authentication.len());
+        } else {
+            debug!("AFL data authentication:\n{}", HexViewBuilder::new(&data_authentication).finish());
+        }
 
         let tag_82_aip = self.get_tag_value("82").unwrap();
 
@@ -946,18 +1334,7 @@ impl EmvConnection<'_> {
         self.icc.capabilities.cda = get_bit!(auc_b1, 0);
 
         if let Some(tag_9f07_application_usage_control) = self.get_tag_value("9F07") {
-            let auc_b1 : u8 = tag_9f07_application_usage_control[0];
-            let auc_b2 : u8 = tag_9f07_application_usage_control[1];
-            self.icc.usage.domestic_cash_transactions = get_bit!(auc_b1, 7);
-            self.icc.usage.international_cash_transactions = get_bit!(auc_b1, 6);
-            self.icc.usage.domestic_goods = get_bit!(auc_b1, 5);
-            self.icc.usage.international_goods = get_bit!(auc_b1, 4);
-            self.icc.usage.domestic_services = get_bit!(auc_b1, 3);
-            self.icc.usage.international_services = get_bit!(auc_b1, 2);
-            self.icc.usage.atms = get_bit!(auc_b1, 1);
-            self.icc.usage.terminals_other_than_atms = get_bit!(auc_b1, 0);
-            self.icc.usage.domestic_cashback = get_bit!(auc_b2, 7);
-            self.icc.usage.international_cashback = get_bit!(auc_b2, 6);
+            self.icc.usage = tag_9f07_application_usage_control.to_vec().into();
         }
 
         debug!("{:?}", self.icc);
@@ -1075,17 +1452,17 @@ impl EmvConnection<'_> {
 
         let tag_9f38_pdol = self.get_tag_value("9F38");
         if tag_9f38_pdol.is_some() {
-            let pdol_data = self.get_tag_list_tag_values(&tag_9f38_pdol.unwrap()[..]).unwrap();
+            let pdol_data = DataObjectList::process_data_object_list(self, &tag_9f38_pdol.unwrap()[..]).unwrap().get_tag_list_tag_values(self);
             assert!(pdol_data.len() <= 0xFF);
             checksum_data.extend_from_slice(&pdol_data);
         }
 
-        let cdol1_data = self.get_tag_list_tag_values(&self.get_tag_value("8C").unwrap()[..]).unwrap();
+        let cdol1_data = DataObjectList::process_data_object_list(self, &self.get_tag_value("8C").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         assert!(cdol1_data.len() <= 0xFF);
         checksum_data.extend_from_slice(&cdol1_data);
 
         if cdol_tag == "8D" {
-            let cdol2_data = self.get_tag_list_tag_values(&self.get_tag_value("8D").unwrap()[..]).unwrap();
+            let cdol2_data = DataObjectList::process_data_object_list(self, &self.get_tag_value("8D").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
             assert!(cdol2_data.len() <= 0xFF);
             checksum_data.extend_from_slice(&cdol2_data);
         }
@@ -1115,7 +1492,7 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        self.add_tag("9F26", tag_9f26_application_cryptogram.to_vec());
+        self.process_tag_as_tlv("9F26", tag_9f26_application_cryptogram.to_vec());
 
         Ok(())
     }
@@ -1152,11 +1529,11 @@ impl EmvConnection<'_> {
             // GET CHALLENGE might be needed to the 9F4C value
             if let None = self.get_tag_value("9F4C") {
                 let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
-                self.add_tag("9F4C", tag_9f4c_icc_dynamic_number);
+                self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number);
             }
         }
 
-        let cdol_data = self.get_tag_list_tag_values(&self.get_tag_value(cdol_tag).unwrap()[..]).unwrap();
+        let cdol_data = DataObjectList::process_data_object_list(self, &self.get_tag_value(cdol_tag).unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         assert!(cdol_data.len() <= 0xFF);
 
 
@@ -1176,11 +1553,11 @@ impl EmvConnection<'_> {
         }
 
         if response_data[0] == 0x80 {
-            self.add_tag("9F27", response_data[2..3].to_vec());
-            self.add_tag("9F36", response_data[3..5].to_vec());
-            self.add_tag("9F26", response_data[5..13].to_vec());
+            self.process_tag_as_tlv("9F27", response_data[2..3].to_vec());
+            self.process_tag_as_tlv("9F36", response_data[3..5].to_vec());
+            self.process_tag_as_tlv("9F26", response_data[5..13].to_vec());
             if response_data.len() > 13 {
-                self.add_tag("9F10", response_data[13..].to_vec());
+                self.process_tag_as_tlv("9F10", response_data[13..].to_vec());
             } 
         } else if response_data[0] != 0x77 {
             warn!("Unrecognized response");
@@ -1414,37 +1791,37 @@ impl EmvConnection<'_> {
     pub fn process_settings(&mut self) -> Result<(), Box<dyn error::Error>> {
         let default_tags = self.settings.default_tags.clone();
         for (tag_name, tag_value) in default_tags.iter() {
-            self.add_tag(&tag_name, hex::decode(&tag_value.clone())?);
+            self.process_tag_as_tlv(&tag_name, hex::decode(&tag_value.clone())?);
         }
 
         let now = Utc::now().naive_utc();
         if !self.get_tag_value("9A").is_some() {
             let today = now.date();
             let transaction_date_ascii_yymmdd = format!("{:02}{:02}{:02}",today.year()-2000, today.month(), today.day());
-            self.add_tag("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
+            self.process_tag_as_tlv("9A", bcdutil::ascii_to_bcd_cn(transaction_date_ascii_yymmdd.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F21").is_some() {
             let time = now.time();
             let transaction_time_ascii_hhmmss = format!("{:02}{:02}{:02}",time.hour(), time.minute(), time.second());
-            self.add_tag("9F21", bcdutil::ascii_to_bcd_cn(transaction_time_ascii_hhmmss.as_bytes(), 3).unwrap());
+            self.process_tag_as_tlv("9F21", bcdutil::ascii_to_bcd_cn(transaction_time_ascii_hhmmss.as_bytes(), 3).unwrap());
         }
 
         if !self.get_tag_value("9F37").is_some() {
             let mut tag_9f37_unpredictable_number = [0u8; 4];
             self.fill_random(&mut tag_9f37_unpredictable_number[..]);
 
-            self.add_tag("9F37", tag_9f37_unpredictable_number.to_vec());
+            self.process_tag_as_tlv("9F37", tag_9f37_unpredictable_number.to_vec());
         }
 
         if !self.get_tag_value("8A").is_some() {
             // ref. EMV Book 4, A6 Authorisation Response Code
-            self.add_tag("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
+            self.process_tag_as_tlv("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
         }
 
         if !self.get_tag_value("9F66").is_some() {
             let tag_9f66_ttq : Vec<u8> = self.settings.terminal.terminal_transaction_qualifiers.into();
-            self.add_tag("9F66", tag_9f66_ttq);
+            self.process_tag_as_tlv("9F66", tag_9f66_ttq);
         }
 
         Ok(())
@@ -1501,7 +1878,7 @@ impl EmvConnection<'_> {
         }
 
         let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application)?;
-        self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..]));
+        self.icc.issuer_pk = Some(RsaPublicKey::new(&issuer_pk_modulus[..], &issuer_pk_exponent[..], self.settings.censor_sensitive_fields));
 
         let data_authentication = &self.icc.data_authentication.as_ref().unwrap()[..];
 
@@ -1512,7 +1889,7 @@ impl EmvConnection<'_> {
             let (icc_pk_modulus, icc_pk_exponent) = self.get_icc_public_key(
                 tag_9f46_icc_pk_certificate.unwrap(), tag_9f47_icc_pk_exponent.unwrap(), tag_9f48_icc_pk_remainder,
                 data_authentication)?;
-            self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..]));
+            self.icc.icc_pk = Some(RsaPublicKey::new(&icc_pk_modulus[..], &icc_pk_exponent[..], self.settings.censor_sensitive_fields));
             self.icc.icc_pin_pk = self.icc.icc_pk.clone();
         }
 
@@ -1526,7 +1903,7 @@ impl EmvConnection<'_> {
                 tag_9f2d_icc_pin_pk_certificate.unwrap(), tag_9f2e_icc_pin_pk_exponent.unwrap(), tag_9f2f_icc_pin_pk_remainder,
                 data_authentication)?;
 
-            self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..]));
+            self.icc.icc_pin_pk = Some(RsaPublicKey::new(&icc_pin_pk_modulus[..], &icc_pin_pk_exponent[..], self.settings.censor_sensitive_fields));
         }
 
         Ok(())
@@ -1644,7 +2021,14 @@ impl EmvConnection<'_> {
         let icc_certificate_pk_exp_length = &icc_certificate[20..21];
         let icc_certificate_pk_leftmost_digits = &icc_certificate[21..checksum_position];
 
-        debug!("ICC PAN:{:02X?}", icc_certificate_pan);
+
+        if self.settings.censor_sensitive_fields {
+            let pan : String = String::from_utf8_lossy(&bcdutil::bcd_to_ascii(&icc_certificate_pan).unwrap()).to_string();
+            let masked_pan: String = pan.chars().enumerate().map(|(i, c)| if i >= 6 && i < pan.len()-4 { '*' } else { c }).collect();
+            debug!("ICC PAN:{}", masked_pan);
+        } else {
+            debug!("ICC PAN:{:02X?}", icc_certificate_pan);
+        }
         debug!("ICC expiry:{:02X?}", icc_certificate_expiry);
         debug!("ICC serial:{:02X?}", icc_certificate_serial);
         debug!("ICC hash algo:{:02X?}", icc_certificate_hash_algo);
@@ -1671,7 +2055,7 @@ impl EmvConnection<'_> {
         checksum_data.extend_from_slice(data_authentication);
 
         if let Some(tag_9f4a_static_data_authentication_tag_list) = self.get_tag_value("9F4A") {
-            let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&tag_9f4a_static_data_authentication_tag_list[..]).unwrap();
+            let static_data_authentication_tag_list_tag_values = DataObjectList::process_data_object_list(self, &tag_9f4a_static_data_authentication_tag_list[..]).unwrap().get_tag_list_tag_values(self);
             checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
         }
 
@@ -1679,7 +2063,9 @@ impl EmvConnection<'_> {
 
         let icc_certificate_checksum = &icc_certificate[checksum_position .. checksum_position + 20];
 
-        trace!("Checksum data: {:02X?}", &checksum_data[..]);
+        if !self.settings.censor_sensitive_fields {
+            trace!("Checksum data: {:02X?}", &checksum_data[..]);
+        }
         trace!("Calculated checksum: {:02X?}", cert_checksum);
         trace!("Stored ICC checksum: {:02X?}", icc_certificate_checksum);
         assert_eq!(cert_checksum, icc_certificate_checksum);
@@ -1776,7 +2162,7 @@ impl EmvConnection<'_> {
         let mut checksum_data : Vec<u8> = Vec::new();
         checksum_data.extend_from_slice(&tag_93_ssad_decrypted[1 .. tag_93_ssad_decrypted.len() - 22]);
         checksum_data.extend_from_slice(data_authentication);
-        let static_data_authentication_tag_list_tag_values = self.get_tag_list_tag_values(&self.get_tag_value("9F4A").unwrap()[..]).unwrap();
+        let static_data_authentication_tag_list_tag_values = DataObjectList::process_data_object_list(self, &self.get_tag_value("9F4A").unwrap()[..]).unwrap().get_tag_list_tag_values(self);
         checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
 
         let ssad_checksum_calculated = sha::sha1(&checksum_data[..]);
@@ -1792,7 +2178,7 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        self.add_tag("9F45", tag_93_ssad_decrypted[3..5].to_vec());
+        self.process_tag_as_tlv("9F45", tag_93_ssad_decrypted[3..5].to_vec());
 
         Ok(())
     }
@@ -1832,7 +2218,7 @@ impl EmvConnection<'_> {
                 None => &ddol_default_value
             };
 
-            let ddol_data = self.get_tag_list_tag_values(&tag_9f49_ddol[..]).unwrap();
+            let ddol_data = DataObjectList::process_data_object_list(self, &tag_9f49_ddol[..]).unwrap().get_tag_list_tag_values(self);
 
             auth_data.extend_from_slice(&ddol_data[..]);
 
@@ -1849,7 +2235,7 @@ impl EmvConnection<'_> {
             }
 
             if response_data[0] == 0x80 {
-                self.add_tag("9F4B", response_data[3..].to_vec());
+                self.process_tag_as_tlv("9F4B", response_data[3..].to_vec());
             } else if response_data[0] != 0x77 {
                 warn!("Unrecognized response");
                 return Err(());
@@ -1859,7 +2245,7 @@ impl EmvConnection<'_> {
         let tag_9f4b_signed_data_decrypted_dynamic_data = self.validate_signed_dynamic_application_data(&auth_data[..]).unwrap();
 
         let tag_9f4c_icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[1..];
-        self.add_tag("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
+        self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
 
         Ok(())
     }
@@ -1956,11 +2342,11 @@ impl EmvConnection<'_> {
 
             if success {
                 self.settings.terminal.tvr.cardholder_verification_was_not_successful = false;
-                self.add_tag("9F34", CvmRule::into_9f34_value(Ok(rule)));
+                self.process_tag_as_tlv("9F34", CvmRule::into_9f34_value(Ok(rule)));
                 break;
             } else {
                 self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
-                self.add_tag("9F34", CvmRule::into_9f34_value(Err(rule)));
+                self.process_tag_as_tlv("9F34", CvmRule::into_9f34_value(Err(rule)));
 
                 if ! skip_if_not_supported {
                     break;
@@ -1974,7 +2360,7 @@ impl EmvConnection<'_> {
             self.settings.terminal.tvr.cardholder_verification_was_not_successful = true;
 
             // "no CVM performed"
-            self.add_tag("9F34", b"\x3F\x00\x01".to_vec());
+            self.process_tag_as_tlv("9F34", b"\x3F\x00\x01".to_vec());
         }
 
         Ok(())
@@ -2030,7 +2416,7 @@ impl EmvConnection<'_> {
 
         let tag_95_tvr : Vec<u8> = self.settings.terminal.tvr.into();
         let tvr_len = tag_95_tvr.len();
-        self.add_tag("95", tag_95_tvr);
+        self.process_tag_as_tlv("95", tag_95_tvr);
         debug!("{:?}", self.settings.terminal.tvr);
 
         let action_zero : TerminalVerificationResults = vec![0; tvr_len].into();
@@ -2106,79 +2492,6 @@ impl EmvConnection<'_> {
 
         Ok(())
     }
-
-    // EMV has some tags that don't conform to ISO/IEC 7816
-    fn is_non_conforming_one_byte_tag(&self, tag : u8) -> bool {
-        if tag == 0x95 {
-            return true;
-        }
-
-        false
-    }
-
-    fn get_tag_list_tag_values(&self, tag_list : &[u8]) -> Result<Vec<u8>, ()> {
-        // EMV Book 3, 5.4 Rules for Using a Data Object List (DOL)
-
-        let mut output : Vec<u8> = Vec::new();
-
-        if tag_list.len() < 2 {
-            let tag_name = hex::encode(&tag_list[0..1]).to_uppercase();
-            let value = match self.get_tag_value(&tag_name) {
-                Some(value) => value,
-                None => {
-                    warn!("tag {:?} has no value", tag_name);
-                    return Err(());
-                }
-            };
-
-            output.extend_from_slice(&value[..]);
-        } else {
-            let mut i = 0;
-            loop {
-                let tag_value_length : usize;
-
-                let mut tag_name = hex::encode(&tag_list[i..i+1]).to_uppercase();
-
-                if Tag::try_from(tag_name.as_str()).is_ok() || self.is_non_conforming_one_byte_tag(tag_list[i]) {
-                    tag_value_length = tag_list[i+1] as usize;
-                    i += 2;
-                } else {
-                    tag_name = hex::encode(&tag_list[i..i+2]).to_uppercase();
-                    if Tag::try_from(tag_name.as_str()).is_ok() {
-                        tag_value_length = tag_list[i+2] as usize;
-                        i += 3;
-                    } else {
-                        warn!("Incorrect tag {:?}", tag_name);
-                        return Err(());
-                    }
-                }
-
-                let default_value : Vec<u8> = vec![0; tag_value_length];
-                let value = match self.get_tag_value(&tag_name) {
-                    Some(value) => value,
-                    None => {
-                        debug!("tag {:?} has no value, filling with zeros", tag_name);
-                        
-                        &default_value
-                    }
-                };
-
-                // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
-                if value.len() != tag_value_length {
-                    warn!("tag {:?} value length {:02X} does not match tag list value length {:02X}", tag_name, value.len(), tag_value_length);
-                    return Err(());
-                }
-
-                output.extend_from_slice(&value[..]);
-
-                if i >= tag_list.len() {
-                    break;
-                }
-            }
-        }
-
-        Ok(output)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2192,26 +2505,73 @@ pub struct EmvApplication {
 pub enum FieldSensitivity {
     Public,
     SensitiveAuthenticationData,
+    Sensitive,
+    Track2,
     PrimaryAccountNumber,
     PersonallyIdentifiableInformation
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum FieldFormat {
+    CompressedNumeric,
+    Binary,
+    Alphanumeric,
+    AlphanumericSpecial,
+    TerminalVerificationResults,
+    ApplicationUsageControl,
+    KeyCertificate,
+    ServiceCodeIso7813,
+    NumericCountryCode,
+    NumericCurrencyCode,
+    DataObjectList,
+    Track2,
+    Date,
+    Time
+}
+
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub enum FieldSource {
+    Icc,
+    Terminal,
+    Issuer,
+    IssuerOrTerminal
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EmvTag {
     pub tag: String,
     pub name: String,
-    pub sensitivity: Option<FieldSensitivity>
+    pub sensitivity: Option<FieldSensitivity>,
+    pub format: Option<FieldFormat>,
+    pub min: Option<u8>,
+    pub max: Option<u8>,
+    pub source: Option<FieldSource>
 }
- 
+
+impl EmvTag {
+    pub fn new(tag_name : &str) -> EmvTag {
+        EmvTag {
+            tag: tag_name.to_string(),
+            name: "Unknown tag".to_string(),
+            sensitivity: None,
+            format: None,
+            min: None,
+            max: None,
+            source: None   
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RsaPublicKey {
     pub modulus: String,
-    pub exponent: String
+    pub exponent: String,
+    sensitive: Option<bool>
 }
 
 impl RsaPublicKey {
-    pub fn new(modulus : &[u8], exponent : &[u8]) -> RsaPublicKey {
-        RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent) }
+    pub fn new(modulus : &[u8], exponent : &[u8], sensitive : bool) -> RsaPublicKey {
+        RsaPublicKey { modulus: hex::encode_upper(modulus), exponent: hex::encode_upper(exponent), sensitive: Some(sensitive) }
     }
 
     pub fn get_key_byte_size(&self) -> usize {
@@ -2238,7 +2598,11 @@ impl RsaPublicKey {
         let mut data = Vec::new();
         data.extend_from_slice(&encrypt_output[..length]);
 
-        trace!("Encrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        if let Some(true) = self.sensitive {
+            trace!("Encrypt result ({} bytes)", data.len());
+        } else {
+            trace!("Encrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        }
 
         if data.len() != pk_modulus_raw.len() {
             warn!("Data length discrepancy");
@@ -2268,7 +2632,11 @@ impl RsaPublicKey {
         let mut data = Vec::new();
         data.extend_from_slice(&decrypt_output[..length]);
 
-        trace!("Decrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        if let Some(true) = self.sensitive {
+            trace!("Decrypt result ({} bytes)", data.len());
+        } else {
+            trace!("Decrypt result ({} bytes):\n{}", data.len(), HexViewBuilder::new(&data[..]).finish());
+        }
 
         if data.len() != pk_modulus_raw.len() {
             warn!("Data length discrepancy");
@@ -2491,7 +2859,7 @@ mod tests {
         let public_key_exponent = &rsa.e().to_vec()[..];
         let private_key_exponent = &rsa.d().to_vec()[..];
 
-        let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent);
+        let pk = RsaPublicKey::new(public_key_modulus, public_key_exponent, false);
         debug!("modulus: {:02X?}, exponent: {:02X?}, private_exponent: {:02X?}", public_key_modulus, public_key_exponent, private_key_exponent);
 
         let mut encrypt_output = [0u8; KEY_BYTE_SIZE];
@@ -2525,14 +2893,14 @@ mod tests {
 
     fn start_transaction(connection : &mut EmvConnection) -> Result<(), ()> {
         // force transaction date as 24.07.2020
-        connection.add_tag("9A", b"\x20\x07\x24".to_vec());
+        connection.process_tag_as_tlv("9A", b"\x20\x07\x24".to_vec());
 
         // force unpreditable number
-        connection.add_tag("9F37", b"\x01\x23\x45\x67".to_vec());
+        connection.process_tag_as_tlv("9F37", b"\x01\x23\x45\x67".to_vec());
         connection.settings.terminal.use_random = false;
 
         // force issuer authentication data
-        connection.add_tag("91", b"\x12\x34\x56\x78\x12\x34\x56\x78".to_vec());
+        connection.process_tag_as_tlv("91", b"\x12\x34\x56\x78\x12\x34\x56\x78".to_vec());
 
         Ok(())
     }
@@ -2600,7 +2968,7 @@ mod tests {
 
         connection.start_transaction(&application)?;
 
-        connection.add_tag("9F02", ascii_to_bcd_n(format!("{}", amount).as_bytes(), 6).unwrap());
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(format!("{}", amount).as_bytes(), 6).unwrap());
 
         connection.handle_card_verification_methods()?;
 
@@ -2627,4 +2995,101 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_data_object_list_processing() -> Result<(), ()> {
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+
+        let cdol1 : [u8; 39] = [
+            //tag       length
+            0x9F,0x02,  0x06,
+            0x9F,0x03,  0x06,
+            0x9F,0x1A,  0x02,
+            0x95,       0x05,
+            0x5F,0x2A,  0x02,
+            0x9A,       0x03,
+            0x9C,       0x01,
+            0x9F,0x37,  0x04,
+            0x9F,0x35,  0x01,
+            0x9F,0x45,  0x02,
+            0x9F,0x4C,  0x08,
+            0x9F,0x34,  0x03,
+            0x9F,0x21,  0x03,
+            0x9F,0x7C,  0x14];
+
+        let dol1 : DataObjectList = DataObjectList::process_data_object_list(&connection, &cdol1).unwrap();
+
+
+        // Check zero padded DOL
+        let dol1_output : Vec<u8> = dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&dol1_output[..], [0; 66]);
+
+        // Fill couple of tags with information
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(format!("{}", 123456).as_bytes(), 6).unwrap());
+        connection.process_tag_as_tlv("9C", [0xFF].to_vec());
+
+        let tag_82_data : [u8; 2] = [0x39, 0x00];
+
+        connection.process_tag_as_tlv("82", tag_82_data.to_vec());
+
+        let dol1_output2 : Vec<u8> = dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&dol1_output2[..], [0, 0, 0, 18, 52, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // Curious case of static data authentication list (9F4A) which slightly differs from regular DOL by not providing tag length
+        let static_data_authentication_list : [u8; 1] = [0x82];
+        let static_dol1 : DataObjectList = DataObjectList::process_data_object_list(&connection, &static_data_authentication_list).unwrap();
+        let static_data_authentication_list_output : Vec<u8> = static_dol1.get_tag_list_tag_values(&connection);
+        assert_eq!(&static_data_authentication_list_output[..], tag_82_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_track2() -> Result<(), ()> {
+        let track2_data          = ";4321432143214321=2612101123456789123?";
+        let track2_data_censored = ";432143******4321=2612101************?";
+
+        let mut track2 : Track2 = Track2::new(track2_data);
+        assert_eq!(format!("{}", track2), track2_data);
+
+        assert_eq!(track2.primary_account_number, "4321432143214321");
+        assert_eq!(track2.expiry_year, "26");
+        assert_eq!(track2.expiry_month, "12");
+        assert_eq!(track2.service_code, "101");
+        assert_eq!(track2.discretionary_data, "123456789123");
+
+        track2.censor();
+        assert_eq!(format!("{}", track2), track2_data_censored);
+        assert_eq!(track2.primary_account_number, "432143******4321");
+        assert_eq!(track2.discretionary_data, "************");
+
+        Ok(())
+    }
+    
+    #[test]
+    fn test_track1() -> Result<(), ()> {
+        let track1_data          = "%B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?";
+        let track1_data_censored = "%B432143******4321^******/****^2609101************************?";
+
+        let mut track1 : Track1 = Track1::new(track1_data);
+        assert_eq!(format!("{}", track1), track1_data);
+
+        assert_eq!(track1.primary_account_number, "4321432143214321");
+        assert_eq!(track1.last_name, "Mc'Doe");
+        assert_eq!(track1.first_name, "JOHN");
+        assert_eq!(track1.expiry_year, "26");
+        assert_eq!(track1.expiry_month, "09");
+        assert_eq!(track1.service_code, "101");
+        assert_eq!(track1.discretionary_data, "123456789012345678901234");
+
+        track1.censor();
+        assert_eq!(format!("{}", track1), track1_data_censored);
+        assert_eq!(track1.primary_account_number, "432143******4321");
+        assert_eq!(track1.last_name, "******");
+        assert_eq!(track1.first_name, "****");
+        assert_eq!(track1.discretionary_data, "************************");
+
+        Ok(())
+    }
+    
 }
