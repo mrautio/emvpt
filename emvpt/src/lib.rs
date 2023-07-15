@@ -3391,7 +3391,7 @@ pub fn get_ca_public_key<'a>(
 }
 
 pub fn is_certificate_expired(date_bcd: &[u8]) -> bool {
-    let today = Utc::today().naive_utc();
+    let today = Utc::now().date_naive();
     let expiry_date =
         NaiveDate::parse_from_str(&format!("01{:02X?}", date_bcd), "%d[%m, %y]").unwrap();
     let duration = today.signed_duration_since(expiry_date).num_days();
