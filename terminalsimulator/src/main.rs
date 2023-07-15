@@ -1,38 +1,44 @@
-use pcsc::{Context, Card, Scope, ShareMode, Protocols, MAX_BUFFER_SIZE, MAX_ATR_SIZE};
-use regex::Regex;
-use log::{error, warn, info, debug};
-use log4rs;
 use clap::Parser;
-use std::io::{self};
-use std::{thread, time};
-use std::str;
-use std::path::PathBuf;
 use hex;
+use log::{debug, error, info, warn};
+use log4rs;
+use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_ATR_SIZE, MAX_BUFFER_SIZE};
+use regex::Regex;
+use std::io::{self};
+use std::path::PathBuf;
+use std::str;
+use std::{thread, time};
 
 use emvpt::*;
 
-static mut INTERACTIVE : bool = false;
-static mut PIN_OPTION : Option<String> = None;
+static mut INTERACTIVE: bool = false;
+static mut PIN_OPTION: Option<String> = None;
 
 pub enum ReaderError {
     ReaderConnectionFailed(String),
     ReaderNotFound,
     CardConnectionFailed(String),
-    CardNotFound
+    CardNotFound,
 }
 
 pub struct SmartCardConnection {
-    ctx : Option<Context>,
-    card : Option<Card>,
-    pub contactless : bool
+    ctx: Option<Context>,
+    card: Option<Card>,
+    pub contactless: bool,
 }
 
 impl ApduInterface for SmartCardConnection {
-    fn send_apdu(&self, apdu : &[u8]) -> Result<Vec<u8>, ()> {
-        let mut output : Vec<u8> = Vec::new();
+    fn send_apdu(&self, apdu: &[u8]) -> Result<Vec<u8>, ()> {
+        let mut output: Vec<u8> = Vec::new();
 
         let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
-        output.extend_from_slice(self.card.as_ref().unwrap().transmit(apdu, &mut apdu_response_buffer).unwrap());
+        output.extend_from_slice(
+            self.card
+                .as_ref()
+                .unwrap()
+                .transmit(apdu, &mut apdu_response_buffer)
+                .unwrap(),
+        );
 
         Ok(output)
     }
@@ -41,13 +47,13 @@ impl ApduInterface for SmartCardConnection {
 impl SmartCardConnection {
     pub fn new() -> SmartCardConnection {
         SmartCardConnection {
-            ctx : None,
-            card : None,
-            contactless : false
+            ctx: None,
+            card: None,
+            contactless: false,
         }
     }
 
-    fn is_contactless_reader(&self, reader_name : &str) -> bool {
+    fn is_contactless_reader(&self, reader_name: &str) -> bool {
         if Regex::new(r"^ACS ACR12").unwrap().is_match(reader_name) {
             debug!("Card reader is deemed contactless");
             return true;
@@ -61,7 +67,10 @@ impl SmartCardConnection {
             self.ctx = match Context::establish(Scope::User) {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
-                    return Err(ReaderError::ReaderConnectionFailed(format!("Failed to establish context: {}", err)));
+                    return Err(ReaderError::ReaderConnectionFailed(format!(
+                        "Failed to establish context: {}",
+                        err
+                    )));
                 }
             };
         }
@@ -70,7 +79,10 @@ impl SmartCardConnection {
         let readers_size = match ctx.list_readers_len() {
             Ok(readers_size) => readers_size,
             Err(err) => {
-                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers size: {}", err)));
+                return Err(ReaderError::ReaderConnectionFailed(format!(
+                    "Failed to list readers size: {}",
+                    err
+                )));
             }
         };
 
@@ -78,7 +90,10 @@ impl SmartCardConnection {
         let readers = match ctx.list_readers(&mut readers_buf) {
             Ok(readers) => readers,
             Err(err) => {
-                return Err(ReaderError::ReaderConnectionFailed(format!("Failed to list readers: {}", err)));
+                return Err(ReaderError::ReaderConnectionFailed(format!(
+                    "Failed to list readers: {}",
+                    err
+                )));
             }
         };
 
@@ -87,11 +102,14 @@ impl SmartCardConnection {
                 Ok(card) => {
                     self.contactless = self.is_contactless_reader(reader.to_str().unwrap());
 
-                    debug!("Card reader: {:?}, contactless:{}", reader, self.contactless);
+                    debug!(
+                        "Card reader: {:?}, contactless:{}",
+                        reader, self.contactless
+                    );
 
                     Some(card)
-                },
-                _ => None
+                }
+                _ => None,
             };
 
             if self.card.is_some() {
@@ -100,13 +118,24 @@ impl SmartCardConnection {
         }
 
         if self.card.is_some() {
-            const MAX_NAME_SIZE : usize = 2048;
+            const MAX_NAME_SIZE: usize = 2048;
             let mut names_buffer = [0; MAX_NAME_SIZE];
             let mut atr_buffer = [0; MAX_ATR_SIZE];
-            let card_status = self.card.as_ref().unwrap().status2(&mut names_buffer, &mut atr_buffer).unwrap();
+            let card_status = self
+                .card
+                .as_ref()
+                .unwrap()
+                .status2(&mut names_buffer, &mut atr_buffer)
+                .unwrap();
 
             // https://www.eftlab.com/knowledge-base/171-atr-list-full/
-            debug!("Card ATR:\n{}", format!("{:02X?}", card_status.atr()).replace(|c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_whitespace()), ""));
+            debug!(
+                "Card ATR:\n{}",
+                format!("{:02X?}", card_status.atr()).replace(
+                    |c: char| !(c.is_ascii_alphanumeric() || c.is_ascii_whitespace()),
+                    ""
+                )
+            );
             debug!("Card protocol: {:?}", card_status.protocol2().unwrap());
         } else {
             return Err(ReaderError::CardNotFound);
@@ -116,13 +145,17 @@ impl SmartCardConnection {
     }
 }
 
-fn pse_application_select(applications : &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
+fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
     let user_interactive = unsafe { INTERACTIVE };
 
     if user_interactive && applications.len() > 1 {
         println!("Select payment application:");
         for i in 0..applications.len() {
-            println!("{:02}. {}", i+1, str::from_utf8(&applications[i].label).unwrap());
+            println!(
+                "{:02}. {}",
+                i + 1,
+                str::from_utf8(&applications[i].label).unwrap()
+            );
         }
 
         print!("> ");
@@ -144,7 +177,6 @@ fn pin_entry() -> Result<String, ()> {
         }
     }
 
-
     if user_interactive {
         println!("Enter PIN:");
         print!("> ");
@@ -164,7 +196,11 @@ fn amount_entry() -> Result<u64, ()> {
         let mut stdin_buffer = String::new();
         io::stdin().read_line(&mut stdin_buffer).unwrap();
 
-        return Ok(format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0).parse::<u64>().unwrap());
+        return Ok(
+            format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0)
+                .parse::<u64>()
+                .unwrap(),
+        );
     }
 
     Ok(1)
@@ -179,32 +215,37 @@ struct Args {
     interactive: bool,
 
     /// Print all read or generated tags
-    #[arg(long="print-tags", default_value_t = false)]
+    #[arg(long = "print-tags", default_value_t = false)]
     print_tags: bool,
 
     /// Censor sensitive data from the output
-    #[arg(long="censor-sensitive-fields", default_value_t = false)]
+    #[arg(long = "censor-sensitive-fields", default_value_t = false)]
     censor_sensitive_fields: bool,
 
-    /// Exit after connecting the card 
-    #[arg(long="stop-after-connect", default_value_t = false)]
+    /// Exit after connecting the card
+    #[arg(long = "stop-after-connect", default_value_t = false)]
     stop_after_connect: bool,
 
     /// Stop processing transaction after card data has been read
-    #[arg(long="stop-after-read", default_value_t = false)]
+    #[arg(long = "stop-after-read", default_value_t = false)]
     stop_after_read: bool,
 
     /// Card PIN code to be used when PIN code is required
-    #[arg(short, long, value_name="PIN CODE")]
+    #[arg(short, long, value_name = "PIN CODE")]
     pin: Option<String>,
 
     /// Card PIN code to be used when PIN code is required
-    #[arg(short, long, value_name="settings file", default_value = "config/settings.yaml")]
+    #[arg(
+        short,
+        long,
+        value_name = "settings file",
+        default_value = "config/settings.yaml"
+    )]
     settings: PathBuf,
 
     /// Print TLV data in human readable form
-    #[arg(long, value_name="TLV")]
-    print_tlv: Option<String>
+    #[arg(long, value_name = "TLV")]
+    print_tlv: Option<String>,
 }
 
 fn run() -> Result<Option<String>, String> {
@@ -231,7 +272,9 @@ fn run() -> Result<Option<String>, String> {
     connection.amount_callback = Some(&amount_entry);
 
     if print_tlv.is_some() {
-        let tlv_hex_data = print_tlv.unwrap().replace(|c: char| !(c.is_ascii_alphanumeric()), "");
+        let tlv_hex_data = print_tlv
+            .unwrap()
+            .replace(|c: char| !(c.is_ascii_alphanumeric()), "");
         info!("input TLV: {}", tlv_hex_data);
         connection.process_tlv(&hex::decode(&tlv_hex_data).unwrap()[..], 0);
         return Ok(None);
@@ -250,21 +293,19 @@ fn run() -> Result<Option<String>, String> {
                     loop {
                         match smart_card_connection.connect_to_card() {
                             Ok(_) => break,
-                            Err(err) => {
-                                match err {
-                                    ReaderError::CardNotFound => {
-                                        thread::sleep(time::Duration::from_millis(250));
-                                    },
-                                    _ => return Err("Could not connect to the reader".to_string())
+                            Err(err) => match err {
+                                ReaderError::CardNotFound => {
+                                    thread::sleep(time::Duration::from_millis(250));
                                 }
-                            }
+                                _ => return Err("Could not connect to the reader".to_string()),
+                            },
                         }
                     }
                 } else {
                     return Err("Card not found.".to_string());
                 }
-            },
-            _ => return Err("Could not connect to the reader".to_string())
+            }
+            _ => return Err("Could not connect to the reader".to_string()),
         }
     }
 
@@ -278,11 +319,14 @@ fn run() -> Result<Option<String>, String> {
     let application = connection.select_payment_application().unwrap();
 
     connection.process_settings().unwrap();
-    connection.add_tag("9F02", bcdutil::ascii_to_bcd_n(format!("{}", purchase_amount).as_bytes(), 6).unwrap());
+    connection.add_tag(
+        "9F02",
+        bcdutil::ascii_to_bcd_n(format!("{}", purchase_amount).as_bytes(), 6).unwrap(),
+    );
 
     connection.handle_get_processing_options().unwrap();
 
-    if ! stop_after_read {
+    if !stop_after_read {
         connection.handle_public_keys(&application).unwrap();
 
         connection.handle_card_verification_methods().unwrap();
@@ -295,12 +339,18 @@ fn run() -> Result<Option<String>, String> {
 
         match connection.handle_1st_generate_ac().unwrap() {
             CryptogramType::AuthorisationRequestCryptogram => {
-                if let CryptogramType::TransactionCertificate = connection.handle_2nd_generate_ac().unwrap() {
+                if let CryptogramType::TransactionCertificate =
+                    connection.handle_2nd_generate_ac().unwrap()
+                {
                     purchase_successful = true;
                 }
-            },
-            CryptogramType::TransactionCertificate => { purchase_successful = true; },
-            CryptogramType::ApplicationAuthenticationCryptogram => { purchase_successful = false; }
+            }
+            CryptogramType::TransactionCertificate => {
+                purchase_successful = true;
+            }
+            CryptogramType::ApplicationAuthenticationCryptogram => {
+                purchase_successful = false;
+            }
         }
 
         if purchase_successful {
@@ -323,7 +373,7 @@ fn main() {
         Ok(msg) => {
             warn!("{:?}", msg);
             0
-        },
+        }
         Err(err) => {
             error!("{:?}", err);
             1
