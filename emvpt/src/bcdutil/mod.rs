@@ -1,7 +1,7 @@
-pub fn bcd_to_ascii(bcd_data : &[u8]) -> Result<Vec<u8>, ()> {
-    let mut ascii_output : Vec<u8> = Vec::with_capacity(bcd_data.len() * 2);
+pub fn bcd_to_ascii(bcd_data: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut ascii_output: Vec<u8> = Vec::with_capacity(bcd_data.len() * 2);
 
-    const ASCII_CHARACTER_0 : u8 = 0x30;
+    const ASCII_CHARACTER_0: u8 = 0x30;
 
     for i in 0..bcd_data.len() {
         let byte = bcd_data[i];
@@ -28,12 +28,12 @@ pub fn bcd_to_ascii(bcd_data : &[u8]) -> Result<Vec<u8>, ()> {
 }
 
 //cn = 12 34 56 78 90 12 3F FF
-pub fn ascii_to_bcd_cn(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
-    let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
+pub fn ascii_to_bcd_cn(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
+    let mut bcd_output: Vec<u8> = Vec::with_capacity(size);
 
     assert!(ascii_data.len() <= size * 2);
 
-    const ASCII_CHARACTER_0 : u8 = 0x30;
+    const ASCII_CHARACTER_0: u8 = 0x30;
 
     for i in (0..ascii_data.len()).step_by(2) {
         let b1 = ascii_data[i] - ASCII_CHARACTER_0;
@@ -65,20 +65,20 @@ pub fn ascii_to_bcd_cn(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> 
 }
 
 //n = 00 00 00 01 23 45
-pub fn ascii_to_bcd_n(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
-    let mut bcd_output : Vec<u8> = Vec::with_capacity(size);
+pub fn ascii_to_bcd_n(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
+    let mut bcd_output: Vec<u8> = Vec::with_capacity(size);
 
     assert!(ascii_data.len() <= size * 2);
 
-    const ASCII_CHARACTER_0 : u8 = 0x30;
+    const ASCII_CHARACTER_0: u8 = 0x30;
 
-    let mut ascii_data_aligned : Vec<u8> = Vec::new();
+    let mut ascii_data_aligned: Vec<u8> = Vec::new();
     if ascii_data.len() % 2 == 1 {
         ascii_data_aligned.push(ASCII_CHARACTER_0);
     }
     ascii_data_aligned.extend_from_slice(&ascii_data[..]);
 
-    for _ in ascii_data_aligned.len()/2..size {
+    for _ in ascii_data_aligned.len() / 2..size {
         let bcd_byte = 0x00;
         bcd_output.push(bcd_byte);
     }
@@ -89,7 +89,7 @@ pub fn ascii_to_bcd_n(ascii_data : &[u8], size : usize) -> Result<Vec<u8>, ()> {
             return Err(());
         }
 
-        let b2 = ascii_data_aligned[i+1] - ASCII_CHARACTER_0;
+        let b2 = ascii_data_aligned[i + 1] - ASCII_CHARACTER_0;
         if b2 > 0x9 {
             return Err(());
         }
