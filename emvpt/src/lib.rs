@@ -126,17 +126,19 @@ pub struct Track2 {
 
 impl Track2 {
     pub fn new(track_data: &str) -> Track2 {
-        // ;4321432143214321=2612101123456789123?
-        println!("Track: {}", track_data);
-        let re = Regex::new(r"^;?(\d+)=(\d{2})(\d{2})(\d{3})(\d+)\??$").unwrap();
+        // Supports human readable and ICC formats
+        // human readable: ;4321432143214321=2612101123456789123?
+        // ICC: 4321432143214321D2612101123456789123F
+
+        let re = Regex::new(r"^;?(\d+)(=|D)(\d{2})(\d{2})(\d{3})(\d+)F?\??$").unwrap();
         let cap = re.captures(track_data).unwrap();
 
         Track2 {
             primary_account_number: cap.get(1).unwrap().as_str().to_string(),
-            expiry_year: cap.get(2).unwrap().as_str().to_string(),
-            expiry_month: cap.get(3).unwrap().as_str().to_string(),
-            service_code: cap.get(4).unwrap().as_str().to_string(),
-            discretionary_data: cap.get(5).unwrap().as_str().to_string(),
+            expiry_year: cap.get(3).unwrap().as_str().to_string(),
+            expiry_month: cap.get(4).unwrap().as_str().to_string(),
+            service_code: cap.get(5).unwrap().as_str().to_string(),
+            discretionary_data: cap.get(6).unwrap().as_str().to_string(),
         }
     }
 
@@ -1364,7 +1366,10 @@ impl EmvConnection<'_> {
                     value = format!("{}", dol);
                 }
                 Some(FieldFormat::Track2) => {
-                    let track2: Track2 = Track2::new(&String::from_utf8_lossy(&v).to_string());
+                    let track2_raw: String = format!("{:02X?}", v)
+                        .replace(|c: char| !(c.is_ascii_alphanumeric()), "")
+                        .to_string();
+                    let track2: Track2 = Track2::new(&track2_raw);
                     value = format!("{}", track2);
                 }
                 Some(FieldFormat::Date) => {
@@ -3738,12 +3743,35 @@ mod tests {
     }
 
     #[test]
-    fn test_track2() -> Result<(), ()> {
+    fn test_track2_human_readable() -> Result<(), ()> {
         let track2_data = ";4321432143214321=2612101123456789123?";
         let track2_data_censored = ";432143******4321=2612101************?";
 
         let mut track2: Track2 = Track2::new(track2_data);
         assert_eq!(format!("{}", track2), track2_data);
+
+        assert_eq!(track2.primary_account_number, "4321432143214321");
+        assert_eq!(track2.expiry_year, "26");
+        assert_eq!(track2.expiry_month, "12");
+        assert_eq!(track2.service_code, "101");
+        assert_eq!(track2.discretionary_data, "123456789123");
+
+        track2.censor();
+        assert_eq!(format!("{}", track2), track2_data_censored);
+        assert_eq!(track2.primary_account_number, "432143******4321");
+        assert_eq!(track2.discretionary_data, "************");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_track2_icc() -> Result<(), ()> {
+        let track2_data = "4321432143214321D2612101123456789123F";
+        let track2_data_formatted = ";4321432143214321=2612101123456789123?";
+        let track2_data_censored = ";432143******4321=2612101************?";
+
+        let mut track2: Track2 = Track2::new(track2_data);
+        assert_eq!(format!("{}", track2), track2_data_formatted);
 
         assert_eq!(track2.primary_account_number, "4321432143214321");
         assert_eq!(track2.expiry_year, "26");
