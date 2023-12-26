@@ -11,15 +11,18 @@ pub fn bcd_to_ascii(bcd_data: &[u8]) -> Result<Vec<u8>, ()> {
         if byte == 0xFF {
             break;
         }
-        ascii_output.push(ASCII_CHARACTER_0 + n2);
 
-        if n1 != 0xF {
-            ascii_output.push(ASCII_CHARACTER_0 + n1);
-        } else if i != bcd_data.len() - 1 {
+        if n2 != 0xF {
+            ascii_output.push(ASCII_CHARACTER_0 + n2);
+        } else if n1 != 0xF {
             return Err(());
         }
 
-        if n1 > 0x9 || n2 > 0x9 {
+        if n1 != 0xF {
+            ascii_output.push(ASCII_CHARACTER_0 + n1);
+        }
+
+        if (n1 > 0x9 && n1 != 0xF) || (n2 > 0x9 && n2 != 0xF) {
             return Err(());
         }
     }

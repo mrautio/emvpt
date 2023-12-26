@@ -3813,4 +3813,33 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_bcd_conversion() -> Result<(), ()> {
+        let empty1 : Vec<u8> = [].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&empty1[..]).unwrap()).unwrap(), "");
+
+        let empty2 : Vec<u8> = [0xFF, 0xFF].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&empty2[..]).unwrap()).unwrap(), "");
+
+        let pan1 : Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x77].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&pan1[..]).unwrap()).unwrap(), "4444555566667777");
+
+        let pan2 : Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x78, 0xFF].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&pan2[..]).unwrap()).unwrap(), "4444555566667778");
+
+        let pan3 : Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x7F].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&pan3[..]).unwrap()).unwrap(), "444455556666777");
+
+        let pan4 : Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x77, 0x88, 0x8F].to_vec();
+        assert_eq!(str::from_utf8(&bcdutil::bcd_to_ascii(&pan4[..]).unwrap()).unwrap(), "4444555566667777888");
+
+        let not_bcd1 : Vec<u8> = [0x44, 0x44, 0xAB, 0x55].to_vec();
+        assert_eq!(bcdutil::bcd_to_ascii(&not_bcd1[..]).is_ok(), false);
+
+        let not_bcd2 : Vec<u8> = [0x44, 0x44, 0xF4].to_vec();
+        assert_eq!(bcdutil::bcd_to_ascii(&not_bcd2[..]).is_ok(), false);
+
+        Ok(())
+    }
 }
