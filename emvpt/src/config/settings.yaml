@@ -62,6 +62,23 @@ terminal:
     contact_chip_offline_pin_supported: true
     issuer_update_processing_supported: false
     consumer_device_cvm_supported: false
+  c4_enhanced_contactless_reader_capabilities:
+    contact_mode_supported: true
+    contactless_mag_stripe_mode_supported: true
+    contactless_emv_full_online_mode_not_supported: false
+    contactless_emv_partial_online_mode_supported: false
+    contactless_mode_supported: true
+    try_another_interface_after_decline: true
+    mobile_cvm_supported: true
+    online_pin_supported: false
+    signature: true
+    plaintext_offline_pin: true
+    reader_is_offline_only: true
+    cvm_required: false
+    terminal_exempt_from_no_cvm_checks: false
+    delayed_authorisation_terminal: false
+    transit_terminal: false
+    c4_kernel_version: 3
   cryptogram_type: 'AuthorisationRequestCryptogram'
   cryptogram_type_arqc: 'TransactionCertificate'
 default_tags:

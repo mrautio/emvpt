@@ -507,6 +507,88 @@ impl From<TerminalTransactionQualifiers> for Vec<u8> {
     }
 }
 
+// EMV Contactless Book C-4 Kernel 4 Specification, Table 4-4: Enhanced Contactless Reader Capabilities (tag 9F6E)
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct C4EnhancedContactlessReaderCapabilities {
+    //byte 1 - Terminal Capabilities
+    pub contact_mode_supported: bool,
+    pub contactless_mag_stripe_mode_supported: bool,
+    pub contactless_emv_full_online_mode_not_supported: bool, // full online mode is a legacy feature and is no longer supported
+    pub contactless_emv_partial_online_mode_supported: bool,
+    pub contactless_mode_supported: bool,
+    pub try_another_interface_after_decline: bool,
+    //2-1 bits RFU
+
+    //byte 2 - Terminal CVM Capabilities
+    pub mobile_cvm_supported: bool,
+    pub online_pin_supported: bool,
+    pub signature: bool,
+    pub plaintext_offline_pin: bool,
+    //4-1 bits RFU
+
+    //byte 3 - Transaction Capabilities
+    pub reader_is_offline_only: bool,
+    pub cvm_required: bool,
+    //6-1 bits RFU
+
+    //byte 4 - Transaction Capabilities
+    pub terminal_exempt_from_no_cvm_checks: bool,
+    pub delayed_authorisation_terminal: bool,
+    pub transit_terminal: bool,
+    //5-4 bits RFU
+    pub c4_kernel_version: u8, // bits 3-1
+}
+
+impl From<C4EnhancedContactlessReaderCapabilities> for Vec<u8> {
+    fn from(tag_9f6e: C4EnhancedContactlessReaderCapabilities) -> Self {
+        let mut b1: u8 = 0b0000_0000;
+        let mut b2: u8 = 0b0000_0000;
+        let mut b3: u8 = 0b0000_0000;
+        let mut b4: u8;
+
+        set_bit!(b1, 7, tag_9f6e.contact_mode_supported);
+        set_bit!(b1, 6, tag_9f6e.contactless_mag_stripe_mode_supported);
+        set_bit!(
+            b1,
+            5,
+            tag_9f6e.contactless_emv_full_online_mode_not_supported
+        );
+        set_bit!(
+            b1,
+            4,
+            tag_9f6e.contactless_emv_partial_online_mode_supported
+        );
+        set_bit!(b1, 3, tag_9f6e.contactless_mode_supported);
+        set_bit!(b1, 2, tag_9f6e.try_another_interface_after_decline);
+        // 1-0 RFU
+
+        set_bit!(b2, 7, tag_9f6e.mobile_cvm_supported);
+        set_bit!(b2, 6, tag_9f6e.online_pin_supported);
+        set_bit!(b2, 5, tag_9f6e.signature);
+        set_bit!(b2, 4, tag_9f6e.plaintext_offline_pin);
+        // 3-0 RFU
+
+        set_bit!(b3, 7, tag_9f6e.reader_is_offline_only);
+        set_bit!(b3, 6, tag_9f6e.cvm_required);
+        //5-0 RFU
+
+        b4 = tag_9f6e.c4_kernel_version; // bits 2-0
+        set_bit!(b4, 7, tag_9f6e.terminal_exempt_from_no_cvm_checks);
+        set_bit!(b4, 6, tag_9f6e.delayed_authorisation_terminal);
+        set_bit!(b4, 5, tag_9f6e.transit_terminal);
+        set_bit!(b4, 4, false); // RFU
+        set_bit!(b4, 3, false); // RFU
+
+        let mut value: Vec<u8> = Vec::new();
+        value.push(b1);
+        value.push(b2);
+        value.push(b3);
+        value.push(b4);
+
+        value
+    }
+}
+
 // TODO: support EMV Book 4, A2 Terminal Capabilities (a.k.a. 9F33)
 #[derive(Serialize, Deserialize)]
 pub struct Terminal {
@@ -517,6 +599,7 @@ pub struct Terminal {
     pub cryptogram_type: CryptogramType,
     pub cryptogram_type_arqc: CryptogramType,
     pub terminal_transaction_qualifiers: TerminalTransactionQualifiers,
+    pub c4_enhanced_contactless_reader_capabilities: C4EnhancedContactlessReaderCapabilities,
 }
 
 // EMV Book 3, C5 Terminal Verification Results (TVR)
@@ -928,6 +1011,16 @@ impl DataObjectList {
 
     fn push(&mut self, data_object: DataObject) {
         self.data_objects.push(data_object);
+    }
+
+    pub fn has_tag(&self, tag_name: &str) -> bool {
+        for data_object in &self.data_objects {
+            if data_object.emv_tag.tag == tag_name {
+                return true;
+            }
+        }
+
+        false
     }
 
     pub fn process_data_object_list(
@@ -1913,7 +2006,15 @@ impl EmvConnection<'_> {
                 4,
                 self.settings.terminal.capabilities.cda
             );
+        }
 
+        let cdol_list = DataObjectList::process_data_object_list(
+            self,
+            &self.get_tag_value(cdol_tag).unwrap()[..],
+        )
+        .unwrap();
+
+        if cdol_list.has_tag("9F4C") {
             // GET CHALLENGE might be needed to the 9F4C value
             if let None = self.get_tag_value("9F4C") {
                 let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
@@ -1921,12 +2022,7 @@ impl EmvConnection<'_> {
             }
         }
 
-        let cdol_data = DataObjectList::process_data_object_list(
-            self,
-            &self.get_tag_value(cdol_tag).unwrap()[..],
-        )
-        .unwrap()
-        .get_tag_list_tag_values(self);
+        let cdol_data = cdol_list.get_tag_list_tag_values(self);
         assert!(cdol_data.len() <= 0xFF);
 
         let apdu_command_generate_ac = b"\x80\xAE";
@@ -2266,6 +2362,15 @@ impl EmvConnection<'_> {
                 .terminal_transaction_qualifiers
                 .into();
             self.process_tag_as_tlv("9F66", tag_9f66_ttq);
+        }
+
+        if !self.get_tag_value("9F6E").is_some() {
+            let tag_9f6e: Vec<u8> = self
+                .settings
+                .terminal
+                .c4_enhanced_contactless_reader_capabilities
+                .into();
+            self.process_tag_as_tlv("9F6E", tag_9f6e);
         }
 
         Ok(())
@@ -3810,6 +3915,53 @@ mod tests {
         assert_eq!(track1.last_name, "******");
         assert_eq!(track1.first_name, "****");
         assert_eq!(track1.discretionary_data, "************************");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bcd_conversion() -> Result<(), ()> {
+        let empty1: Vec<u8> = [].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&empty1[..]).unwrap()).unwrap(),
+            ""
+        );
+
+        let empty2: Vec<u8> = [0xFF, 0xFF].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&empty2[..]).unwrap()).unwrap(),
+            ""
+        );
+
+        let pan1: Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x77].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&pan1[..]).unwrap()).unwrap(),
+            "4444555566667777"
+        );
+
+        let pan2: Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x78, 0xFF].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&pan2[..]).unwrap()).unwrap(),
+            "4444555566667778"
+        );
+
+        let pan3: Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x7F].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&pan3[..]).unwrap()).unwrap(),
+            "444455556666777"
+        );
+
+        let pan4: Vec<u8> = [0x44, 0x44, 0x55, 0x55, 0x66, 0x66, 0x77, 0x77, 0x88, 0x8F].to_vec();
+        assert_eq!(
+            str::from_utf8(&bcdutil::bcd_to_ascii(&pan4[..]).unwrap()).unwrap(),
+            "4444555566667777888"
+        );
+
+        let not_bcd1: Vec<u8> = [0x44, 0x44, 0xAB, 0x55].to_vec();
+        assert_eq!(bcdutil::bcd_to_ascii(&not_bcd1[..]).is_ok(), false);
+
+        let not_bcd2: Vec<u8> = [0x44, 0x44, 0xF4].to_vec();
+        assert_eq!(bcdutil::bcd_to_ascii(&not_bcd2[..]).is_ok(), false);
 
         Ok(())
     }
