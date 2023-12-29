@@ -51,6 +51,25 @@ macro_rules! serialize_yaml {
     };
 }
 
+// PCI SSC PAN truncation rules ref. https://d30000001huxdea4.my.salesforce-sites.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
+pub fn get_truncated_pan(pan: &str) -> String {
+    let uncensored_bin_prefix_length = if pan.len() > 15 { 8 } else { 6 };
+
+    let truncated_pan: String = pan
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i >= uncensored_bin_prefix_length && i < pan.len() - 4 {
+                '*'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    truncated_pan
+}
+
 #[derive(Debug, Clone)]
 pub struct Track1 {
     pub primary_account_number: String,
@@ -81,18 +100,7 @@ impl Track1 {
     }
 
     pub fn censor(&mut self) {
-        self.primary_account_number = self
-            .primary_account_number
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                if i >= 6 && i < self.primary_account_number.len() - 4 {
-                    '*'
-                } else {
-                    c
-                }
-            })
-            .collect();
+        self.primary_account_number = get_truncated_pan(&self.primary_account_number);
         self.last_name = self.last_name.replace(|_c: char| true, "*");
         self.first_name = self.first_name.replace(|_c: char| true, "*");
         self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
@@ -143,18 +151,7 @@ impl Track2 {
     }
 
     pub fn censor(&mut self) {
-        self.primary_account_number = self
-            .primary_account_number
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                if i >= 6 && i < self.primary_account_number.len() - 4 {
-                    '*'
-                } else {
-                    c
-                }
-            })
-            .collect();
+        self.primary_account_number = get_truncated_pan(&self.primary_account_number);
         self.discretionary_data = self.discretionary_data.replace(|_c: char| true, "*");
     }
 }
@@ -1501,20 +1498,8 @@ impl EmvConnection<'_> {
             if let Some(tag) = emv_tag {
                 match tag.sensitivity {
                     Some(FieldSensitivity::PrimaryAccountNumber) => {
-                        // PAN truncation rules ref. https://pcissc.secure.force.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
-                        // Going with "First 6, last 4" as it is applicable for all schemes
-                        let masked_pan: String = value
-                            .chars()
-                            .enumerate()
-                            .map(|(i, c)| {
-                                if i >= 6 && i < value.len() - 4 {
-                                    '*'
-                                } else {
-                                    c
-                                }
-                            })
-                            .collect();
-                        debug!("{}-data: {}", padding, masked_pan);
+                        let truncated_pan = get_truncated_pan(&value);
+                        debug!("{}-data: {}", padding, truncated_pan);
                     }
                     Some(FieldSensitivity::Track2) => {
                         let mut track2: Track2 =
@@ -2641,12 +2626,8 @@ impl EmvConnection<'_> {
             let pan: String =
                 String::from_utf8_lossy(&bcdutil::bcd_to_ascii(&icc_certificate_pan).unwrap())
                     .to_string();
-            let masked_pan: String = pan
-                .chars()
-                .enumerate()
-                .map(|(i, c)| if i >= 6 && i < pan.len() - 4 { '*' } else { c })
-                .collect();
-            debug!("ICC PAN:{}", masked_pan);
+            let truncated_pan = get_truncated_pan(&pan);
+            debug!("ICC PAN:{}", truncated_pan);
         } else {
             debug!("ICC PAN:{:02X?}", icc_certificate_pan);
         }
@@ -3850,7 +3831,7 @@ mod tests {
     #[test]
     fn test_track2_human_readable() -> Result<(), ()> {
         let track2_data = ";4321432143214321=2612101123456789123?";
-        let track2_data_censored = ";432143******4321=2612101************?";
+        let track2_data_censored = ";43214321****4321=2612101************?";
 
         let mut track2: Track2 = Track2::new(track2_data);
         assert_eq!(format!("{}", track2), track2_data);
@@ -3863,7 +3844,7 @@ mod tests {
 
         track2.censor();
         assert_eq!(format!("{}", track2), track2_data_censored);
-        assert_eq!(track2.primary_account_number, "432143******4321");
+        assert_eq!(track2.primary_account_number, "43214321****4321");
         assert_eq!(track2.discretionary_data, "************");
 
         Ok(())
@@ -3873,7 +3854,7 @@ mod tests {
     fn test_track2_icc() -> Result<(), ()> {
         let track2_data = "4321432143214321D2612101123456789123F";
         let track2_data_formatted = ";4321432143214321=2612101123456789123?";
-        let track2_data_censored = ";432143******4321=2612101************?";
+        let track2_data_censored = ";43214321****4321=2612101************?";
 
         let mut track2: Track2 = Track2::new(track2_data);
         assert_eq!(format!("{}", track2), track2_data_formatted);
@@ -3886,7 +3867,7 @@ mod tests {
 
         track2.censor();
         assert_eq!(format!("{}", track2), track2_data_censored);
-        assert_eq!(track2.primary_account_number, "432143******4321");
+        assert_eq!(track2.primary_account_number, "43214321****4321");
         assert_eq!(track2.discretionary_data, "************");
 
         Ok(())
@@ -3896,7 +3877,7 @@ mod tests {
     fn test_track1() -> Result<(), ()> {
         let track1_data = "%B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?";
         let track1_data_censored =
-            "%B432143******4321^******/****^2609101************************?";
+            "%B43214321****4321^******/****^2609101************************?";
 
         let mut track1: Track1 = Track1::new(track1_data);
         assert_eq!(format!("{}", track1), track1_data);
@@ -3911,7 +3892,7 @@ mod tests {
 
         track1.censor();
         assert_eq!(format!("{}", track1), track1_data_censored);
-        assert_eq!(track1.primary_account_number, "432143******4321");
+        assert_eq!(track1.primary_account_number, "43214321****4321");
         assert_eq!(track1.last_name, "******");
         assert_eq!(track1.first_name, "****");
         assert_eq!(track1.discretionary_data, "************************");
@@ -3964,5 +3945,12 @@ mod tests {
         assert_eq!(bcdutil::bcd_to_ascii(&not_bcd2[..]).is_ok(), false);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_pan_truncation() {
+        assert_eq!(get_truncated_pan("0000000000000000"), "00000000****0000");
+        assert_eq!(get_truncated_pan("000000000000000"), "000000*****0000");
+        assert_eq!(get_truncated_pan("00000000000000"), "000000****0000");
     }
 }
