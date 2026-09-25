@@ -7,12 +7,14 @@ use regex::Regex;
 use std::io::{self};
 use std::path::PathBuf;
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::{thread, time};
 
 use emvpt::*;
 
-static mut INTERACTIVE: bool = false;
-static mut PIN_OPTION: Option<String> = None;
+static INTERACTIVE: AtomicBool = AtomicBool::new(false);
+static PIN_OPTION: OnceLock<Option<String>> = OnceLock::new();
 
 pub enum ReaderError {
     ReaderConnectionFailed(String),
@@ -146,7 +148,7 @@ impl SmartCardConnection {
 }
 
 fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
-    let user_interactive = unsafe { INTERACTIVE };
+    let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
 
     if user_interactive && applications.len() > 1 {
         println!("Select payment application:");
@@ -170,11 +172,9 @@ fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvAppli
 }
 
 fn pin_entry() -> Result<String, ()> {
-    let user_interactive = unsafe { INTERACTIVE };
-    unsafe {
-        if PIN_OPTION.is_some() {
-            return Ok(PIN_OPTION.as_ref().unwrap().to_string());
-        }
+    let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
+    if let Some(Some(pin)) = PIN_OPTION.get() {
+        return Ok(pin.clone());
     }
 
     if user_interactive {
@@ -188,7 +188,7 @@ fn pin_entry() -> Result<String, ()> {
 }
 
 fn amount_entry() -> Result<u64, ()> {
-    let user_interactive = unsafe { INTERACTIVE };
+    let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
 
     if user_interactive {
         println!("Enter amount:");
@@ -253,11 +253,9 @@ fn run() -> Result<Option<String>, String> {
 
     let args = Args::parse();
 
-    unsafe {
-        INTERACTIVE = args.interactive;
-        PIN_OPTION = args.pin;
-    }
-    let user_interactive = unsafe { INTERACTIVE };
+    INTERACTIVE.store(args.interactive, Ordering::Relaxed);
+    let _ = PIN_OPTION.set(args.pin);
+    let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
     let censor_sensitive_fields = args.censor_sensitive_fields;
     let stop_after_connect = args.stop_after_connect;
     let stop_after_read = args.stop_after_read;

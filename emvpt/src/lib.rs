@@ -6,8 +6,8 @@ use log::{debug, info, trace, warn};
 use openssl::bn::BigNum;
 use openssl::rsa::{Padding, Rsa};
 use openssl::sha;
-use rand::prelude::*;
-use rand::Rng;
+use rand::rngs::SysRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1615,7 +1615,8 @@ impl EmvConnection<'_> {
             }
             None => {
                 get_processing_options_command.push(0x02); // lc
-                get_processing_options_command.push(0x83); // data
+                get_processing_options_command.push(0x83); // tag 83
+                get_processing_options_command.push(0x00); // tag 83 length
                 get_processing_options_command.push(0x00); // le
             }
         }
@@ -1781,8 +1782,8 @@ impl EmvConnection<'_> {
 
     fn fill_random(&self, data: &mut [u8]) {
         if self.settings.terminal.use_random {
-            let mut rng = ChaCha20Rng::from_entropy();
-            rng.try_fill(data).unwrap();
+            let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng).unwrap();
+            rng.fill_bytes(data);
         }
     }
 
@@ -1840,7 +1841,7 @@ impl EmvConnection<'_> {
 
     fn handle_application_cryptogram_card_authentication(
         &mut self,
-        tag_77_data: &[u8],
+        generate_ac_response: &[u8],
         cdol_tag: &str,
     ) -> Result<(), ()> {
         //ref. EMV Book 2, 6.6.2 Dynamic Signature Verification
@@ -1906,28 +1907,19 @@ impl EmvConnection<'_> {
             checksum_data.extend_from_slice(&cdol2_data);
         }
 
-        let mut tag_77_hex_encoded = hex::encode_upper(tag_77_data);
-
-        let tag_9f4b_signed_dynamic_application_data_hex_encoded =
-            hex::encode_upper(self.get_tag_value("9F4B").unwrap());
-
-        let tag_9f4b_tlv_header_length = 4 /* tag */ + 2 /* tag length */;
-        let tag_77_part1: String = tag_77_hex_encoded
-            .drain(
-                ..tag_77_hex_encoded
-                    .find(&tag_9f4b_signed_dynamic_application_data_hex_encoded)
-                    .unwrap()
-                    - tag_9f4b_tlv_header_length,
-            )
-            .collect();
-        checksum_data.extend_from_slice(&hex::decode(&tag_77_part1).unwrap()[..]);
-
-        let tag_9f4b_whole_size = tag_9f4b_signed_dynamic_application_data_hex_encoded.len()
-            + tag_9f4b_tlv_header_length
-            + 2;
-        if tag_77_hex_encoded.len() > tag_9f4b_whole_size {
-            let tag_77_part2: String = tag_77_hex_encoded.drain(tag_9f4b_whole_size..).collect();
-            checksum_data.extend_from_slice(&hex::decode(&tag_77_part2).unwrap()[..]);
+        // Response data objects in the order they are returned, except Signed Dynamic Application Data
+        match parse_tlv(generate_ac_response).map(|tlv| tlv.value().clone()) {
+            Some(Value::Constructed(response_tlvs)) => {
+                for response_tlv in response_tlvs {
+                    if hex::encode_upper(response_tlv.tag().to_bytes()) != "9F4B" {
+                        checksum_data.extend_from_slice(&response_tlv.to_vec()[..]);
+                    }
+                }
+            }
+            _ => {
+                warn!("Could not parse GENERATE AC response template");
+                return Err(());
+            }
         }
 
         let transaction_data_hash_code_checksum = sha::sha1(&checksum_data[..]);
@@ -2046,7 +2038,7 @@ impl EmvConnection<'_> {
                 CryptogramType::TransactionCertificate
                 | CryptogramType::AuthorisationRequestCryptogram => {
                     self.handle_application_cryptogram_card_authentication(
-                        &response_data[3..],
+                        &response_data[..],
                         cdol_tag,
                     )?;
                 }
@@ -2372,7 +2364,7 @@ impl EmvConnection<'_> {
 
         let mut get_data_command = apdu_command_get_data.to_vec();
         get_data_command.extend_from_slice(tag);
-        get_data_command.push(0x05);
+        get_data_command.push(0x00); // le
 
         let (response_trailer, response_data) = self.send_apdu(&get_data_command[..]);
         if !is_success_response(&response_trailer) {
@@ -2921,7 +2913,19 @@ impl EmvConnection<'_> {
             .validate_signed_dynamic_application_data(&auth_data[..])
             .unwrap();
 
-        let tag_9f4c_icc_dynamic_number = &tag_9f4b_signed_data_decrypted_dynamic_data[1..];
+        // ICC Dynamic Data = ICC Dynamic Number length || ICC Dynamic Number, ref. EMV Book 2, 6.5.2
+        let icc_dynamic_number_length = tag_9f4b_signed_data_decrypted_dynamic_data[0] as usize;
+        if !(2..=8).contains(&icc_dynamic_number_length)
+            || tag_9f4b_signed_data_decrypted_dynamic_data.len() < 1 + icc_dynamic_number_length
+        {
+            warn!(
+                "Invalid ICC Dynamic Number length: {}",
+                icc_dynamic_number_length
+            );
+            return Err(());
+        }
+        let tag_9f4c_icc_dynamic_number =
+            &tag_9f4b_signed_data_decrypted_dynamic_data[1..1 + icc_dynamic_number_length];
         self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number.to_vec());
 
         Ok(())
