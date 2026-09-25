@@ -6,8 +6,8 @@ use log::{debug, info, trace, warn};
 use openssl::bn::BigNum;
 use openssl::rsa::{Padding, Rsa};
 use openssl::sha;
-use rand::prelude::*;
-use rand::Rng;
+use rand::rngs::SysRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1781,8 +1781,8 @@ impl EmvConnection<'_> {
 
     fn fill_random(&self, data: &mut [u8]) {
         if self.settings.terminal.use_random {
-            let mut rng = ChaCha20Rng::from_entropy();
-            rng.try_fill(data).unwrap();
+            let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng).unwrap();
+            rng.fill_bytes(data);
         }
     }
 

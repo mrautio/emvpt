@@ -14,14 +14,14 @@ jobs:
   snyk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # pin@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
       - name: Build a Docker image
         run: docker build -t emvpt .
       - name: Run Snyk to check Docker image for vulnerabilities
         # Snyk can be used to break the build when it detects vulnerabilities.
         # In this case we want to upload the issues to GitHub Code Scanning
         continue-on-error: true
-        uses: snyk/actions/docker@14818c4695ecc4045f33c9cee9e795a788711ca4 # pin@master
+        uses: snyk/actions/docker@9adf32b1121593767fc3c057af55b55db032dc04 # pin@v1.0.0
         env:
           # In order to use the Snyk Action you will need to have a Snyk API token.
           # More details in https://github.com/snyk/actions#getting-your-snyk-token
@@ -31,6 +31,6 @@ jobs:
           image: emvpt
           args: --file=Dockerfile
       - name: Upload result to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@e095058bfa09de8070f94e98f5dc059531bc6235 # pin@v1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # pin@v4.38.2
         with:
           sarif_file: snyk.sarif

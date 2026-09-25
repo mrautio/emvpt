@@ -11,17 +11,17 @@ jobs:
 
     steps:
       - run: sudo apt-get install -y libpcsclite-dev
-      - uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # pin@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           submodules: true
-      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # pin@v1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pin@stable
         with:
           toolchain: stable
       - run: cargo install cargo-edit cargo-audit
       - run: cd emvpt && cargo upgrade && cargo update && cargo test
       - run: cd terminalsimulator && cargo upgrade && cargo update && cargo test
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@67df31e08a133c6a77008b89689677067fef169e # pin@v3
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # pin@v8.1.1
         with:
           title: Update dependencies
           commit-message: Update dependencies
