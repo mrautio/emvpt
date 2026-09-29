@@ -18,6 +18,7 @@ use std::error;
 use std::fmt;
 use std::fs::{self};
 use std::str;
+use std::time::Instant;
 
 pub mod bcdutil;
 
@@ -399,6 +400,9 @@ pub struct Icc {
     pub icc_pk: Option<RsaPublicKey>,
     pub icc_pin_pk: Option<RsaPublicKey>,
     pub data_authentication: Option<Vec<u8>>,
+    // Terminal Relay Resistance Entropy || Device Relay Resistance Entropy || Min Time For Processing Relay Resistance APDU ||
+    // Max Time For Processing Relay Resistance APDU || Device Estimated Transmission Time For Relay Resistance R-APDU
+    pub relay_resistance_data: Option<Vec<u8>>,
 }
 
 impl Icc {
@@ -434,6 +438,7 @@ impl Icc {
             icc_pk: None,
             icc_pin_pk: None,
             data_authentication: None,
+            relay_resistance_data: None,
         }
     }
 }
@@ -599,6 +604,25 @@ pub struct Terminal {
     pub c4_enhanced_contactless_reader_capabilities: C4EnhancedContactlessReaderCapabilities,
 }
 
+// EMV Contactless Book C-2, Terminal Verification Results (TVR) byte 5 bits 2-1: Relay resistance performed
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Default, PartialEq)]
+pub enum RelayResistancePerformed {
+    #[default]
+    NotSupported = 0b00,
+    NotPerformed = 0b01,
+    Performed = 0b10,
+}
+
+impl From<u8> for RelayResistancePerformed {
+    fn from(bits: u8) -> Self {
+        match bits & 0b11 {
+            0b01 => RelayResistancePerformed::NotPerformed,
+            0b10 => RelayResistancePerformed::Performed,
+            _ => RelayResistancePerformed::NotSupported,
+        }
+    }
+}
+
 // EMV Book 3, C5 Terminal Verification Results (TVR)
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct TerminalVerificationResults {
@@ -646,10 +670,14 @@ pub struct TerminalVerificationResults {
     pub default_tdol_used: bool,
     pub issuer_authentication_failed: bool,
     pub script_processing_failed_before_final_generate_ac: bool,
-    pub script_processing_failed_after_final_generate_ac: bool, //RFU
-                                                                //RFU
-                                                                //RFU
-                                                                //RFU
+    pub script_processing_failed_after_final_generate_ac: bool,
+    // EMV Contactless Book C-2 Kernel 2, RFU in EMV Book 3
+    #[serde(default)]
+    pub relay_resistance_threshold_exceeded: bool,
+    #[serde(default)]
+    pub relay_resistance_time_limits_exceeded: bool,
+    #[serde(default)]
+    pub relay_resistance_performed: RelayResistancePerformed,
 }
 
 impl TerminalVerificationResults {
@@ -781,6 +809,23 @@ impl TerminalVerificationResults {
         {
             return true;
         }
+        if tvr.relay_resistance_threshold_exceeded
+            && (iac.relay_resistance_threshold_exceeded || tac.relay_resistance_threshold_exceeded)
+        {
+            return true;
+        }
+        if tvr.relay_resistance_time_limits_exceeded
+            && (iac.relay_resistance_time_limits_exceeded
+                || tac.relay_resistance_time_limits_exceeded)
+        {
+            return true;
+        }
+        if tvr.relay_resistance_performed as u8
+            & (iac.relay_resistance_performed as u8 | tac.relay_resistance_performed as u8)
+            != 0
+        {
+            return true;
+        }
 
         false
     }
@@ -821,6 +866,9 @@ impl From<Vec<u8>> for TerminalVerificationResults {
             issuer_authentication_failed: get_bit!(b5, 6),
             script_processing_failed_before_final_generate_ac: get_bit!(b5, 5),
             script_processing_failed_after_final_generate_ac: get_bit!(b5, 4),
+            relay_resistance_threshold_exceeded: get_bit!(b5, 3),
+            relay_resistance_time_limits_exceeded: get_bit!(b5, 2),
+            relay_resistance_performed: RelayResistancePerformed::from(b5),
         }
     }
 }
@@ -879,6 +927,9 @@ impl From<TerminalVerificationResults> for Vec<u8> {
         set_bit!(b5, 6, tvr.issuer_authentication_failed);
         set_bit!(b5, 5, tvr.script_processing_failed_before_final_generate_ac);
         set_bit!(b5, 4, tvr.script_processing_failed_after_final_generate_ac);
+        set_bit!(b5, 3, tvr.relay_resistance_threshold_exceeded);
+        set_bit!(b5, 2, tvr.relay_resistance_time_limits_exceeded);
+        b5 |= tvr.relay_resistance_performed as u8;
 
         let mut output: Vec<u8> = Vec::new();
         output.push(b1);
@@ -1635,6 +1686,11 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
+        // ref. EMV Contactless Book C-2, 3.10 Relay Resistance Protocol is performed before reading the records
+        if self.contactless {
+            self.handle_relay_resistance_protocol()?;
+        }
+
         let tag_94_afl = self.get_tag_value("94").unwrap().clone();
 
         debug!("Read card Application File Locator (AFL) information:");
@@ -1755,6 +1811,77 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    /// Relay Resistance Protocol (EMV Contactless Book C-2, 3.10 and 5.3) when the ICC supports it in AIP byte 2 bit 1.
+    /// The Unpredictable Number is used as the Terminal Relay Resistance Entropy. 'Relay resistance time limits exceeded' is
+    /// set in TVR when the measured processing time less the Device Estimated Transmission Time exceeds the Max Time.
+    /// C-2 retries, grace periods and accuracy threshold checks are not implemented.
+    pub fn handle_relay_resistance_protocol(&mut self) -> Result<(), ()> {
+        self.icc.relay_resistance_data = None;
+
+        let tag_82_aip = self.get_tag_value("82").unwrap();
+        if tag_82_aip.len() < 2 || !get_bit!(tag_82_aip[1], 0) {
+            self.settings.terminal.tvr.relay_resistance_performed =
+                RelayResistancePerformed::NotPerformed;
+            return Ok(());
+        }
+
+        debug!("EXCHANGE RELAY RESISTANCE DATA:");
+
+        let terminal_relay_resistance_entropy = self.get_tag_value("9F37").unwrap().clone();
+
+        let mut exchange_relay_resistance_data_command = b"\x80\xEA\x00\x00\x04".to_vec();
+        exchange_relay_resistance_data_command
+            .extend_from_slice(&terminal_relay_resistance_entropy[..]);
+        exchange_relay_resistance_data_command.push(0x00);
+
+        let start = Instant::now();
+        let (response_trailer, response_data) =
+            self.send_apdu(&exchange_relay_resistance_data_command);
+        let elapsed = start.elapsed();
+
+        if !is_success_response(&response_trailer) {
+            warn!("Could not exchange relay resistance data");
+            return Err(());
+        }
+
+        // Response Message Template Format 1: Device Relay Resistance Entropy (4) || Min Time (2) || Max Time (2) ||
+        // Device Estimated Transmission Time For Relay Resistance R-APDU (2)
+        if response_data.len() != 12 || response_data[0] != 0x80 || response_data[1] != 0x0A {
+            warn!("Unrecognized relay resistance data response");
+            return Err(());
+        }
+
+        let max_time = u16::from_be_bytes([response_data[8], response_data[9]]) as u128;
+        let device_estimated_transmission_time =
+            u16::from_be_bytes([response_data[10], response_data[11]]) as u128;
+
+        // Times are in units of hundreds of microseconds
+        let measured_processing_time =
+            (elapsed.as_micros() / 100).saturating_sub(device_estimated_transmission_time);
+        if measured_processing_time > max_time {
+            warn!(
+                "Relay resistance time limits exceeded: {} > {} (x 100 us)",
+                measured_processing_time, max_time
+            );
+            self.settings
+                .terminal
+                .tvr
+                .relay_resistance_time_limits_exceeded = true;
+        } else {
+            debug!(
+                "Relay resistance processing time: {} <= {} (x 100 us)",
+                measured_processing_time, max_time
+            );
+        }
+
+        let mut relay_resistance_data = terminal_relay_resistance_entropy;
+        relay_resistance_data.extend_from_slice(&response_data[2..]);
+        self.icc.relay_resistance_data = Some(relay_resistance_data);
+        self.settings.terminal.tvr.relay_resistance_performed = RelayResistancePerformed::Performed;
+
+        Ok(())
+    }
+
     pub fn handle_verify_plaintext_pin(&mut self, ascii_pin: &[u8]) -> Result<(), ()> {
         debug!("Verify plaintext PIN:");
 
@@ -1865,6 +1992,20 @@ impl EmvConnection<'_> {
             &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + 8];
         i += 8;
         let transaction_data_hash_code = &tag_9f4b_signed_data_decrypted_dynamic_data[i..i + 20];
+        i += 20;
+
+        // ref. EMV Contactless Book C-2, Table 6.8 ICC Dynamic Data includes the relay resistance data when RRP was performed
+        if let Some(relay_resistance_data) = &self.icc.relay_resistance_data {
+            let icc_relay_resistance_data =
+                tag_9f4b_signed_data_decrypted_dynamic_data.get(i..i + relay_resistance_data.len());
+            if icc_relay_resistance_data != Some(&relay_resistance_data[..]) {
+                warn!(
+                    "Relay resistance data mismatch in CDA! Exchanged:{:02X?}, ICC Dynamic Data:{:02X?}",
+                    relay_resistance_data, icc_relay_resistance_data
+                );
+                return Err(());
+            }
+        }
 
         let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
 
@@ -3830,6 +3971,26 @@ mod tests {
         assert_eq!(&static_data_authentication_list_output[..], tag_82_data);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_tvr_relay_resistance() {
+        let tvr = TerminalVerificationResults::from(b"\x00\x00\x00\x00\x06".to_vec());
+        assert!(!tvr.relay_resistance_threshold_exceeded);
+        assert!(tvr.relay_resistance_time_limits_exceeded);
+        assert_eq!(
+            tvr.relay_resistance_performed,
+            RelayResistancePerformed::Performed
+        );
+        assert_eq!(Vec::<u8>::from(tvr), b"\x00\x00\x00\x00\x06".to_vec());
+
+        let tvr = TerminalVerificationResults::from(b"\x00\x00\x00\x00\x09".to_vec());
+        assert!(tvr.relay_resistance_threshold_exceeded);
+        assert_eq!(
+            tvr.relay_resistance_performed,
+            RelayResistancePerformed::NotPerformed
+        );
+        assert_eq!(Vec::<u8>::from(tvr), b"\x00\x00\x00\x00\x09".to_vec());
     }
 
     #[test]
