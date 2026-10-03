@@ -190,6 +190,17 @@ impl From<CryptogramType> for u8 {
     }
 }
 
+impl CryptogramType {
+    // EMV Book 3, 9.3: responses in hierarchical order, TC being the highest and AAC the lowest
+    fn level(self) -> u8 {
+        match self {
+            CryptogramType::ApplicationAuthenticationCryptogram => 0,
+            CryptogramType::AuthorisationRequestCryptogram => 1,
+            CryptogramType::TransactionCertificate => 2,
+        }
+    }
+}
+
 impl TryFrom<u8> for CryptogramType {
     type Error = &'static str;
 
@@ -600,8 +611,30 @@ pub struct Terminal {
     pub tsi: TransactionStatusInformation,
     pub cryptogram_type: CryptogramType,
     pub cryptogram_type_arqc: CryptogramType,
+    // Authorisation Response Codes (tag '8A', an 2) of the authorisation response that approve the transaction online. EMV Book 4,
+    // A6 does not define the value of 'Online approved', it is acquirer specific. Without the list the second GENERATE AC requests
+    // cryptogram_type_arqc.
+    #[serde(default)]
+    pub online_approved_authorisation_response_codes: Option<Vec<String>>,
     pub terminal_transaction_qualifiers: TerminalTransactionQualifiers,
     pub c4_enhanced_contactless_reader_capabilities: C4EnhancedContactlessReaderCapabilities,
+    #[serde(default)]
+    pub protocol_deviations: ProtocolDeviations,
+}
+
+// Terminal behaviour that deviates from the specifications, for example to see what a card does with a non-compliant terminal.
+// All deviations are disabled by default.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy)]
+pub struct ProtocolDeviations {
+    // Accept a GENERATE AC response with a higher cryptogram type than requested, EMV Book 3, 9.3 treats it as an ICC logic error
+    #[serde(default)]
+    pub accept_higher_cryptogram_type: bool,
+    // Send EXTERNAL AUTHENTICATE although the AIP does not indicate issuer authentication support (EMV Book 3, 10.9)
+    #[serde(default)]
+    pub external_authenticate_without_aip_support: bool,
+    // Offline PIN verification with VERIFY in a Kernel 2 transaction, EMV Contactless Book C-2 has no VERIFY command
+    #[serde(default)]
+    pub kernel_2_offline_pin: bool,
 }
 
 // EMV Contactless Book C-2, Terminal Verification Results (TVR) byte 5 bits 2-1: Relay resistance performed
@@ -1161,6 +1194,8 @@ pub struct EmvConnection<'a> {
     pub tags: HashMap<String, Vec<u8>>,
     pub interface: Option<&'a dyn ApduInterface>,
     pub contactless: bool,
+    // Kernel Identifier of the selected contactless application
+    pub kernel_identifier: Option<Vec<u8>>,
     emv_tags: HashMap<String, EmvTag>,
     constants: Constants,
     pub settings: Settings,
@@ -1192,6 +1227,7 @@ impl EmvConnection<'_> {
             icc: Icc::new(),
             interface: None,
             contactless: false,
+            kernel_identifier: None,
             pin_callback: None,
             amount_callback: None,
             pse_application_select_callback: None,
@@ -2088,19 +2124,45 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
-    fn validate_ac(&self, requested_cryptogram_type: CryptogramType) -> Result<CryptogramType, ()> {
-        if let CryptogramType::ApplicationAuthenticationCryptogram = requested_cryptogram_type {
-            warn!("Transaction declined by terminal (AAC)");
-            return Err(());
-        }
-
+    // EMV Book 3, 9.3: the ICC responds with the requested cryptogram type or a lower one. A higher one is an ICC logic error,
+    // the transaction is terminated after the first GENERATE AC and the cryptogram is treated as an AAC after the second one.
+    fn validate_ac(
+        &self,
+        requested_cryptogram_type: CryptogramType,
+        second_generate_ac: bool,
+    ) -> Result<CryptogramType, ()> {
         let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
-        let icc_cryptogram_type =
+        let mut icc_cryptogram_type =
             CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
 
+        if icc_cryptogram_type.level() > requested_cryptogram_type.level() {
+            if self
+                .settings
+                .terminal
+                .protocol_deviations
+                .accept_higher_cryptogram_type
+            {
+                warn!(
+                    "ICC logic error: {:?} requested but {:?} returned, accepted as a protocol deviation",
+                    requested_cryptogram_type, icc_cryptogram_type
+                );
+            } else if second_generate_ac {
+                warn!(
+                    "ICC logic error: {:?} requested but {:?} returned, treated as an AAC",
+                    requested_cryptogram_type, icc_cryptogram_type
+                );
+                icc_cryptogram_type = CryptogramType::ApplicationAuthenticationCryptogram;
+            } else {
+                warn!(
+                    "ICC logic error: {:?} requested but {:?} returned, transaction terminated",
+                    requested_cryptogram_type, icc_cryptogram_type
+                );
+                return Err(());
+            }
+        }
+
         if let CryptogramType::ApplicationAuthenticationCryptogram = icc_cryptogram_type {
-            warn!("Transaction declined by ICC (AAC)");
-            return Err(());
+            info!("Transaction declined by ICC (AAC)");
         }
 
         let _tag_9f36_application_transaction_counter = self.get_tag_value("9F36").unwrap();
@@ -2116,6 +2178,7 @@ impl EmvConnection<'_> {
         &mut self,
         requested_cryptogram_type: CryptogramType,
         cdol_tag: &str,
+        second_generate_ac: bool,
     ) -> Result<CryptogramType, ()> {
         let mut p1_reference_control_parameter: u8 = requested_cryptogram_type.into();
         if self.icc.capabilities.cda {
@@ -2132,14 +2195,8 @@ impl EmvConnection<'_> {
         )
         .unwrap();
 
-        if cdol_list.has_tag("9F4C") {
-            // GET CHALLENGE might be needed to the 9F4C value
-            if let None = self.get_tag_value("9F4C") {
-                let tag_9f4c_icc_dynamic_number = self.handle_get_challenge().unwrap();
-                self.process_tag_as_tlv("9F4C", tag_9f4c_icc_dynamic_number);
-            }
-        }
-
+        // ICC Dynamic Number (9F4C) is known only after DDA, otherwise it is zero filled like any data object that the terminal
+        // does not have (EMV Book 3, 5.4). GET CHALLENGE is for the offline PIN encipherment only (EMV Book 2, 7.2).
         let cdol_data = cdol_list.get_tag_list_tag_values(self);
         assert!(cdol_data.len() <= 0xFF);
 
@@ -2187,7 +2244,7 @@ impl EmvConnection<'_> {
             }
         }
 
-        self.validate_ac(requested_cryptogram_type)
+        self.validate_ac(requested_cryptogram_type, second_generate_ac)
     }
 
     pub fn handle_1st_generate_ac(&mut self) -> Result<CryptogramType, ()> {
@@ -2197,19 +2254,12 @@ impl EmvConnection<'_> {
         if self.contactless && self.get_tag_value("9F26").is_some() {
             debug!("Application Cryptogram returned in GET PROCESSING OPTIONS");
             // ref. EMV Contactless Book C-3, A.2 Data Elements by Name - cryptogram returned in GET PROCESSING OPTIONS (Kernel 3, Visa)
-            icc_cryptogram_type = self.validate_ac(self.settings.terminal.cryptogram_type)?;
-        } else {
             icc_cryptogram_type =
-                self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C")?;
-
-            if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
-                // handle_2nd_generate_ac needed
-            } else if let CryptogramType::AuthorisationRequestCryptogram =
-                self.settings.terminal.cryptogram_type
-            {
-                warn!("Transaction terminated by terminal - ARQC requested but got unexpected return type from ICC");
-                return Err(());
-            }
+                self.validate_ac(self.settings.terminal.cryptogram_type, false)?;
+        } else {
+            // ARQC continues with online processing and handle_2nd_generate_ac
+            icc_cryptogram_type =
+                self.send_generate_ac(self.settings.terminal.cryptogram_type, "8C", false)?;
         }
 
         Ok(icc_cryptogram_type)
@@ -2218,15 +2268,37 @@ impl EmvConnection<'_> {
     pub fn handle_2nd_generate_ac(&mut self) -> Result<CryptogramType, ()> {
         debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
 
-        let icc_cryptogram_type =
-            self.send_generate_ac(self.settings.terminal.cryptogram_type_arqc, "8D")?;
+        // EMV Book 4, 6.3.8 and 12.2.1: the terminal decides from the Authorisation Response Code whether to accept or decline the
+        // transaction and requests a TC or an AAC. 'Y3' and 'Z3' are 'Unable to go online, offline approved / declined' (Book 4, A6).
+        let requested_cryptogram_type = match (
+            self.get_tag_value("8A"),
+            &self
+                .settings
+                .terminal
+                .online_approved_authorisation_response_codes,
+        ) {
+            (Some(arc), _) if &arc[..] == b"Y3" => CryptogramType::TransactionCertificate,
+            (Some(arc), _) if &arc[..] == b"Z3" => {
+                CryptogramType::ApplicationAuthenticationCryptogram
+            }
+            (Some(arc), Some(approved)) => {
+                if approved.iter().any(|code| code.as_bytes() == &arc[..]) {
+                    CryptogramType::TransactionCertificate
+                } else {
+                    CryptogramType::ApplicationAuthenticationCryptogram
+                }
+            }
+            _ => self.settings.terminal.cryptogram_type_arqc,
+        };
 
-        if let CryptogramType::TransactionCertificate = icc_cryptogram_type {
-            return Ok(icc_cryptogram_type);
+        // EMV Book 3, 9.3: the ICC responds to the second GENERATE AC with either a TC or an AAC
+        let icc_cryptogram_type = self.send_generate_ac(requested_cryptogram_type, "8D", true)?;
+        if let CryptogramType::AuthorisationRequestCryptogram = icc_cryptogram_type {
+            warn!("Transaction has unexpected return type from ICC");
+            return Err(());
         }
 
-        warn!("Transaction has unexpected return type from ICC");
-        Err(())
+        Ok(icc_cryptogram_type)
     }
 
     fn read_record(&mut self, short_file_identifier: u8, record_index: u8) -> Option<Vec<u8>> {
@@ -2313,6 +2385,7 @@ impl EmvConnection<'_> {
                                     aid: tag_4f_aid.clone(),
                                     label: tag_50_label.to_vec(),
                                     priority: tag_87_priority.to_vec(),
+                                    kernel_identifier: self.get_tag_value("9F2A").cloned(),
                                 });
 
                                 // TODO: Since in NFC we're interested only of a single application
@@ -2374,6 +2447,7 @@ impl EmvConnection<'_> {
                                             aid: tag_4f_aid.clone(),
                                             label: tag_50_label.clone(),
                                             priority: tag_87_priority.clone(),
+                                            kernel_identifier: None,
                                         });
                                     } else {
                                         debug!(
@@ -2417,6 +2491,7 @@ impl EmvConnection<'_> {
             );
             return Err(());
         }
+        self.kernel_identifier = application.kernel_identifier.clone();
 
         Ok(())
     }
@@ -3092,6 +3167,19 @@ impl EmvConnection<'_> {
         .parse::<u32>()
         .unwrap();
 
+        // EMV Contactless Book C-2, 5: Kernel 2 has no VERIFY command, so offline PIN is not supported in a Kernel 2 transaction.
+        // Kernel 2 is identified by Kernel Identifier '02' of the PPSE directory entry.
+        let kernel_2 = self.contactless && self.kernel_identifier.as_deref() == Some(&[0x02][..]);
+        let offline_pin_supported = !kernel_2
+            || self
+                .settings
+                .terminal
+                .protocol_deviations
+                .kernel_2_offline_pin;
+        if kernel_2 && offline_pin_supported {
+            warn!("Offline PIN in a Kernel 2 transaction, a protocol deviation");
+        }
+
         let cvm_rules = self.icc.cvm_rules.clone();
         for rule in cvm_rules {
             let mut skip_if_not_supported = false;
@@ -3152,14 +3240,22 @@ impl EmvConnection<'_> {
                         _ => false,
                     };
 
-                    let ascii_pin = self.pin_callback.unwrap()()?;
+                    if !offline_pin_supported {
+                        debug!("Offline PIN is not supported in a Kernel 2 transaction");
 
-                    if enciphered_pin && self.settings.terminal.capabilities.enciphered_pin {
+                        if skip_if_not_supported {
+                            continue;
+                        }
+
+                        success = false;
+                    } else if enciphered_pin && self.settings.terminal.capabilities.enciphered_pin {
+                        let ascii_pin = self.pin_callback.unwrap()()?;
                         success = match self.handle_verify_enciphered_pin(ascii_pin.as_bytes()) {
                             Ok(_) => true,
                             Err(_) => false,
                         };
                     } else if self.settings.terminal.capabilities.plaintext_pin {
+                        let ascii_pin = self.pin_callback.unwrap()()?;
                         success = match self.handle_verify_plaintext_pin(ascii_pin.as_bytes()) {
                             Ok(_) => true,
                             Err(_) => false,
@@ -3335,25 +3431,39 @@ impl EmvConnection<'_> {
         // ref. EMV 4.3 Book 3 - 10.9 Online Processing
         // ref. EMV 4.3 Book 3 - 6.5.4 EXTERNAL AUTHENTICATE Command-Response APDUs
 
-        let tag_91_issuer_authentication_data = self.get_tag_value("91");
-        if !self.icc.capabilities.issuer_authentication
-            && tag_91_issuer_authentication_data.is_none()
-        {
-            return Ok(());
+        let tag_91_issuer_authentication_data = match self.get_tag_value("91") {
+            Some(data) => data.clone(),
+            None => return Ok(()),
+        };
+
+        // Without issuer authentication in the AIP the ICC has combined issuer authentication with the GENERATE AC command,
+        // and the terminal shall not execute the EXTERNAL AUTHENTICATE command
+        if !self.icc.capabilities.issuer_authentication {
+            if !self
+                .settings
+                .terminal
+                .protocol_deviations
+                .external_authenticate_without_aip_support
+            {
+                return Ok(());
+            }
+            warn!("EXTERNAL AUTHENTICATE without issuer authentication in the AIP, a protocol deviation");
         }
 
         debug!("Validating issuer authentication data");
-        // TODO: call external authenticate
         let apdu_command_external_authenticate = b"\x00\x82\x00\x00"; // EXTERNAL AUTHENTICATE
         let mut external_authenticate_command = apdu_command_external_authenticate.to_vec();
-        external_authenticate_command.push(tag_91_issuer_authentication_data.unwrap().len() as u8);
-        external_authenticate_command
-            .extend_from_slice(&tag_91_issuer_authentication_data.unwrap()[..]);
+        external_authenticate_command.push(tag_91_issuer_authentication_data.len() as u8);
+        external_authenticate_command.extend_from_slice(&tag_91_issuer_authentication_data[..]);
 
         let (response_trailer, _response_data) = self.send_apdu(&external_authenticate_command);
         if !is_success_response(&response_trailer) {
             self.settings.terminal.tvr.issuer_authentication_failed = true;
         }
+        self.settings
+            .terminal
+            .tsi
+            .issuer_authentication_was_performed = true;
 
         Ok(())
     }
@@ -3364,6 +3474,8 @@ pub struct EmvApplication {
     pub aid: Vec<u8>,
     pub label: Vec<u8>,
     pub priority: Vec<u8>,
+    // Kernel Identifier (tag '9F2A') of the PPSE directory entry, EMV Contactless Book B
+    pub kernel_identifier: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Copy, Clone)]

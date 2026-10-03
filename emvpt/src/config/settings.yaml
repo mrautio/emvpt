@@ -81,6 +81,18 @@ terminal:
     c4_kernel_version: 3
   cryptogram_type: 'AuthorisationRequestCryptogram'
   cryptogram_type_arqc: 'TransactionCertificate'
+  # Authorisation Response Codes (tag '8A') that approve the transaction online, the second GENERATE AC requests a TC for them and an
+  # AAC for other codes. The value of 'Online approved' is acquirer specific (EMV Book 4, A6), '00' is approved in ISO 8583.
+  # 'Y3' and 'Z3' (unable to go online, offline approved / declined) are always handled. Without the list cryptogram_type_arqc is used.
+  #online_approved_authorisation_response_codes: ['00']
+  # Terminal behaviour that deviates from the specifications, all disabled by default
+  protocol_deviations:
+    # Accept a higher cryptogram type than requested in GENERATE AC (EMV Book 3, 9.3: ICC logic error)
+    accept_higher_cryptogram_type: false
+    # EXTERNAL AUTHENTICATE although the AIP does not indicate issuer authentication (EMV Book 3, 10.9)
+    external_authenticate_without_aip_support: false
+    # Offline PIN with VERIFY in a Kernel 2 transaction (EMV Contactless Book C-2 has no VERIFY command)
+    kernel_2_offline_pin: false
 default_tags:
   '9F1A': '0246'
   '5F2A': 0978
