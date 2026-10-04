@@ -52,6 +52,16 @@ macro_rules! serialize_yaml {
     };
 }
 
+/// Three digit numeric code (n3) of a two byte BCD value, e.g. a country code '0246' is 246
+fn numeric_code(value: &[u8]) -> String {
+    let code = hex::encode_upper(value);
+    if code.len() == 4 && code.starts_with('0') {
+        code[1..].to_string()
+    } else {
+        code
+    }
+}
+
 // PCI SSC PAN truncation rules ref. https://d30000001huxdea4.my.salesforce-sites.com/faq/articles/Frequently_Asked_Question/What-are-acceptable-formats-for-truncation-of-primary-account-numbers
 pub fn get_truncated_pan(pan: &str) -> String {
     let uncensored_bin_prefix_length = if pan.len() > 15 { 8 } else { 6 };
@@ -1150,6 +1160,43 @@ impl DataObjectList {
         Ok(dol)
     }
 
+    /// EMV Book 3, 5.4: a value longer than its DOL entry is truncated keeping the leftmost bytes, the rightmost bytes of numeric
+    /// (n) data. A shorter value is padded, numeric (n) data with leading hexadecimal zeros, compressed numeric (cn) data with
+    /// trailing hexadecimal 'F's and other data with trailing hexadecimal zeros.
+    fn fit_value(value: &[u8], length: usize, format: Option<FieldFormat>) -> Vec<u8> {
+        let numeric = matches!(
+            format,
+            Some(FieldFormat::Numeric)
+                | Some(FieldFormat::NumericCountryCode)
+                | Some(FieldFormat::NumericCurrencyCode)
+                | Some(FieldFormat::Date)
+                | Some(FieldFormat::Time)
+                | Some(FieldFormat::ServiceCodeIso7813)
+        );
+
+        if value.len() >= length {
+            if numeric {
+                return value[value.len() - length..].to_vec();
+            }
+            return value[..length].to_vec();
+        }
+
+        let padding = length - value.len();
+        if numeric {
+            let mut result = vec![0x00; padding];
+            result.extend_from_slice(value);
+            return result;
+        }
+
+        let mut result = value.to_vec();
+        let padding_byte = match format {
+            Some(FieldFormat::CompressedNumeric) => 0xFF,
+            _ => 0x00,
+        };
+        result.resize(length, padding_byte);
+        result
+    }
+
     pub fn get_tag_list_tag_values(&self, emv_connection: &EmvConnection) -> Vec<u8> {
         let mut output: Vec<u8> = Vec::new();
         for data_object in &self.data_objects {
@@ -1166,24 +1213,25 @@ impl DataObjectList {
                 }
             };
 
-            // TODO: we need to understand tag metadata (is tag "numeric" etc) in order to properly truncate/pad the tag
             if data_object.length > 0 && value.len() != data_object.length {
-                warn!(
+                debug!(
                     "tag {:?} value length {:02X} does not match tag list value length {:02X}",
                     data_object.emv_tag.tag,
                     value.len(),
                     data_object.length
                 );
-                //return Err(());
             }
 
-            let mut len = data_object.length;
-            if len == 0 {
+            if data_object.length == 0 {
                 // at least 9F4A does not provide length information
-                len = value.len();
+                output.extend_from_slice(&value[..]);
+            } else {
+                output.extend_from_slice(&DataObjectList::fit_value(
+                    &value[..],
+                    data_object.length,
+                    data_object.emv_tag.format,
+                ));
             }
-
-            output.extend_from_slice(&value[..len]);
         }
 
         output
@@ -1453,7 +1501,7 @@ impl EmvConnection<'_> {
         );
         if let Some(tag) = emv_tag {
             match tag.format {
-                Some(FieldFormat::CompressedNumeric) => {
+                Some(FieldFormat::Numeric) | Some(FieldFormat::CompressedNumeric) => {
                     value = format!("{:02X?}", v)
                         .replace(|c: char| !(c.is_ascii_alphanumeric()), "")
                         .trim_start_matches('0')
@@ -1518,23 +1566,25 @@ impl EmvConnection<'_> {
                     );
                 }
                 Some(FieldFormat::NumericCountryCode) => {
-                    let numeric_country_code: String = format!("{:02X?}", v)
-                        .replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..]
-                        .to_string();
+                    let numeric_country_code = numeric_code(&v[..]);
                     value = format!(
                         "{} - {}",
                         numeric_country_code,
-                        self.constants.numeric_country_codes[&numeric_country_code]
+                        self.constants
+                            .numeric_country_codes
+                            .get(&numeric_country_code)
+                            .map_or("Unknown", String::as_str)
                     );
                 }
                 Some(FieldFormat::NumericCurrencyCode) => {
-                    let numeric_currency_code: String = format!("{:02X?}", v)
-                        .replace(|c: char| !(c.is_ascii_alphanumeric()), "")[1..]
-                        .to_string();
+                    let numeric_currency_code = numeric_code(&v[..]);
                     value = format!(
                         "{} - {}",
                         numeric_currency_code,
-                        self.constants.numeric_currency_codes[&numeric_currency_code]
+                        self.constants
+                            .numeric_currency_codes
+                            .get(&numeric_currency_code)
+                            .map_or("Unknown", String::as_str)
                     );
                 }
                 Some(FieldFormat::DataObjectList) => {
@@ -1727,7 +1777,14 @@ impl EmvConnection<'_> {
             self.handle_relay_resistance_protocol()?;
         }
 
-        let tag_94_afl = self.get_tag_value("94").unwrap().clone();
+        // AFL is not in a contactless GET PROCESSING OPTIONS response when the card has no records for the terminal to read
+        let tag_94_afl = match self.get_tag_value("94") {
+            Some(afl) => afl.clone(),
+            None => {
+                debug!("No Application File Locator (AFL), no records to read");
+                Vec::new()
+            }
+        };
 
         debug!("Read card Application File Locator (AFL) information:");
 
@@ -1790,10 +1847,20 @@ impl EmvConnection<'_> {
         // bit 7 = RFU
         self.icc.capabilities.sda = get_bit!(auc_b1, 6);
         self.icc.capabilities.dda = get_bit!(auc_b1, 5);
-        if get_bit!(auc_b1, 4) {
-            // Cardholder verification is supported
-
-            let tag_8e_cvm_list = self.get_tag_value("8E").unwrap().clone();
+        // Cardholder verification is supported. Without the CVM List the terminal terminates cardholder verification (EMV Book 3, 10.5).
+        let tag_8e_cvm_list = match self.get_tag_value("8E") {
+            Some(cvm_list) if get_bit!(auc_b1, 4) && cvm_list.len() >= 8 => Some(cvm_list.clone()),
+            Some(_) if get_bit!(auc_b1, 4) => {
+                warn!("Invalid CVM List");
+                None
+            }
+            None if get_bit!(auc_b1, 4) => {
+                warn!("Cardholder verification is supported but the CVM List is missing");
+                None
+            }
+            _ => None,
+        };
+        if let Some(tag_8e_cvm_list) = tag_8e_cvm_list {
             let amount1 = &tag_8e_cvm_list[0..4];
             let amount2 = &tag_8e_cvm_list[4..8];
             let amount_x = str::from_utf8(&bcdutil::bcd_to_ascii(&amount1[..]).unwrap()[..])
@@ -2013,9 +2080,8 @@ impl EmvConnection<'_> {
 
         let tag_9f37_unpredictable_number = self.get_tag_value("9F37").unwrap();
 
-        let tag_9f4b_signed_data_decrypted_dynamic_data = self
-            .validate_signed_dynamic_application_data(&tag_9f37_unpredictable_number[..])
-            .unwrap();
+        let tag_9f4b_signed_data_decrypted_dynamic_data =
+            self.validate_signed_dynamic_application_data(&tag_9f37_unpredictable_number[..])?;
         let mut i = 0;
         let icc_dynamic_number_length = tag_9f4b_signed_data_decrypted_dynamic_data[i] as usize;
         i += 1;
@@ -2189,11 +2255,11 @@ impl EmvConnection<'_> {
             );
         }
 
-        let cdol_list = DataObjectList::process_data_object_list(
-            self,
-            &self.get_tag_value(cdol_tag).unwrap()[..],
-        )
-        .unwrap();
+        let Some(cdol) = self.get_tag_value(cdol_tag) else {
+            warn!("Card Risk Management Data Object List {} missing", cdol_tag);
+            return Err(());
+        };
+        let cdol_list = DataObjectList::process_data_object_list(self, &cdol[..])?;
 
         // ICC Dynamic Number (9F4C) is known only after DDA, otherwise it is zero filled like any data object that the terminal
         // does not have (EMV Book 3, 5.4). GET CHALLENGE is for the offline PIN encipherment only (EMV Book 2, 7.2).
@@ -2619,7 +2685,16 @@ impl EmvConnection<'_> {
             return Ok(());
         }
 
-        let (issuer_pk_modulus, issuer_pk_exponent) = self.get_issuer_public_key(application)?;
+        // A key that can not be retrieved is left unset, offline data authentication then fails and the terminal sets the
+        // failure in TVR (EMV Book 3, 10.3)
+        let (issuer_pk_modulus, issuer_pk_exponent) = match self.get_issuer_public_key(application)
+        {
+            Ok(key) => key,
+            Err(_) => {
+                warn!("Issuer public key could not be retrieved");
+                return Ok(());
+            }
+        };
         self.icc.issuer_pk = Some(RsaPublicKey::new(
             &issuer_pk_modulus[..],
             &issuer_pk_exponent[..],
@@ -2632,18 +2707,22 @@ impl EmvConnection<'_> {
         let tag_9f47_icc_pk_exponent = self.get_tag_value("9F47");
         if tag_9f46_icc_pk_certificate.is_some() && tag_9f47_icc_pk_exponent.is_some() {
             let tag_9f48_icc_pk_remainder = self.get_tag_value("9F48");
-            let (icc_pk_modulus, icc_pk_exponent) = self.get_icc_public_key(
+            match self.get_icc_public_key(
                 tag_9f46_icc_pk_certificate.unwrap(),
                 tag_9f47_icc_pk_exponent.unwrap(),
                 tag_9f48_icc_pk_remainder,
                 data_authentication,
-            )?;
-            self.icc.icc_pk = Some(RsaPublicKey::new(
-                &icc_pk_modulus[..],
-                &icc_pk_exponent[..],
-                self.settings.censor_sensitive_fields,
-            ));
-            self.icc.icc_pin_pk = self.icc.icc_pk.clone();
+            ) {
+                Ok((icc_pk_modulus, icc_pk_exponent)) => {
+                    self.icc.icc_pk = Some(RsaPublicKey::new(
+                        &icc_pk_modulus[..],
+                        &icc_pk_exponent[..],
+                        self.settings.censor_sensitive_fields,
+                    ));
+                    self.icc.icc_pin_pk = self.icc.icc_pk.clone();
+                }
+                Err(_) => warn!("ICC public key could not be retrieved"),
+            }
         }
 
         let tag_9f2d_icc_pin_pk_certificate = self.get_tag_value("9F2D");
@@ -2652,18 +2731,21 @@ impl EmvConnection<'_> {
             let tag_9f2f_icc_pin_pk_remainder = self.get_tag_value("9F2F");
 
             // ICC has a separate ICC PIN Encipherement public key
-            let (icc_pin_pk_modulus, icc_pin_pk_exponent) = self.get_icc_public_key(
+            match self.get_icc_public_key(
                 tag_9f2d_icc_pin_pk_certificate.unwrap(),
                 tag_9f2e_icc_pin_pk_exponent.unwrap(),
                 tag_9f2f_icc_pin_pk_remainder,
                 data_authentication,
-            )?;
-
-            self.icc.icc_pin_pk = Some(RsaPublicKey::new(
-                &icc_pin_pk_modulus[..],
-                &icc_pin_pk_exponent[..],
-                self.settings.censor_sensitive_fields,
-            ));
+            ) {
+                Ok((icc_pin_pk_modulus, icc_pin_pk_exponent)) => {
+                    self.icc.icc_pin_pk = Some(RsaPublicKey::new(
+                        &icc_pin_pk_modulus[..],
+                        &icc_pin_pk_exponent[..],
+                        self.settings.censor_sensitive_fields,
+                    ));
+                }
+                Err(_) => warn!("ICC PIN Encipherment public key could not be retrieved"),
+            }
         }
 
         Ok(())
@@ -2680,20 +2762,46 @@ impl EmvConnection<'_> {
         );
 
         let tag_92_issuer_pk_remainder = self.get_tag_value("92");
-        let tag_9f32_issuer_pk_exponent = self.get_tag_value("9F32").unwrap();
-        let tag_90_issuer_public_key_certificate = self.get_tag_value("90").unwrap();
+        let (
+            Some(tag_9f32_issuer_pk_exponent),
+            Some(tag_90_issuer_public_key_certificate),
+            Some(tag_8f_ca_pk_index),
+        ) = (
+            self.get_tag_value("9F32"),
+            self.get_tag_value("90"),
+            self.get_tag_value("8F"),
+        )
+        else {
+            warn!("Issuer Public Key Certificate, Issuer Public Key Exponent or CA Public Key Index missing");
+            return Err(());
+        };
 
         let rid = &application.aid[0..5];
-        let tag_8f_ca_pk_index = self.get_tag_value("8F").unwrap();
 
-        let ca_pk = get_ca_public_key(&ca_data, &rid[..], &tag_8f_ca_pk_index[..]).unwrap();
+        let ca_pk = match get_ca_public_key(&ca_data, &rid[..], &tag_8f_ca_pk_index[..]) {
+            Some(ca_pk) => ca_pk,
+            None => {
+                warn!(
+                    "CA public key not found, rid:{:02X?}, index:{:02X?}",
+                    rid, tag_8f_ca_pk_index
+                );
+                return Err(());
+            }
+        };
 
-        let issuer_certificate = ca_pk
-            .public_decrypt(&tag_90_issuer_public_key_certificate[..])
-            .unwrap();
+        // EMV Book 2, 6.3: the certificate length is the CA public key modulus length
+        if tag_90_issuer_public_key_certificate.len() != ca_pk.get_key_byte_size() {
+            warn!("Issuer Public Key Certificate and CA public key length mismatch");
+            return Err(());
+        }
+
+        let issuer_certificate = ca_pk.public_decrypt(&tag_90_issuer_public_key_certificate[..])?;
         let issuer_certificate_length = issuer_certificate.len();
 
-        if issuer_certificate[1] != 0x02 {
+        if issuer_certificate[0] != 0x6A
+            || issuer_certificate[1] != 0x02
+            || issuer_certificate[issuer_certificate_length - 1] != 0xBC
+        {
             warn!(
                 "Incorrect issuer certificate type {:02X?}",
                 issuer_certificate[1]
@@ -2726,8 +2834,14 @@ impl EmvConnection<'_> {
             issuer_pk_leftmost_digits
         );
 
-        assert_eq!(issuer_certificate_hash_algorithm[0], 0x01); // SHA-1
-        assert_eq!(issuer_pk_algorithm[0], 0x01); // RSA as defined in EMV Book 2, B2.1 RSA Algorihm
+        // SHA-1 and RSA as defined in EMV Book 2, B2.1 RSA Algorithm
+        if issuer_certificate_hash_algorithm[0] != 0x01 || issuer_pk_algorithm[0] != 0x01 {
+            warn!(
+                "Unsupported issuer certificate hash algorithm {:02X?} or public key algorithm {:02X?}",
+                issuer_certificate_hash_algorithm, issuer_pk_algorithm
+            );
+            return Err(());
+        }
 
         let issuer_certificate_checksum =
             &issuer_certificate[checksum_position..checksum_position + 20];
@@ -2755,10 +2869,13 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        let tag_5a_pan = self.get_tag_value("5A").unwrap();
-        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..]).unwrap();
-        let ascii_iin = bcdutil::bcd_to_ascii(&issuer_certificate_iin).unwrap();
-        if ascii_iin != &ascii_pan[0..ascii_iin.len()] {
+        let Some(tag_5a_pan) = self.get_tag_value("5A") else {
+            warn!("PAN missing");
+            return Err(());
+        };
+        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..])?;
+        let ascii_iin = bcdutil::bcd_to_ascii(&issuer_certificate_iin)?;
+        if ascii_pan.len() < ascii_iin.len() || ascii_iin != &ascii_pan[0..ascii_iin.len()] {
             warn!(
                 "IIN mismatch! Cert IIN: {:02X?}, PAN IIN: {:02X?}",
                 ascii_iin,
@@ -2768,7 +2885,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        is_certificate_expired(&issuer_certificate_expiry[..]);
+        if is_certificate_expired(&issuer_certificate_expiry[..]) {
+            warn!("Issuer Public Key Certificate expired");
+            return Err(());
+        }
 
         let issuer_pk_leftmost_digits_length = issuer_pk_leftmost_digits
             .iter()
@@ -2806,15 +2926,23 @@ impl EmvConnection<'_> {
 
         let tag_9f46_icc_pk_certificate = icc_pk_certificate;
 
-        let icc_certificate = self
-            .icc
-            .issuer_pk
-            .as_ref()
-            .unwrap()
-            .public_decrypt(&tag_9f46_icc_pk_certificate[..])
-            .unwrap();
+        let Some(issuer_pk) = self.icc.issuer_pk.as_ref() else {
+            warn!("Issuer public key missing, can't retrieve ICC public key");
+            return Err(());
+        };
+
+        // EMV Book 2, 6.4: the certificate length is the issuer public key modulus length
+        if tag_9f46_icc_pk_certificate.len() != issuer_pk.get_key_byte_size() {
+            warn!("ICC Public Key Certificate and issuer public key length mismatch");
+            return Err(());
+        }
+
+        let icc_certificate = issuer_pk.public_decrypt(&tag_9f46_icc_pk_certificate[..])?;
         let icc_certificate_length = icc_certificate.len();
-        if icc_certificate[1] != 0x04 {
+        if icc_certificate[0] != 0x6A
+            || icc_certificate[1] != 0x04
+            || icc_certificate[icc_certificate_length - 1] != 0xBC
+        {
             warn!("Incorrect ICC certificate type {:02X?}", icc_certificate[1]);
             return Err(());
         }
@@ -2850,8 +2978,14 @@ impl EmvConnection<'_> {
             icc_certificate_pk_leftmost_digits
         );
 
-        assert_eq!(icc_certificate_hash_algo[0], 0x01); // SHA-1
-        assert_eq!(icc_certificate_pk_algo[0], 0x01); // RSA as defined in EMV Book 2, B2.1 RSA Algorihm
+        // SHA-1 and RSA as defined in EMV Book 2, B2.1 RSA Algorithm
+        if icc_certificate_hash_algo[0] != 0x01 || icc_certificate_pk_algo[0] != 0x01 {
+            warn!(
+                "Unsupported ICC certificate hash algorithm {:02X?} or public key algorithm {:02X?}",
+                icc_certificate_hash_algo, icc_certificate_pk_algo
+            );
+            return Err(());
+        }
 
         let tag_9f47_icc_pk_exponent = icc_pk_exponent;
 
@@ -2867,16 +3001,7 @@ impl EmvConnection<'_> {
 
         checksum_data.extend_from_slice(data_authentication);
 
-        if let Some(tag_9f4a_static_data_authentication_tag_list) = self.get_tag_value("9F4A") {
-            let static_data_authentication_tag_list_tag_values =
-                DataObjectList::process_data_object_list(
-                    self,
-                    &tag_9f4a_static_data_authentication_tag_list[..],
-                )
-                .unwrap()
-                .get_tag_list_tag_values(self);
-            checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
-        }
+        checksum_data.extend_from_slice(&self.static_data_authentication_tag_list_values()?);
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
 
@@ -2887,11 +3012,17 @@ impl EmvConnection<'_> {
         }
         trace!("Calculated checksum: {:02X?}", cert_checksum);
         trace!("Stored ICC checksum: {:02X?}", icc_certificate_checksum);
-        assert_eq!(cert_checksum, icc_certificate_checksum);
+        if &cert_checksum[..] != icc_certificate_checksum {
+            warn!("ICC cert checksum mismatch!");
+            return Err(());
+        }
 
-        let tag_5a_pan = self.get_tag_value("5A").unwrap();
-        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..]).unwrap();
-        let icc_ascii_pan = bcdutil::bcd_to_ascii(&icc_certificate_pan).unwrap();
+        let Some(tag_5a_pan) = self.get_tag_value("5A") else {
+            warn!("PAN missing");
+            return Err(());
+        };
+        let ascii_pan = bcdutil::bcd_to_ascii(&tag_5a_pan[..])?;
+        let icc_ascii_pan = bcdutil::bcd_to_ascii(&icc_certificate_pan)?;
         if icc_ascii_pan != ascii_pan {
             warn!(
                 "PAN mismatch! Cert PAN: {:02X?}, PAN: {:02X?}",
@@ -2901,7 +3032,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        is_certificate_expired(&icc_certificate_expiry[..]);
+        if is_certificate_expired(&icc_certificate_expiry[..]) {
+            warn!("ICC Public Key Certificate expired");
+            return Err(());
+        }
 
         let mut icc_pk_modulus: Vec<u8> = Vec::new();
 
@@ -2929,11 +3063,26 @@ impl EmvConnection<'_> {
         Ok((icc_pk_modulus, tag_9f47_icc_pk_exponent.to_vec()))
     }
 
+    /// Values of the data objects in the Static Data Authentication Tag List (9F4A), empty when the card has no tag list.
+    /// EMV Book 3, 10.3: the list may contain only the AIP.
+    fn static_data_authentication_tag_list_values(&self) -> Result<Vec<u8>, ()> {
+        match self.get_tag_value("9F4A") {
+            Some(tag_list) => Ok(
+                DataObjectList::process_data_object_list(self, &tag_list[..])?
+                    .get_tag_list_tag_values(self),
+            ),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn validate_signed_dynamic_application_data(
         &self,
         auth_data: &[u8],
     ) -> Result<Vec<u8>, ()> {
-        let tag_9f4b_signed_data = self.get_tag_value("9F4B").unwrap();
+        let Some(tag_9f4b_signed_data) = self.get_tag_value("9F4B") else {
+            warn!("Signed Dynamic Application Data missing, can't validate");
+            return Err(());
+        };
         trace!(
             "9F4B signed data result moduluslength: ({} bytes):\n{}",
             tag_9f4b_signed_data.len(),
@@ -2945,24 +3094,40 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        let tag_9f4b_signed_data_decrypted = self
-            .icc
-            .icc_pk
-            .as_ref()
-            .unwrap()
-            .public_decrypt(&tag_9f4b_signed_data[..])
-            .unwrap();
+        let icc_pk = self.icc.icc_pk.as_ref().unwrap();
+        // EMV Book 2, 6.5.2: the signed data length is the ICC public key modulus length
+        if tag_9f4b_signed_data.len() != icc_pk.get_key_byte_size() {
+            warn!("Signed Dynamic Application Data and ICC public key length mismatch");
+            return Err(());
+        }
+
+        let tag_9f4b_signed_data_decrypted = icc_pk.public_decrypt(&tag_9f4b_signed_data[..])?;
         let tag_9f4b_signed_data_decrypted_length = tag_9f4b_signed_data_decrypted.len();
-        if tag_9f4b_signed_data_decrypted[1] != 0x05 {
+        if tag_9f4b_signed_data_decrypted[0] != 0x6A
+            || tag_9f4b_signed_data_decrypted[1] != 0x05
+            || tag_9f4b_signed_data_decrypted[tag_9f4b_signed_data_decrypted_length - 1] != 0xBC
+        {
             warn!("Unrecognized format");
             return Err(());
         }
 
         let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
-        assert_eq!(tag_9f4b_signed_data_decrypted_hash_algo, 0x01);
+        if tag_9f4b_signed_data_decrypted_hash_algo != 0x01 {
+            warn!(
+                "Unsupported hash algorithm {:02X?}",
+                tag_9f4b_signed_data_decrypted_hash_algo
+            );
+            return Err(());
+        }
 
         let tag_9f4b_signed_data_decrypted_dynamic_data_length =
             tag_9f4b_signed_data_decrypted[3] as usize;
+        if 4 + tag_9f4b_signed_data_decrypted_dynamic_data_length + 21
+            > tag_9f4b_signed_data_decrypted_length
+        {
+            warn!("ICC Dynamic Data length exceeds the signed data");
+            return Err(());
+        }
 
         let tag_9f4b_signed_data_decrypted_dynamic_data = &tag_9f4b_signed_data_decrypted
             [4..4 + tag_9f4b_signed_data_decrypted_dynamic_data_length];
@@ -3005,7 +3170,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        let tag_93_ssad = self.get_tag_value("93").unwrap();
+        let Some(tag_93_ssad) = self.get_tag_value("93") else {
+            warn!("Signed Static Application Data missing");
+            return Err(());
+        };
 
         if tag_93_ssad.len() != self.icc.issuer_pk.as_ref().unwrap().get_key_byte_size() {
             warn!("SDA and issuer key mismatch");
@@ -3017,23 +3185,21 @@ impl EmvConnection<'_> {
             .issuer_pk
             .as_ref()
             .unwrap()
-            .public_decrypt(&tag_93_ssad[..])
-            .unwrap();
+            .public_decrypt(&tag_93_ssad[..])?;
 
-        assert_eq!(tag_93_ssad_decrypted[1], 0x03);
+        if tag_93_ssad_decrypted[0] != 0x6A
+            || tag_93_ssad_decrypted[1] != 0x03
+            || tag_93_ssad_decrypted[tag_93_ssad_decrypted.len() - 1] != 0xBC
+        {
+            warn!("Unrecognized Signed Static Application Data format");
+            return Err(());
+        }
 
         let mut checksum_data: Vec<u8> = Vec::new();
         checksum_data
             .extend_from_slice(&tag_93_ssad_decrypted[1..tag_93_ssad_decrypted.len() - 22]);
         checksum_data.extend_from_slice(data_authentication);
-        let static_data_authentication_tag_list_tag_values =
-            DataObjectList::process_data_object_list(
-                self,
-                &self.get_tag_value("9F4A").unwrap()[..],
-            )
-            .unwrap()
-            .get_tag_list_tag_values(self);
-        checksum_data.extend_from_slice(&static_data_authentication_tag_list_tag_values[..]);
+        checksum_data.extend_from_slice(&self.static_data_authentication_tag_list_values()?);
 
         let ssad_checksum_calculated = sha::sha1(&checksum_data[..]);
 
@@ -3066,16 +3232,17 @@ impl EmvConnection<'_> {
     pub fn handle_dynamic_data_authentication(&mut self) -> Result<(), ()> {
         let mut auth_data: Vec<u8> = Vec::new();
 
-        if let Some(tag_9f69_card_authentication_related_data) = self.get_tag_value("9F69") {
+        // fDDA is a contactless transaction, a contact transaction does DDA also when the card has Card Authentication Related Data
+        let tag_9f69 = if self.contactless {
+            self.get_tag_value("9F69")
+        } else {
+            None
+        };
+        if let Some(tag_9f69_card_authentication_related_data) = tag_9f69 {
             // ref. EMV Contactless Book C-3, Annex C Fast Dynamic Data Authentication (fDDA)
             // ref. EMV Contactless Book C-7, Annex B Fast Dynamic Data Authentication (fDDA)
 
             debug!("Perform Fast Dynamic Data Authentication (fDDA):");
-
-            if !self.contactless {
-                warn!("fDDA expected only for contactless");
-                return Err(());
-            }
 
             if tag_9f69_card_authentication_related_data[0] != 0x01 {
                 warn!(
@@ -3125,9 +3292,8 @@ impl EmvConnection<'_> {
             }
         }
 
-        let tag_9f4b_signed_data_decrypted_dynamic_data = self
-            .validate_signed_dynamic_application_data(&auth_data[..])
-            .unwrap();
+        let tag_9f4b_signed_data_decrypted_dynamic_data =
+            self.validate_signed_dynamic_application_data(&auth_data[..])?;
 
         // ICC Dynamic Data = ICC Dynamic Number length || ICC Dynamic Number, ref. EMV Book 2, 6.5.2
         let icc_dynamic_number_length = tag_9f4b_signed_data_decrypted_dynamic_data[0] as usize;
@@ -3490,6 +3656,8 @@ pub enum FieldSensitivity {
 
 #[derive(Deserialize, Serialize, Debug, Copy, Clone)]
 pub enum FieldFormat {
+    // Numeric (n) and compressed numeric (cn) data, EMV Book 3, 4.3
+    Numeric,
     CompressedNumeric,
     Binary,
     Alphanumeric,
@@ -3738,17 +3906,38 @@ pub fn get_ca_public_key<'a>(
     }
 }
 
+/// EMV Book 2, 6.3 and 6.4: a certificate is valid until the last day of the month of its Certificate Expiration Date (MMYY).
+/// An invalid date is treated as expired.
 pub fn is_certificate_expired(date_bcd: &[u8]) -> bool {
-    let today = Utc::now().date_naive();
-    let expiry_date =
-        NaiveDate::parse_from_str(&format!("01{:02X?}", date_bcd), "%d[%m, %y]").unwrap();
-    let duration = today.signed_duration_since(expiry_date).num_days();
+    let date = hex::encode(date_bcd);
+    let (Some(Ok(month)), Some(Ok(year))) = (
+        date.get(0..2).map(|m| m.parse::<u32>()),
+        date.get(2..4).map(|y| y.parse::<i32>()),
+    ) else {
+        warn!("Invalid certificate expiry date (MMYY) {:02X?}", date_bcd);
+        return true;
+    };
 
-    if duration > 30 {
+    // Two digit year as chrono %y: 00-68 is 2000-2068, 69-99 is 1969-1999
+    let year = if year < 69 { 2000 + year } else { 1900 + year };
+    let (next_month_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_day_after_expiry = match NaiveDate::from_ymd_opt(next_month_year, next_month, 1) {
+        Some(date) if month >= 1 => date,
+        _ => {
+            warn!("Invalid certificate expiry date (MMYY) {:02X?}", date_bcd);
+            return true;
+        }
+    };
+
+    let today = Utc::now().date_naive();
+    if today >= first_day_after_expiry {
         warn!(
-            "Certificate expiry date (MMYY) {:02X?} is {} days in the past",
-            date_bcd,
-            duration.to_string()
+            "Certificate expiry date (MMYY) {:02X?} is in the past",
+            date_bcd
         );
 
         return true;
@@ -4220,6 +4409,206 @@ mod tests {
 
         let not_bcd2: Vec<u8> = [0x44, 0x44, 0xF4].to_vec();
         assert_eq!(bcdutil::bcd_to_ascii(&not_bcd2[..]).is_ok(), false);
+
+        Ok(())
+    }
+
+    /// Test card of test_data.yaml with some responses replaced
+    struct ModifiedSmartCardConnection {
+        card: DummySmartCardConnection,
+        responses: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
+    impl ApduInterface for ModifiedSmartCardConnection {
+        fn send_apdu(&self, apdu: &[u8]) -> Result<Vec<u8>, ()> {
+            for (request, response) in &self.responses {
+                if &apdu[..] == &request[..] {
+                    return Ok(response.clone());
+                }
+            }
+            self.card.send_apdu(apdu)
+        }
+    }
+
+    fn modified_card(responses: Vec<(&str, &str)>) -> ModifiedSmartCardConnection {
+        ModifiedSmartCardConnection {
+            card: DummySmartCardConnection {
+                test_data_file: "test_data.yaml".to_string(),
+            },
+            responses: responses
+                .iter()
+                .map(|(req, res)| {
+                    (
+                        ApduRequestResponse::to_raw_vec(&req.to_string()),
+                        ApduRequestResponse::to_raw_vec(&res.to_string()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Response of a request in test_data.yaml
+    fn test_data_response(request: &str) -> Vec<u8> {
+        let test_data: Vec<ApduRequestResponse> =
+            serde_yaml::from_str(&fs::read_to_string("test_data.yaml").unwrap()).unwrap();
+        let request = ApduRequestResponse::to_raw_vec(&request.to_string());
+        let data = DummySmartCardConnection::find_dummy_apdu(&test_data, &request).unwrap();
+        ApduRequestResponse::to_raw_vec(&data.res)
+    }
+
+    #[test]
+    fn test_data_object_list_padding() {
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        // Numeric (n) Amount, Authorised, compressed numeric (cn) PAN, binary Issuer Authentication Data and TTQ
+        connection.process_tag_as_tlv("9F02", b"\x12\x34".to_vec());
+        connection.process_tag_as_tlv("5A", b"\x12\x34\x56\x78\x90\x12\x34\x56".to_vec());
+        connection.process_tag_as_tlv("91", b"\x11\x22\x33\x44\x55\x66\x77\x88".to_vec());
+        connection.process_tag_as_tlv("9F66", b"\x36\x00\x40\x00".to_vec());
+
+        // EMV Book 3, 5.4: shorter numeric data is padded with leading zeros, compressed numeric with trailing 'F's, others
+        // with trailing zeros
+        let dol = DataObjectList::process_data_object_list(
+            &connection,
+            b"\x9F\x02\x06\x5A\x0A\x91\x10\x9F\x66\x04",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode_upper(dol.get_tag_list_tag_values(&connection)),
+            "000000001234".to_string()
+                + "1234567890123456FFFF"
+                + "11223344556677880000000000000000"
+                + "36004000"
+        );
+
+        // Longer numeric data is truncated keeping the rightmost bytes, others keeping the leftmost bytes
+        let dol = DataObjectList::process_data_object_list(
+            &connection,
+            b"\x9F\x02\x01\x91\x04\x9F\x66\x02",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode_upper(dol.get_tag_list_tag_values(&connection)),
+            "34112233443600"
+        );
+    }
+
+    #[test]
+    fn test_certificate_expiry() {
+        assert!(is_certificate_expired(b"\x12\x20"));
+        assert!(!is_certificate_expired(b"\x12\x68"));
+
+        // Valid until the last day of the expiry month
+        let today = Utc::now().date_naive();
+        let this_month = hex::decode(today.format("%m%y").to_string()).unwrap();
+        assert!(!is_certificate_expired(&this_month));
+
+        assert!(is_certificate_expired(b"\x13\x30"));
+        assert!(is_certificate_expired(b"\x00\x30"));
+        assert!(is_certificate_expired(b"\xFF\x12"));
+    }
+
+    #[test]
+    fn test_unknown_country_code() {
+        init_logging();
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        // Issuer Country Code that is not in the constants is logged as unknown
+        connection.process_tag_as_tlv("5F28", b"\x09\x00".to_vec());
+        connection.process_tag_as_tlv("9F42", b"\x09\x99".to_vec());
+        assert_eq!(
+            connection.get_tag_value("5F28").unwrap(),
+            &b"\x09\x00".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_get_processing_options_without_afl() -> Result<(), ()> {
+        init_logging();
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        // GET PROCESSING OPTIONS response format 2 without AFL
+        let card = modified_card(vec![("00 C0 00 00 10", "77 04 82 02 00 00 90 00")]);
+        connection.interface = Some(&card);
+        setup_connection(&mut connection)?;
+
+        let application = connection.select_payment_application()?;
+        connection.start_transaction(&application)?;
+
+        assert!(connection.get_tag_value("94").is_none());
+        assert_eq!(connection.icc.data_authentication, Some(Vec::new()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_contact_dda_with_card_authentication_related_data() -> Result<(), ()> {
+        init_logging();
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let card = DummySmartCardConnection {
+            test_data_file: "test_data.yaml".to_string(),
+        };
+        connection.interface = Some(&card);
+        setup_connection(&mut connection)?;
+
+        let application = connection.select_payment_application()?;
+        connection.start_transaction(&application)?;
+
+        // Card Authentication Related Data of fDDA does not change a contact transaction to fDDA
+        connection.process_tag_as_tlv("9F69", b"\x01\x00\x00\x00\x00\x00\x00".to_vec());
+        connection.handle_offline_data_authentication()?;
+
+        assert!(!connection.settings.terminal.tvr.dda_failed);
+        assert!(connection.get_tag_value("9F4C").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_icc_certificate_mismatch() -> Result<(), ()> {
+        init_logging();
+
+        // ICC Public Key Certificate in SFI 2 record 1 with a modified byte
+        let mut record = test_data_response("00 B2 01 14 C1");
+        record[20] ^= 0x01;
+        let record = hex::encode_upper(record);
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let card = modified_card(vec![("00 B2 01 14 C1", &record)]);
+        connection.interface = Some(&card);
+        setup_connection(&mut connection)?;
+
+        let application = connection.select_payment_application()?;
+        connection.start_transaction(&application)?;
+        assert!(connection.icc.issuer_pk.is_some());
+        assert!(connection.icc.icc_pk.is_none());
+
+        // EMV Book 3, 10.3: DDA has failed
+        connection.handle_offline_data_authentication()?;
+        assert!(connection.settings.terminal.tvr.dda_failed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_ca_public_key() -> Result<(), ()> {
+        init_logging();
+
+        // Certification Authority Public Key Index '93' is not in the CA public keys
+        let record =
+            hex::encode_upper(test_data_response("00 B2 02 14 E3")).replacen("8F0192", "8F0193", 1);
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        let card = modified_card(vec![("00 B2 02 14 E3", &record)]);
+        connection.interface = Some(&card);
+        setup_connection(&mut connection)?;
+
+        let application = connection.select_payment_application()?;
+        connection.start_transaction(&application)?;
+        assert!(connection.icc.issuer_pk.is_none());
+
+        connection.handle_offline_data_authentication()?;
+        assert!(connection.settings.terminal.tvr.dda_failed);
 
         Ok(())
     }
