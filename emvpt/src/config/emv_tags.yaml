@@ -180,7 +180,7 @@
 '5F34':
   tag: '5F34'
   name: 'Application Primary Account Number (PAN) Sequence Number'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Icc'
   min: 1
   max: 1
@@ -258,7 +258,7 @@
 '9F44':
   tag: '9F44'
   name: 'Application Currency Exponent'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Icc'
   min: 1
   max: 1
@@ -277,14 +277,14 @@
 '9F02':
   tag: '9F02'
   name: 'Amount, Authorised (Numeric)'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Terminal'
   min: 6
   max: 6
 '9F03':
   tag: '9F03'
   name: 'Amount, Other (Numeric)'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Terminal'
   min: 6
   max: 6
@@ -317,7 +317,7 @@
 '9C':
   tag: '9C'
   name: 'Transaction Type'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Terminal'
   min: 1
   max: 1
@@ -395,7 +395,7 @@
 '9F35':
   tag: '9F35'
   name: 'Terminal Type'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Terminal'
   min: 1
   max: 1
@@ -437,7 +437,7 @@
 '9F11':
   tag: '9F11'
   name: 'Issuer Code Table Index'
-  format: 'CompressedNumeric'
+  format: 'Numeric'
   source: 'Icc'
   min: 1
   max: 1
