@@ -626,6 +626,10 @@ pub struct Terminal {
     // cryptogram_type_arqc.
     #[serde(default)]
     pub online_approved_authorisation_response_codes: Option<Vec<String>>,
+    // Terminal list of AIDs (hex) selected one by one when the card has no PSE / PPSE or it lists no applications, EMV Book 1,
+    // 12.3.3 Using a List of AIDs. A card application whose DF name begins with a listed AID matches partially.
+    #[serde(default)]
+    pub application_identifiers: Vec<String>,
     pub terminal_transaction_qualifiers: TerminalTransactionQualifiers,
     pub c4_enhanced_contactless_reader_capabilities: C4EnhancedContactlessReaderCapabilities,
     #[serde(default)]
@@ -1342,12 +1346,24 @@ impl EmvConnection<'_> {
     }
 
     fn send_apdu_select(&mut self, aid: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        self.send_apdu_select_occurrence(aid, false)
+    }
+
+    fn send_apdu_select_occurrence(
+        &mut self,
+        aid: &[u8],
+        next_occurrence: bool,
+    ) -> (Vec<u8>, Vec<u8>) {
         //ref. EMV Book 1, 11.3.2 Command message
         self.tags.clear();
 
         let apdu_command_select = b"\x00\xA4";
         let p1_reference_control_parameter: u8 = 0b0000_0100; // "Select by name"
-        let p2_selection_options: u8 = 0b0000_0000; // "First or only occurrence"
+        let p2_selection_options: u8 = if next_occurrence {
+            0b0000_0010 // "Next occurrence"
+        } else {
+            0b0000_0000 // "First or only occurrence"
+        };
 
         let mut select_command = apdu_command_select.to_vec();
         select_command.push(p1_reference_control_parameter);
@@ -1764,12 +1780,30 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        if response_data[0] == 0x80 {
-            self.process_tag_as_tlv("82", response_data[2..4].to_vec());
-            self.process_tag_as_tlv("94", response_data[4..].to_vec());
-        } else if response_data[0] != 0x77 {
-            warn!("Unrecognized response");
-            return Err(());
+        // ref. EMV Book 3, 6.5.8.4: Format 1 is AIP || AFL in tag '80', Format 2 includes the AIP and the AFL in tag '77'. If any
+        // mandatory data element is missing, the terminal shall terminate the transaction.
+        match response_data.first() {
+            Some(0x80) if response_data.len() >= 4 => {
+                self.process_tag_as_tlv("82", response_data[2..4].to_vec());
+                self.process_tag_as_tlv("94", response_data[4..].to_vec());
+            }
+            Some(0x77) => {}
+            _ => {
+                warn!("Unrecognized response");
+                return Err(());
+            }
+        }
+
+        match self.get_tag_value("82") {
+            Some(aip) if aip.len() == 2 => {}
+            Some(_) => {
+                warn!("Invalid Application Interchange Profile (AIP)");
+                return Err(());
+            }
+            None => {
+                warn!("Application Interchange Profile (AIP) missing");
+                return Err(());
+            }
         }
 
         // ref. EMV Contactless Book C-2, 3.10 Relay Resistance Protocol is performed before reading the records
@@ -1788,8 +1822,13 @@ impl EmvConnection<'_> {
 
         debug!("Read card Application File Locator (AFL) information:");
 
+        // AFL entries are 4 bytes each (EMV Book 3, 10.2)
+        if tag_94_afl.len() % 4 != 0 {
+            warn!("Invalid Application File Locator (AFL)");
+            return Err(());
+        }
+
         let mut data_authentication: Vec<u8> = Vec::new();
-        assert_eq!(tag_94_afl.len() % 4, 0);
         let mut records: Vec<u8> = Vec::new();
         for i in (0..tag_94_afl.len()).step_by(4) {
             let short_file_identifier: u8 = tag_94_afl[i] >> 3;
@@ -2331,12 +2370,11 @@ impl EmvConnection<'_> {
         Ok(icc_cryptogram_type)
     }
 
-    pub fn handle_2nd_generate_ac(&mut self) -> Result<CryptogramType, ()> {
-        debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
-
+    /// Terminal decision on an online authorised transaction from the Authorisation Response Code: TC to approve, AAC to decline
+    fn online_authorisation_decision(&self) -> CryptogramType {
         // EMV Book 4, 6.3.8 and 12.2.1: the terminal decides from the Authorisation Response Code whether to accept or decline the
         // transaction and requests a TC or an AAC. 'Y3' and 'Z3' are 'Unable to go online, offline approved / declined' (Book 4, A6).
-        let requested_cryptogram_type = match (
+        match (
             self.get_tag_value("8A"),
             &self
                 .settings
@@ -2355,7 +2393,26 @@ impl EmvConnection<'_> {
                 }
             }
             _ => self.settings.terminal.cryptogram_type_arqc,
-        };
+        }
+    }
+
+    /// In a contact transaction an ARQC is completed with the second GENERATE AC. A contactless transaction has only one
+    /// GENERATE AC (or the cryptogram in the GET PROCESSING OPTIONS response), an ARQC is the Online Request outcome and the
+    /// online authorisation is final (EMV Contactless Book A, Online Request Outcome). The returned type is then the terminal
+    /// decision from the Authorisation Response Code, no cryptogram is requested from the card.
+    pub fn handle_2nd_generate_ac(&mut self) -> Result<CryptogramType, ()> {
+        if self.contactless {
+            let decision = self.online_authorisation_decision();
+            debug!(
+                "No second GENERATE AC in a contactless transaction, online authorisation decides the outcome: {:?}",
+                decision
+            );
+            return Ok(decision);
+        }
+
+        debug!("Generate Application Cryptogram (GENERATE AC) - second issuance:");
+
+        let requested_cryptogram_type = self.online_authorisation_decision();
 
         // EMV Book 3, 9.3: the ICC responds to the second GENERATE AC with either a TC or an AAC
         let icc_cryptogram_type = self.send_generate_ac(requested_cryptogram_type, "8D", true)?;
@@ -2393,16 +2450,15 @@ impl EmvConnection<'_> {
     }
 
     pub fn handle_select_payment_system_environment(&mut self) -> Result<Vec<EmvApplication>, ()> {
-        debug!("Selecting Payment System Environment (PSE):");
-        let contact_pse_name = "1PAY.SYS.DDF01";
-        let contactless_pse_name = "2PAY.SYS.DDF01";
-
-        let mut pse_name = contact_pse_name;
-
-        if self.contactless {
-            self.contactless = true;
-            pse_name = contactless_pse_name;
-        }
+        // ref. EMV Book 1, Payment System Environment (PSE) and EMV Contactless Book B, Proximity Payment System
+        // Environment (PPSE)
+        let pse_name = if self.contactless {
+            debug!("Selecting Proximity Payment System Environment (PPSE):");
+            "2PAY.SYS.DDF01"
+        } else {
+            debug!("Selecting Payment System Environment (PSE):");
+            "1PAY.SYS.DDF01"
+        };
 
         let (response_trailer, response_data) = self.send_apdu_select(&pse_name.as_bytes());
         if !is_success_response(&response_trailer) {
@@ -2539,15 +2595,95 @@ impl EmvConnection<'_> {
         Ok(all_applications)
     }
 
+    /// Candidate applications from the terminal list of AIDs, ref. EMV Book 1, 12.3.3 Using a List of AIDs
+    pub fn handle_select_list_of_aids(&mut self) -> Result<Vec<EmvApplication>, ()> {
+        debug!("Selecting applications with the terminal list of AIDs:");
+
+        let mut all_applications: Vec<EmvApplication> = Vec::new();
+
+        for terminal_aid_hex in self.settings.terminal.application_identifiers.clone() {
+            let terminal_aid = match hex::decode(&terminal_aid_hex) {
+                Ok(aid) if !aid.is_empty() => aid,
+                _ => {
+                    warn!("Invalid terminal AID {:?}", terminal_aid_hex);
+                    continue;
+                }
+            };
+
+            // A card answering the same occurrence again would otherwise be selected endlessly
+            let mut selected_df_names: Vec<Vec<u8>> = Vec::new();
+            let mut next_occurrence = false;
+
+            loop {
+                let (response_trailer, _) =
+                    self.send_apdu_select_occurrence(&terminal_aid, next_occurrence);
+
+                // '6A81': the card is blocked or does not support SELECT, the card is rejected
+                if response_trailer[..] == [0x6A, 0x81] {
+                    warn!("Card blocked or SELECT not supported");
+                    return Err(());
+                }
+
+                // '6283': the application is blocked, it is not a candidate but further occurrences are still selected
+                let application_blocked = response_trailer[..] == [0x62, 0x83];
+                if !is_success_response(&response_trailer) && !application_blocked {
+                    break;
+                }
+
+                let df_name = match self.get_tag_value("84") {
+                    Some(df_name) if df_name.starts_with(&terminal_aid) => df_name.clone(),
+                    _ => {
+                        warn!(
+                            "DF name of the selected application does not match the terminal AID {:02X?}",
+                            terminal_aid
+                        );
+                        break;
+                    }
+                };
+
+                if selected_df_names.contains(&df_name) {
+                    break;
+                }
+                selected_df_names.push(df_name.clone());
+
+                if application_blocked {
+                    debug!("Skipping blocked application. AID:{:02X?}", df_name);
+                } else if !all_applications.iter().any(|a| a.aid == df_name) {
+                    let default_label = "UNKNOWN".as_bytes().to_vec();
+                    all_applications.push(EmvApplication {
+                        aid: df_name.clone(),
+                        label: self.get_tag_value("50").unwrap_or(&default_label).clone(),
+                        priority: self.get_tag_value("87").cloned().unwrap_or_default(),
+                        kernel_identifier: None,
+                    });
+                }
+
+                // An exact match is the only occurrence, a partial match may have further occurrences
+                if df_name == terminal_aid {
+                    break;
+                }
+                next_occurrence = true;
+            }
+        }
+
+        if all_applications.is_empty() {
+            warn!("No applications of the terminal list of AIDs found!");
+            return Err(());
+        }
+
+        Ok(all_applications)
+    }
+
     pub fn handle_select_payment_application(
         &mut self,
         application: &EmvApplication,
     ) -> Result<(), ()> {
         info!(
-            "Selecting application. AID:{:02X?}, label:{:?}, priority:{:02X?}",
+            "Selecting application. AID:{:02X?}, label:{:?}, priority:{:02X?}, kernel identifier:{:02X?}",
             application.aid,
             str::from_utf8(&application.label).unwrap(),
-            application.priority
+            application.priority,
+            application.kernel_identifier
         );
         let (response_trailer, _) = self.send_apdu_select(&application.aid);
         if !is_success_response(&response_trailer) {
@@ -2563,7 +2699,11 @@ impl EmvConnection<'_> {
     }
 
     pub fn select_payment_application(&mut self) -> Result<EmvApplication, ()> {
-        let applications = self.handle_select_payment_system_environment()?;
+        // EMV Book 1, 12.3.2: without a PSE, or with no applications listed in it, the terminal uses its list of AIDs
+        let applications = match self.handle_select_payment_system_environment() {
+            Ok(applications) => applications,
+            Err(_) => self.handle_select_list_of_aids()?,
+        };
 
         let application = self.pse_application_select_callback.unwrap()(&applications)?;
         self.handle_select_payment_application(&application)?;
@@ -4522,6 +4662,60 @@ mod tests {
     }
 
     #[test]
+    fn test_contactless_arqc_has_no_second_generate_ac() -> Result<(), ()> {
+        init_logging();
+
+        // Without a card interface any APDU would panic, a contactless transaction has no second GENERATE AC (no CDOL2)
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection.contactless = true;
+
+        connection.process_tag_as_tlv("8A", b"Y3".to_vec());
+        assert!(matches!(
+            connection.handle_2nd_generate_ac()?,
+            CryptogramType::TransactionCertificate
+        ));
+
+        connection.process_tag_as_tlv("8A", b"Z3".to_vec());
+        assert!(matches!(
+            connection.handle_2nd_generate_ac()?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_of_aids_without_pse() -> Result<(), ()> {
+        init_logging();
+
+        // The card has no PSE, the terminal AID 'AFFFFFFFFF' matches the card application 'AFFFFFFFFF1234' partially and
+        // 'A0000000031010' is not found
+        let card = modified_card(vec![
+            (
+                "00 A4 04 00 0E 31 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00",
+                "6A 82",
+            ),
+            (
+                "00 A4 04 00 05 AF FF FF FF FF 00",
+                "6F 39 84 07 AF FF FF FF FF 12 34 A5 2E 50 0D 56 45 53 41 20 45 4C 45 43 54 52 4F 4E 5F 2D 02 65 6E 87 01 01 9F 12 10 56 45 53 41 20 20 20 20 20 20 20 20 20 20 20 20 9F 11 01 01 90 00",
+            ),
+        ]);
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection.interface = Some(&card);
+        setup_connection(&mut connection)?;
+        connection.settings.terminal.application_identifiers =
+            vec!["A0000000031010".to_string(), "AFFFFFFFFF".to_string()];
+
+        let application = connection.select_payment_application()?;
+        assert_eq!(application.aid, b"\xAF\xFF\xFF\xFF\xFF\x12\x34".to_vec());
+        assert_eq!(application.label, b"VESA ELECTRON".to_vec());
+        assert_eq!(application.priority, b"\x01".to_vec());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_get_processing_options_without_afl() -> Result<(), ()> {
         init_logging();
 
@@ -4536,6 +4730,36 @@ mod tests {
 
         assert!(connection.get_tag_value("94").is_none());
         assert_eq!(connection.icc.data_authentication, Some(Vec::new()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_processing_options_invalid_response() -> Result<(), ()> {
+        init_logging();
+
+        // EMV Book 3, 6.5.8.4 and 10.2: the transaction is terminated, not panicked, when the AIP is missing or invalid, the
+        // Format 1 response is too short or an AFL entry is not 4 bytes
+        for response in [
+            "77 00 90 00",
+            "77 04 94 04 08 01 01 00 90 00",
+            "77 03 82 01 00 90 00",
+            "80 01 00 90 00",
+            "77 07 82 02 00 00 94 01 08 90 00",
+            "90 00",
+        ] {
+            let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+            let card = modified_card(vec![("00 C0 00 00 10", response)]);
+            connection.interface = Some(&card);
+            setup_connection(&mut connection)?;
+
+            let application = connection.select_payment_application()?;
+            assert!(
+                connection.start_transaction(&application).is_err(),
+                "GET PROCESSING OPTIONS response {}",
+                response
+            );
+        }
 
         Ok(())
     }
