@@ -637,8 +637,8 @@ pub struct Terminal {
 }
 
 // Terminal behaviour that deviates from the specifications, for example to see what a card does with a non-compliant terminal.
-// All deviations are disabled by default.
-#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy)]
+// Deviations are disabled by default, except ignoring certificate expiry so that test cards with expired certificates can be used.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct ProtocolDeviations {
     // Accept a GENERATE AC response with a higher cryptogram type than requested, EMV Book 3, 9.3 treats it as an ICC logic error
     #[serde(default)]
@@ -649,6 +649,25 @@ pub struct ProtocolDeviations {
     // Offline PIN verification with VERIFY in a Kernel 2 transaction, EMV Contactless Book C-2 has no VERIFY command
     #[serde(default)]
     pub kernel_2_offline_pin: bool,
+    // Accept an expired Issuer or ICC Public Key Certificate, EMV Book 2, 6.3 and 6.4 fail offline data authentication with it.
+    // The expiry is logged. A certificate expiry date that is not a valid date still fails.
+    #[serde(default = "default_ignore_certificate_expiry")]
+    pub ignore_certificate_expiry: bool,
+}
+
+fn default_ignore_certificate_expiry() -> bool {
+    true
+}
+
+impl Default for ProtocolDeviations {
+    fn default() -> ProtocolDeviations {
+        ProtocolDeviations {
+            accept_higher_cryptogram_type: false,
+            external_authenticate_without_aip_support: false,
+            kernel_2_offline_pin: false,
+            ignore_certificate_expiry: default_ignore_certificate_expiry(),
+        }
+    }
 }
 
 // EMV Contactless Book C-2, Terminal Verification Results (TVR) byte 5 bits 2-1: Relay resistance performed
@@ -2891,6 +2910,36 @@ impl EmvConnection<'_> {
         Ok(())
     }
 
+    /// Certificate Expiration Date of the Issuer or ICC Public Key Certificate (EMV Book 2, 6.3 and 6.4). An expired certificate
+    /// fails offline data authentication unless the ignore_certificate_expiry protocol deviation is enabled, the expiry is logged.
+    fn check_public_key_certificate_expiry(
+        &self,
+        certificate: &str,
+        date_bcd: &[u8],
+    ) -> Result<(), ()> {
+        match check_certificate_expiry(date_bcd) {
+            CertificateExpiry::Valid => Ok(()),
+            CertificateExpiry::Expired
+                if self
+                    .settings
+                    .terminal
+                    .protocol_deviations
+                    .ignore_certificate_expiry =>
+            {
+                warn!("{} expired, accepted as a protocol deviation", certificate);
+                Ok(())
+            }
+            CertificateExpiry::Expired => {
+                warn!("{} expired", certificate);
+                Err(())
+            }
+            CertificateExpiry::InvalidDate => {
+                warn!("{} expiry date is invalid", certificate);
+                Err(())
+            }
+        }
+    }
+
     pub fn get_issuer_public_key(
         &self,
         application: &EmvApplication,
@@ -3025,10 +3074,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        if is_certificate_expired(&issuer_certificate_expiry[..]) {
-            warn!("Issuer Public Key Certificate expired");
-            return Err(());
-        }
+        self.check_public_key_certificate_expiry(
+            "Issuer Public Key Certificate",
+            &issuer_certificate_expiry[..],
+        )?;
 
         let issuer_pk_leftmost_digits_length = issuer_pk_leftmost_digits
             .iter()
@@ -3172,10 +3221,10 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
-        if is_certificate_expired(&icc_certificate_expiry[..]) {
-            warn!("ICC Public Key Certificate expired");
-            return Err(());
-        }
+        self.check_public_key_certificate_expiry(
+            "ICC Public Key Certificate",
+            &icc_certificate_expiry[..],
+        )?;
 
         let mut icc_pk_modulus: Vec<u8> = Vec::new();
 
@@ -4046,16 +4095,29 @@ pub fn get_ca_public_key<'a>(
     }
 }
 
+/// Certificate Expiration Date check result, EMV Book 2, 6.3 and 6.4
+#[derive(Debug, PartialEq)]
+pub enum CertificateExpiry {
+    Valid,
+    Expired,
+    InvalidDate,
+}
+
 /// EMV Book 2, 6.3 and 6.4: a certificate is valid until the last day of the month of its Certificate Expiration Date (MMYY).
 /// An invalid date is treated as expired.
 pub fn is_certificate_expired(date_bcd: &[u8]) -> bool {
+    check_certificate_expiry(date_bcd) != CertificateExpiry::Valid
+}
+
+/// EMV Book 2, 6.3 and 6.4: a certificate is valid until the last day of the month of its Certificate Expiration Date (MMYY)
+pub fn check_certificate_expiry(date_bcd: &[u8]) -> CertificateExpiry {
     let date = hex::encode(date_bcd);
     let (Some(Ok(month)), Some(Ok(year))) = (
         date.get(0..2).map(|m| m.parse::<u32>()),
         date.get(2..4).map(|y| y.parse::<i32>()),
     ) else {
         warn!("Invalid certificate expiry date (MMYY) {:02X?}", date_bcd);
-        return true;
+        return CertificateExpiry::InvalidDate;
     };
 
     // Two digit year as chrono %y: 00-68 is 2000-2068, 69-99 is 1969-1999
@@ -4069,7 +4131,7 @@ pub fn is_certificate_expired(date_bcd: &[u8]) -> bool {
         Some(date) if month >= 1 => date,
         _ => {
             warn!("Invalid certificate expiry date (MMYY) {:02X?}", date_bcd);
-            return true;
+            return CertificateExpiry::InvalidDate;
         }
     };
 
@@ -4080,10 +4142,10 @@ pub fn is_certificate_expired(date_bcd: &[u8]) -> bool {
             date_bcd
         );
 
-        return true;
+        return CertificateExpiry::Expired;
     }
 
-    false
+    CertificateExpiry::Valid
 }
 
 #[cfg(test)]
@@ -4645,6 +4707,46 @@ mod tests {
         assert!(is_certificate_expired(b"\x13\x30"));
         assert!(is_certificate_expired(b"\x00\x30"));
         assert!(is_certificate_expired(b"\xFF\x12"));
+    }
+
+    #[test]
+    fn test_ignore_certificate_expiry() {
+        init_logging();
+
+        // Enabled by default, also without the setting or the protocol_deviations section
+        assert!(ProtocolDeviations::default().ignore_certificate_expiry);
+        let deviations: ProtocolDeviations =
+            serde_yaml::from_str("accept_higher_cryptogram_type: false").unwrap();
+        assert!(deviations.ignore_certificate_expiry);
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection
+            .settings
+            .terminal
+            .protocol_deviations
+            .ignore_certificate_expiry = true;
+        assert!(connection
+            .check_public_key_certificate_expiry("Issuer Public Key Certificate", b"\x12\x20")
+            .is_ok());
+        assert!(connection
+            .check_public_key_certificate_expiry("Issuer Public Key Certificate", b"\x12\x68")
+            .is_ok());
+        // Only an expired certificate is accepted, not an invalid date
+        assert!(connection
+            .check_public_key_certificate_expiry("Issuer Public Key Certificate", b"\x13\x30")
+            .is_err());
+
+        connection
+            .settings
+            .terminal
+            .protocol_deviations
+            .ignore_certificate_expiry = false;
+        assert!(connection
+            .check_public_key_certificate_expiry("ICC Public Key Certificate", b"\x12\x20")
+            .is_err());
+        assert!(connection
+            .check_public_key_certificate_expiry("ICC Public Key Certificate", b"\x12\x68")
+            .is_ok());
     }
 
     #[test]

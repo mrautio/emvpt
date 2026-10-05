@@ -89,8 +89,11 @@ terminal:
   # matches the card applications whose DF name begins with it.
   application_identifiers:
     - 'A0000000031010' # Visa credit or debit
-  # Terminal behaviour that deviates from the specifications, all disabled by default
+  # Terminal behaviour that deviates from the specifications, disabled by default except ignore_certificate_expiry
   protocol_deviations:
+    # Accept an expired Issuer or ICC Public Key Certificate, the expiry is logged (EMV Book 2, 6.3 and 6.4 fail offline data
+    # authentication). Enabled by default for test cards with expired certificates.
+    ignore_certificate_expiry: true
     # Accept a higher cryptogram type than requested in GENERATE AC (EMV Book 3, 9.3: ICC logic error)
     accept_higher_cryptogram_type: false
     # EXTERNAL AUTHENTICATE although the AIP does not indicate issuer authentication (EMV Book 3, 10.9)
