@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hex;
 use log::{debug, error, info, warn};
 use log4rs;
@@ -23,10 +23,22 @@ pub enum ReaderError {
     CardNotFound,
 }
 
+/// Card interface of the transaction
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+pub enum CardInterface {
+    /// Deduce the interface from the card reader name
+    Auto,
+    /// Contact chip transaction
+    Contact,
+    /// Contactless transaction
+    Contactless,
+}
+
 pub struct SmartCardConnection {
     ctx: Option<Context>,
     card: Option<Card>,
     pub contactless: bool,
+    interface: CardInterface,
 }
 
 impl ApduInterface for SmartCardConnection {
@@ -47,21 +59,20 @@ impl ApduInterface for SmartCardConnection {
 }
 
 impl SmartCardConnection {
-    pub fn new() -> SmartCardConnection {
+    pub fn new(interface: CardInterface) -> SmartCardConnection {
         SmartCardConnection {
             ctx: None,
             card: None,
             contactless: false,
+            interface: interface,
         }
     }
 
-    fn is_contactless_reader(&self, reader_name: &str) -> bool {
-        if Regex::new(r"^ACS ACR12").unwrap().is_match(reader_name) {
-            debug!("Card reader is deemed contactless");
-            return true;
-        }
-
-        false
+    // Dual interface readers list the contactless interface as a separate PICC / contactless reader
+    fn is_contactless_reader(reader_name: &str) -> bool {
+        Regex::new(r"(?i)^ACS ACR12|PICC|contactless")
+            .unwrap()
+            .is_match(reader_name)
     }
 
     pub fn connect_to_card(&mut self) -> Result<(), ReaderError> {
@@ -99,10 +110,46 @@ impl SmartCardConnection {
             }
         };
 
-        for reader in readers {
+        // With an explicit interface the readers of that interface are tried first. A reader that does not look like one of
+        // that interface is still used if it is the only one with a card, the interface is then taken as given.
+        let mut readers: Vec<_> = readers
+            .map(|reader| {
+                let contactless_reader =
+                    SmartCardConnection::is_contactless_reader(&reader.to_string_lossy());
+                (reader, contactless_reader)
+            })
+            .collect();
+        match self.interface {
+            CardInterface::Auto => (),
+            CardInterface::Contact => readers.sort_by_key(|(_, contactless)| *contactless),
+            CardInterface::Contactless => readers.sort_by_key(|(_, contactless)| !*contactless),
+        }
+
+        for (reader, contactless_reader) in readers {
             self.card = match ctx.connect(reader, ShareMode::Shared, Protocols::ANY) {
                 Ok(card) => {
-                    self.contactless = self.is_contactless_reader(reader.to_str().unwrap());
+                    self.contactless = match self.interface {
+                        CardInterface::Auto => contactless_reader,
+                        CardInterface::Contact => false,
+                        CardInterface::Contactless => true,
+                    };
+
+                    if self.contactless != contactless_reader {
+                        warn!(
+                            "Card reader {:?} is deemed {}, {} interface used as requested",
+                            reader,
+                            if contactless_reader {
+                                "contactless"
+                            } else {
+                                "contact"
+                            },
+                            if self.contactless {
+                                "contactless"
+                            } else {
+                                "contact"
+                            }
+                        );
+                    }
 
                     debug!(
                         "Card reader: {:?}, contactless:{}",
@@ -234,7 +281,7 @@ struct Args {
     #[arg(short, long, value_name = "PIN CODE")]
     pin: Option<String>,
 
-    /// Card PIN code to be used when PIN code is required
+    /// Terminal settings file
     #[arg(
         short,
         long,
@@ -246,6 +293,10 @@ struct Args {
     /// Print TLV data in human readable form
     #[arg(long, value_name = "TLV")]
     print_tlv: Option<String>,
+
+    /// Card interface, auto deduces it from the card reader name
+    #[arg(long, value_enum, default_value_t = CardInterface::Auto)]
+    interface: CardInterface,
 }
 
 fn run() -> Result<Option<String>, String> {
@@ -280,7 +331,7 @@ fn run() -> Result<Option<String>, String> {
 
     let purchase_amount = connection.amount_callback.unwrap()().unwrap();
 
-    let mut smart_card_connection = SmartCardConnection::new();
+    let mut smart_card_connection = SmartCardConnection::new(args.interface);
 
     if let Err(err) = smart_card_connection.connect_to_card() {
         match err {
@@ -314,7 +365,9 @@ fn run() -> Result<Option<String>, String> {
     connection.contactless = smart_card_connection.contactless;
     connection.interface = Some(&smart_card_connection);
 
-    let application = connection.select_payment_application().unwrap();
+    let application = connection
+        .select_payment_application()
+        .map_err(|_| "Could not select a payment application".to_string())?;
 
     connection.process_settings().unwrap();
     connection.add_tag(

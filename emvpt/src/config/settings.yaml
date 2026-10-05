@@ -85,6 +85,10 @@ terminal:
   # AAC for other codes. The value of 'Online approved' is acquirer specific (EMV Book 4, A6), '00' is approved in ISO 8583.
   # 'Y3' and 'Z3' (unable to go online, offline approved / declined) are always handled. Without the list cryptogram_type_arqc is used.
   #online_approved_authorisation_response_codes: ['00']
+  # Terminal list of AIDs selected one by one when the card has no PSE / PPSE (EMV Book 1, 12.3.3 Using a List of AIDs). An AID
+  # matches the card applications whose DF name begins with it.
+  application_identifiers:
+    - 'A0000000031010' # Visa credit or debit
   # Terminal behaviour that deviates from the specifications, all disabled by default
   protocol_deviations:
     # Accept a higher cryptogram type than requested in GENERATE AC (EMV Book 3, 9.3: ICC logic error)
