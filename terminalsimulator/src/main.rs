@@ -203,7 +203,7 @@ fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvAppli
             println!(
                 "{:02}. {}",
                 i + 1,
-                str::from_utf8(&applications[i].label).unwrap()
+                String::from_utf8_lossy(&applications[i].label)
             );
         }
 
