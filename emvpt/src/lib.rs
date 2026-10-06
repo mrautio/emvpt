@@ -145,20 +145,26 @@ pub struct Track2 {
 
 impl Track2 {
     pub fn new(track_data: &str) -> Track2 {
+        Track2::parse(track_data).unwrap()
+    }
+
+    /// Track 2 data, None if it is not in the format. The discretionary data may be empty (ISO/IEC 7813, EMV Book 3, Annex A
+    /// Track 2 Equivalent Data).
+    pub fn parse(track_data: &str) -> Option<Track2> {
         // Supports human readable and ICC formats
         // human readable: ;4321432143214321=2612101123456789123?
         // ICC: 4321432143214321D2612101123456789123F
 
-        let re = Regex::new(r"^;?(\d+)(=|D)(\d{2})(\d{2})(\d{3})(\d+)F?\??$").unwrap();
-        let cap = re.captures(track_data).unwrap();
+        let re = Regex::new(r"^;?(\d+)(=|D)(\d{2})(\d{2})(\d{3})(\d*)F?\??$").unwrap();
+        let cap = re.captures(track_data)?;
 
-        Track2 {
+        Some(Track2 {
             primary_account_number: cap.get(1).unwrap().as_str().to_string(),
             expiry_year: cap.get(3).unwrap().as_str().to_string(),
             expiry_month: cap.get(4).unwrap().as_str().to_string(),
             service_code: cap.get(5).unwrap().as_str().to_string(),
             discretionary_data: cap.get(6).unwrap().as_str().to_string(),
-        }
+        })
     }
 
     pub fn censor(&mut self) {
@@ -327,7 +333,8 @@ pub struct CvmRule {
     pub amount_x: u32,
     pub amount_y: u32,
     pub fail_if_unsuccessful: bool,
-    pub code: CvmCode,
+    /// CVM code, the code (b6-b1) when the terminal does not recognise it
+    pub code: Result<CvmCode, u8>,
     pub condition: CvmConditionCode,
 }
 
@@ -340,7 +347,10 @@ impl CvmRule {
             Err(rule) => rule,
         };
 
-        let mut c: u8 = rule_unwrapped.code.try_into().unwrap();
+        let mut c: u8 = match rule_unwrapped.code {
+            Ok(code) => code.into(),
+            Err(code) => code,
+        };
         if !rule_unwrapped.fail_if_unsuccessful {
             c += 0b0100_0000;
         }
@@ -352,8 +362,8 @@ impl CvmRule {
         let result: u8 = match rule {
             Ok(rule) => {
                 match rule.code {
-                    CvmCode::Signature => 0x00, // unknown
-                    _ => 0x02,                  // successful
+                    Ok(CvmCode::Signature) => 0x00, // unknown
+                    _ => 0x02,                      // successful
                 }
             }
             Err(_) => 0x01, // failed
@@ -1631,8 +1641,10 @@ impl EmvConnection<'_> {
                     let track2_raw: String = format!("{:02X?}", v)
                         .replace(|c: char| !(c.is_ascii_alphanumeric()), "")
                         .to_string();
-                    let track2: Track2 = Track2::new(&track2_raw);
-                    value = format!("{}", track2);
+                    value = match Track2::parse(&track2_raw) {
+                        Some(track2) => format!("{}", track2),
+                        None => track2_raw,
+                    };
                 }
                 Some(FieldFormat::Date) => {
                     value =
@@ -1674,10 +1686,13 @@ impl EmvConnection<'_> {
                         debug!("{}-data: {}", padding, truncated_pan);
                     }
                     Some(FieldSensitivity::Track2) => {
-                        let mut track2: Track2 =
-                            Track2::new(&String::from_utf8_lossy(&v).to_string());
-                        track2.censor();
-                        value = format!("{}", track2);
+                        value = match Track2::parse(&String::from_utf8_lossy(&v).to_string()) {
+                            Some(mut track2) => {
+                                track2.censor();
+                                format!("{}", track2)
+                            }
+                            None => value.replace(|_c: char| true, "*"),
+                        };
 
                         debug!("{}-data: {}", padding, value);
                     }
@@ -1940,8 +1955,19 @@ impl EmvConnection<'_> {
                 // bit 7 = RFU
                 let fail_if_unsuccessful = !get_bit!(cvm_code, 6);
                 let cvm_code = (cvm_code << 2) >> 2;
-                let code: CvmCode = cvm_code.try_into().unwrap();
-                let condition: CvmConditionCode = cvm_condition_code.try_into().unwrap();
+                // EMV Book 3, 10.5: a CVM the terminal does not recognise is unsuccessful ('Unrecognised CVM' in TVR), a
+                // CV Rule with a condition code the terminal does not understand is bypassed
+                let code: Result<CvmCode, u8> = cvm_code.try_into().map_err(|_| cvm_code);
+                let condition: CvmConditionCode = match cvm_condition_code.try_into() {
+                    Ok(condition) => condition,
+                    Err(_) => {
+                        debug!(
+                            "CVM condition code {:02X} not understood, CV Rule bypassed",
+                            cvm_condition_code
+                        );
+                        continue;
+                    }
+                };
 
                 let rule = CvmRule {
                     amount_x: amount_x,
@@ -2078,13 +2104,20 @@ impl EmvConnection<'_> {
     pub fn handle_verify_enciphered_pin(&mut self, ascii_pin: &[u8]) -> Result<(), ()> {
         debug!("Verify enciphered PIN:");
 
+        // EMV Book 2, 7.1: the ICC PIN Encipherment Public Key, or the ICC Public Key, must be retrieved to encipher the PIN.
+        // Without it the CVM is unsuccessful.
+        let Some(icc_pin_pk) = self.icc.icc_pin_pk.clone() else {
+            warn!("ICC PIN Encipherment public key missing, can't encipher the PIN");
+            return Err(());
+        };
+
         let pin_bcd_cn = bcdutil::ascii_to_bcd_cn(ascii_pin, 6).unwrap();
 
         const PK_MAX_SIZE: usize = 248; // ref. EMV Book 2, B2.1 RSA Algorithm
         let mut random_padding = [0u8; PK_MAX_SIZE];
         self.fill_random(&mut random_padding[..]);
 
-        let icc_unpredictable_number = self.handle_get_challenge().unwrap();
+        let icc_unpredictable_number = self.handle_get_challenge()?;
 
         // EMV Book 2, 7.1 Keys and Certificates, 7.2 PIN Encipherment and Verification
 
@@ -2097,17 +2130,9 @@ impl EmvConnection<'_> {
         // ICC Unpredictable Number
         plaintext_data.extend_from_slice(&icc_unpredictable_number[..]);
         // Random padding
-        plaintext_data.extend_from_slice(
-            &random_padding[0..self.icc.icc_pin_pk.as_ref().unwrap().get_key_byte_size() - 17],
-        );
+        plaintext_data.extend_from_slice(&random_padding[0..icc_pin_pk.get_key_byte_size() - 17]);
 
-        let ciphered_pin_data = self
-            .icc
-            .icc_pin_pk
-            .as_ref()
-            .unwrap()
-            .public_encrypt(&plaintext_data[..])
-            .unwrap();
+        let ciphered_pin_data = icc_pin_pk.public_encrypt(&plaintext_data[..]).unwrap();
 
         let apdu_command_verify = b"\x00\x20\x00";
         let mut verify_command = apdu_command_verify.to_vec();
@@ -2255,9 +2280,19 @@ impl EmvConnection<'_> {
         requested_cryptogram_type: CryptogramType,
         second_generate_ac: bool,
     ) -> Result<CryptogramType, ()> {
-        let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
-        let mut icc_cryptogram_type =
-            CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
+        let Some(tag_9f27_cryptogram_information_data) = self.get_tag_value("9F27") else {
+            warn!("Cryptogram Information Data missing");
+            return Err(());
+        };
+        let Ok(mut icc_cryptogram_type) =
+            CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8)
+        else {
+            warn!(
+                "Unknown cryptogram type in Cryptogram Information Data {:02X?}",
+                tag_9f27_cryptogram_information_data
+            );
+            return Err(());
+        };
 
         if icc_cryptogram_type.level() > requested_cryptogram_type.level() {
             if self
@@ -2351,24 +2386,42 @@ impl EmvConnection<'_> {
             return Err(());
         }
 
+        let mut cda_failed = false;
         if get_bit!(p1_reference_control_parameter, 4) {
-            let tag_9f27_cryptogram_information_data = self.get_tag_value("9F27").unwrap();
+            let Some(tag_9f27_cryptogram_information_data) = self.get_tag_value("9F27") else {
+                warn!("Cryptogram Information Data missing");
+                return Err(());
+            };
             let icc_cryptogram_type =
-                CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8).unwrap();
+                CryptogramType::try_from(tag_9f27_cryptogram_information_data[0] as u8);
 
             match icc_cryptogram_type {
-                CryptogramType::TransactionCertificate
-                | CryptogramType::AuthorisationRequestCryptogram => {
-                    self.handle_application_cryptogram_card_authentication(
-                        &response_data[..],
-                        cdol_tag,
-                    )?;
+                Ok(CryptogramType::TransactionCertificate)
+                | Ok(CryptogramType::AuthorisationRequestCryptogram) => {
+                    // EMV Book 2, 6.6.2: a failed dynamic signature verification is 'CDA failed' in TVR, the Application
+                    // Cryptogram is not recovered and the transaction is declined
+                    if self
+                        .handle_application_cryptogram_card_authentication(
+                            &response_data[..],
+                            cdol_tag,
+                        )
+                        .is_err()
+                    {
+                        warn!("CDA failed, the cryptogram is treated as an AAC");
+                        self.settings.terminal.tvr.cda_failed = true;
+                        cda_failed = true;
+                    }
                 }
                 _ => {}
             }
         }
 
-        self.validate_ac(requested_cryptogram_type, second_generate_ac)
+        let icc_cryptogram_type =
+            self.validate_ac(requested_cryptogram_type, second_generate_ac)?;
+        if cda_failed {
+            return Ok(CryptogramType::ApplicationAuthenticationCryptogram);
+        }
+        Ok(icc_cryptogram_type)
     }
 
     pub fn handle_1st_generate_ac(&mut self) -> Result<CryptogramType, ()> {
@@ -2594,7 +2647,7 @@ impl EmvConnection<'_> {
                                         debug!(
                                             "Skipping application. AID:{:02X?}, label:{:?}",
                                             tag_4f_aid,
-                                            str::from_utf8(&tag_50_label).unwrap()
+                                            String::from_utf8_lossy(&tag_50_label)
                                         );
                                     }
                                 }
@@ -2700,7 +2753,8 @@ impl EmvConnection<'_> {
         info!(
             "Selecting application. AID:{:02X?}, label:{:?}, priority:{:02X?}, kernel identifier:{:02X?}",
             application.aid,
-            str::from_utf8(&application.label).unwrap(),
+            // Application Label is ans (EMV Book 3, Annex A), a card may still have other bytes in it
+            String::from_utf8_lossy(&application.label),
             application.priority,
             application.kernel_identifier
         );
@@ -2870,7 +2924,7 @@ impl EmvConnection<'_> {
                 tag_9f46_icc_pk_certificate.unwrap(),
                 tag_9f47_icc_pk_exponent.unwrap(),
                 tag_9f48_icc_pk_remainder,
-                data_authentication,
+                Some(data_authentication),
             ) {
                 Ok((icc_pk_modulus, icc_pk_exponent)) => {
                     self.icc.icc_pk = Some(RsaPublicKey::new(
@@ -2889,12 +2943,12 @@ impl EmvConnection<'_> {
         if tag_9f2d_icc_pin_pk_certificate.is_some() && tag_9f2e_icc_pin_pk_exponent.is_some() {
             let tag_9f2f_icc_pin_pk_remainder = self.get_tag_value("9F2F");
 
-            // ICC has a separate ICC PIN Encipherement public key
+            // ICC has a separate ICC PIN Encipherment public key, its certificate has no static data (EMV Book 2, 7.1)
             match self.get_icc_public_key(
                 tag_9f2d_icc_pin_pk_certificate.unwrap(),
                 tag_9f2e_icc_pin_pk_exponent.unwrap(),
                 tag_9f2f_icc_pin_pk_remainder,
-                data_authentication,
+                None,
             ) {
                 Ok((icc_pin_pk_modulus, icc_pin_pk_exponent)) => {
                     self.icc.icc_pin_pk = Some(RsaPublicKey::new(
@@ -3100,17 +3154,20 @@ impl EmvConnection<'_> {
         Ok((issuer_pk_modulus, tag_9f32_issuer_pk_exponent.to_vec()))
     }
 
+    /// ICC Public Key (EMV Book 2, 6.4) with the static data to be authenticated, or the ICC PIN Encipherment Public Key
+    /// (EMV Book 2, 7.1) when static_data_authentication is None: its certificate hash has no static data to be authenticated
+    /// and no Static Data Authentication Tag List values.
     pub fn get_icc_public_key(
         &self,
         icc_pk_certificate: &Vec<u8>,
         icc_pk_exponent: &Vec<u8>,
         icc_pk_remainder: Option<&Vec<u8>>,
-        data_authentication: &[u8],
+        static_data_authentication: Option<&[u8]>,
     ) -> Result<(Vec<u8>, Vec<u8>), ()> {
         // ICC public key retrieval: EMV Book 2, 6.4 Retrieval of ICC Public Key
         debug!(
             "Retrieving ICC public key {:02X?}",
-            &icc_pk_certificate[0..2]
+            &icc_pk_certificate[..icc_pk_certificate.len().min(2)]
         );
 
         let tag_9f46_icc_pk_certificate = icc_pk_certificate;
@@ -3188,9 +3245,10 @@ impl EmvConnection<'_> {
 
         checksum_data.extend_from_slice(&tag_9f47_icc_pk_exponent[..]);
 
-        checksum_data.extend_from_slice(data_authentication);
-
-        checksum_data.extend_from_slice(&self.static_data_authentication_tag_list_values()?);
+        if let Some(data_authentication) = static_data_authentication {
+            checksum_data.extend_from_slice(data_authentication);
+            checksum_data.extend_from_slice(&self.static_data_authentication_tag_list_values()?);
+        }
 
         let cert_checksum = sha::sha1(&checksum_data[..]);
 
@@ -3575,8 +3633,13 @@ impl EmvConnection<'_> {
             }
 
             match rule.code {
-                CvmCode::FailCvmProcessing => success = false,
-                CvmCode::EncipheredPinOnline => {
+                Err(code) => {
+                    debug!("CVM {:02X} not recognised", code);
+                    self.settings.terminal.tvr.unrecognised_cvm = true;
+                    success = false;
+                }
+                Ok(CvmCode::FailCvmProcessing) => success = false,
+                Ok(CvmCode::EncipheredPinOnline) => {
                     debug!("Enciphered PIN online is not supported");
 
                     if skip_if_not_supported {
@@ -3585,13 +3648,13 @@ impl EmvConnection<'_> {
 
                     success = false;
                 }
-                CvmCode::PlaintextPin
-                | CvmCode::PlaintextPinAndSignature
-                | CvmCode::EncipheredPinOffline
-                | CvmCode::EncipheredPinOfflineAndSignature => {
+                Ok(CvmCode::PlaintextPin)
+                | Ok(CvmCode::PlaintextPinAndSignature)
+                | Ok(CvmCode::EncipheredPinOffline)
+                | Ok(CvmCode::EncipheredPinOfflineAndSignature) => {
                     let enciphered_pin = match rule.code {
-                        CvmCode::EncipheredPinOffline
-                        | CvmCode::EncipheredPinOfflineAndSignature => true,
+                        Ok(CvmCode::EncipheredPinOffline)
+                        | Ok(CvmCode::EncipheredPinOfflineAndSignature) => true,
                         _ => false,
                     };
 
@@ -3602,6 +3665,13 @@ impl EmvConnection<'_> {
                             continue;
                         }
 
+                        success = false;
+                    } else if enciphered_pin
+                        && self.settings.terminal.capabilities.enciphered_pin
+                        && self.icc.icc_pin_pk.is_none()
+                    {
+                        // The PIN can not be enciphered, the cardholder is not asked for it (EMV Book 2, 7.1)
+                        warn!("ICC PIN Encipherment public key missing, offline enciphered PIN is unsuccessful");
                         success = false;
                     } else if enciphered_pin && self.settings.terminal.capabilities.enciphered_pin {
                         let ascii_pin = self.pin_callback.unwrap()()?;
@@ -3619,7 +3689,7 @@ impl EmvConnection<'_> {
                         continue;
                     }
                 }
-                CvmCode::Signature | CvmCode::NoCvm => {
+                Ok(CvmCode::Signature) | Ok(CvmCode::NoCvm) => {
                     success = true;
                 }
             }
@@ -3638,7 +3708,9 @@ impl EmvConnection<'_> {
                     .cardholder_verification_was_not_successful = true;
                 self.process_tag_as_tlv("9F34", CvmRule::into_9f34_value(Err(rule)));
 
-                if !skip_if_not_supported {
+                // EMV Book 3, 10.5: b7 of the CVM Code, apply the succeeding CV Rule if this CVM is unsuccessful. A CVM that the
+                // terminal does not support with condition 'if terminal supports the CVM' is skipped before this.
+                if rule.fail_if_unsuccessful {
                     break;
                 }
             }
@@ -3675,7 +3747,14 @@ impl EmvConnection<'_> {
     pub fn handle_offline_data_authentication(&mut self) -> Result<(), ()> {
         //ref. EMV 4.3 Book 3 - 10.3 Offline Data Authentication
 
-        if !(self.settings.terminal.capabilities.cda && self.icc.capabilities.cda) {
+        if self.settings.terminal.capabilities.cda && self.icc.capabilities.cda {
+            // CDA is completed in GENERATE AC, the ICC Public Key retrieval of it is done here (EMV Book 2, 6.6.1). Without the
+            // key CDA fails.
+            if self.icc.icc_pk.is_none() {
+                warn!("ICC public key could not be retrieved for CDA");
+                self.settings.terminal.tvr.cda_failed = true;
+            }
+        } else {
             if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
                 if let Err(_) = self.handle_dynamic_data_authentication() {
                     self.settings.terminal.tvr.dda_failed = true;
@@ -4472,6 +4551,69 @@ mod tests {
         let static_data_authentication_list_output: Vec<u8> =
             static_dol1.get_tag_list_tag_values(&connection);
         assert_eq!(&static_data_authentication_list_output[..], tag_82_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_track2_without_discretionary_data() {
+        // Track 2 Equivalent Data: PAN, separator, expiry date and service code, the discretionary data may be empty
+        let track2 = Track2::parse("6263600221180611D2212206").unwrap();
+        assert_eq!(track2.primary_account_number, "6263600221180611");
+        assert_eq!(track2.service_code, "206");
+        assert_eq!(track2.discretionary_data, "");
+        assert!(Track2::parse("not track 2").is_none());
+    }
+
+    #[test]
+    fn test_cvm_results_of_unrecognised_cvm() {
+        // EMV Book 4, A4: CVM Results of a failed CVM that the terminal does not recognise, b7 'apply succeeding CV Rule'
+        let rule = CvmRule {
+            amount_x: 0,
+            amount_y: 0,
+            fail_if_unsuccessful: false,
+            code: Err(0x20),
+            condition: CvmConditionCode::Always,
+        };
+        assert_eq!(CvmRule::into_9f34_value(Err(rule)), vec![0x60, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_cvm_processing_continues_after_unsuccessful_cvm() -> Result<(), ()> {
+        init_logging();
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection.process_tag_as_tlv("9F02", b"\x00\x00\x00\x00\x01\x00".to_vec());
+        connection.settings.terminal.capabilities.enciphered_pin = true;
+        // Enciphered PIN by ICC, apply succeeding CV Rule if unsuccessful (b7), without an ICC PIN Encipherment key, then a
+        // CVM that the terminal does not recognise and Signature
+        let rule = |code: Result<CvmCode, u8>, fail_if_unsuccessful: bool| CvmRule {
+            amount_x: 0,
+            amount_y: 0,
+            fail_if_unsuccessful: fail_if_unsuccessful,
+            code: code,
+            condition: CvmConditionCode::Always,
+        };
+        connection.icc.cvm_rules = vec![
+            rule(Ok(CvmCode::EncipheredPinOffline), false),
+            rule(Err(0x20), false),
+            rule(Ok(CvmCode::Signature), true),
+        ];
+
+        connection.handle_card_verification_methods()?;
+
+        assert_eq!(
+            connection.get_tag_value("9F34").unwrap(),
+            &vec![0x1E, 0x00, 0x00]
+        );
+        assert!(connection.settings.terminal.tvr.unrecognised_cvm);
+        assert!(
+            !connection
+                .settings
+                .terminal
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
 
         Ok(())
     }
