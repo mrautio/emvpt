@@ -42,19 +42,17 @@ pub struct SmartCardConnection {
 }
 
 impl ApduInterface for SmartCardConnection {
-    fn send_apdu(&self, apdu: &[u8]) -> Result<Vec<u8>, ()> {
-        let mut output: Vec<u8> = Vec::new();
+    fn send_apdu(&self, apdu: &[u8]) -> Result<Vec<u8>, EmvError> {
+        let Some(card) = self.card.as_ref() else {
+            return Err(EmvError::Interface("Card not connected".to_string()));
+        };
 
         let mut apdu_response_buffer = [0; MAX_BUFFER_SIZE];
-        output.extend_from_slice(
-            self.card
-                .as_ref()
-                .unwrap()
-                .transmit(apdu, &mut apdu_response_buffer)
-                .unwrap(),
-        );
+        let response = card
+            .transmit(apdu, &mut apdu_response_buffer)
+            .map_err(|err| EmvError::Interface(format!("Transmit failed: {}", err)))?;
 
-        Ok(output)
+        Ok(response.to_vec())
     }
 }
 
@@ -194,7 +192,7 @@ impl SmartCardConnection {
     }
 }
 
-fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvApplication, ()> {
+fn pse_application_select(applications: &[EmvApplication]) -> Result<EmvApplication, EmvError> {
     let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
 
     if user_interactive && applications.len() > 1 {
@@ -210,15 +208,23 @@ fn pse_application_select(applications: &Vec<EmvApplication>) -> Result<EmvAppli
         print!("> ");
 
         let mut stdin_buffer = String::new();
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
+        io::stdin()
+            .read_line(&mut stdin_buffer)
+            .map_err(|err| EmvError::Callback(err.to_string()))?;
 
-        return Ok(applications[stdin_buffer.trim().parse::<usize>().unwrap() - 1].clone());
+        return stdin_buffer
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| applications.get(i.checked_sub(1)?))
+            .cloned()
+            .ok_or_else(|| EmvError::Callback("Invalid application selection".to_string()));
     }
 
     Ok(applications[0].clone())
 }
 
-fn pin_entry() -> Result<String, ()> {
+fn pin_entry() -> Result<String, EmvError> {
     let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
     if let Some(Some(pin)) = PIN_OPTION.get() {
         return Ok(pin.clone());
@@ -228,26 +234,29 @@ fn pin_entry() -> Result<String, ()> {
         println!("Enter PIN:");
         print!("> ");
 
-        return Ok(rpassword::read_password().unwrap().trim().to_string());
+        return rpassword::read_password()
+            .map(|pin| pin.trim().to_string())
+            .map_err(|err| EmvError::Callback(err.to_string()));
     }
 
     Ok("".to_string())
 }
 
-fn amount_entry() -> Result<u64, ()> {
+fn amount_entry() -> Result<u64, EmvError> {
     let user_interactive = INTERACTIVE.load(Ordering::Relaxed);
 
     if user_interactive {
         println!("Enter amount:");
         print!("> ");
         let mut stdin_buffer = String::new();
-        io::stdin().read_line(&mut stdin_buffer).unwrap();
+        io::stdin()
+            .read_line(&mut stdin_buffer)
+            .map_err(|err| EmvError::Callback(err.to_string()))?;
 
-        return Ok(
-            format!("{:.0}", stdin_buffer.trim().parse::<f64>().unwrap() * 100.0)
-                .parse::<u64>()
-                .unwrap(),
-        );
+        return match stdin_buffer.trim().parse::<f64>() {
+            Ok(amount) if amount >= 0.0 => Ok((amount * 100.0).round() as u64),
+            _ => Err(EmvError::Callback("Invalid amount".to_string())),
+        };
     }
 
     Ok(1)
@@ -313,23 +322,24 @@ fn run() -> Result<Option<String>, String> {
     let print_tags = args.print_tags;
     let print_tlv = args.print_tlv;
 
-    let mut connection = EmvConnection::new(&args.settings.as_path().to_str().unwrap()).unwrap();
+    let mut connection =
+        EmvConnection::new(&args.settings.to_string_lossy()).map_err(|err| err.to_string())?;
 
     connection.settings.censor_sensitive_fields = censor_sensitive_fields;
-    connection.pse_application_select_callback = Some(&pse_application_select);
-    connection.pin_callback = Some(&pin_entry);
-    connection.amount_callback = Some(&amount_entry);
+    connection.pse_application_select_callback = Some(Box::new(pse_application_select));
+    connection.pin_callback = Some(Box::new(pin_entry));
 
     if print_tlv.is_some() {
         let tlv_hex_data = print_tlv
             .unwrap()
             .replace(|c: char| !(c.is_ascii_alphanumeric()), "");
         info!("input TLV: {}", tlv_hex_data);
-        connection.process_tlv(&hex::decode(&tlv_hex_data).unwrap()[..], 0);
+        let tlv_data = hex::decode(&tlv_hex_data).map_err(|err| err.to_string())?;
+        connection.process_tlv(&tlv_data[..], 0);
         return Ok(None);
     }
 
-    let purchase_amount = connection.amount_callback.unwrap()().unwrap();
+    let purchase_amount = amount_entry().map_err(|err| err.to_string())?;
 
     let mut smart_card_connection = SmartCardConnection::new(args.interface);
 
@@ -363,52 +373,15 @@ fn run() -> Result<Option<String>, String> {
     }
 
     connection.contactless = smart_card_connection.contactless;
-    connection.interface = Some(&smart_card_connection);
+    connection.interface = Some(Box::new(smart_card_connection));
 
-    let application = connection
-        .select_payment_application()
-        .map_err(|_| "Could not select a payment application".to_string())?;
+    let purchase_successful = purchase(&mut connection, purchase_amount, stop_after_read)
+        .map_err(|err| format!("Transaction terminated: {}", err))?;
 
-    connection.process_settings().unwrap();
-    connection.add_tag(
-        "9F02",
-        bcdutil::ascii_to_bcd_n(format!("{}", purchase_amount).as_bytes(), 6).unwrap(),
-    );
-
-    connection.handle_get_processing_options().unwrap();
-
-    if !stop_after_read {
-        connection.handle_public_keys(&application).unwrap();
-
-        connection.handle_card_verification_methods().unwrap();
-
-        connection.handle_terminal_risk_management().unwrap();
-
-        connection.handle_terminal_action_analysis().unwrap();
-
-        let mut purchase_successful = false;
-
-        match connection.handle_1st_generate_ac().unwrap() {
-            CryptogramType::AuthorisationRequestCryptogram => {
-                if let CryptogramType::TransactionCertificate =
-                    connection.handle_2nd_generate_ac().unwrap()
-                {
-                    purchase_successful = true;
-                }
-            }
-            CryptogramType::TransactionCertificate => {
-                purchase_successful = true;
-            }
-            CryptogramType::ApplicationAuthenticationCryptogram => {
-                purchase_successful = false;
-            }
-        }
-
-        if purchase_successful {
-            info!("Purchase successful!");
-        } else {
-            warn!("Purchase unsuccessful!");
-        }
+    match purchase_successful {
+        Some(true) => info!("Purchase successful!"),
+        Some(false) => warn!("Purchase unsuccessful!"),
+        None => (),
     }
 
     if print_tags {
@@ -416,6 +389,46 @@ fn run() -> Result<Option<String>, String> {
     }
 
     Ok(None)
+}
+
+/// Purchase sequence made of the transaction steps of the library, None when stopped after reading the card data
+fn purchase(
+    connection: &mut EmvConnection,
+    purchase_amount: u64,
+    stop_after_read: bool,
+) -> Result<Option<bool>, EmvError> {
+    let application = connection.select_payment_application()?;
+
+    connection.process_settings()?;
+    connection.add_tag(
+        "9F02",
+        bcdutil::ascii_to_bcd_n(format!("{}", purchase_amount).as_bytes(), 6)
+            .map_err(|_| EmvError::Callback("Amount does not fit in 12 digits".to_string()))?,
+    );
+
+    connection.handle_get_processing_options()?;
+
+    if stop_after_read {
+        return Ok(None);
+    }
+
+    connection.handle_public_keys(&application)?;
+
+    connection.handle_card_verification_methods()?;
+
+    connection.handle_terminal_risk_management()?;
+
+    connection.handle_terminal_action_analysis()?;
+
+    let purchase_successful = match connection.handle_1st_generate_ac()? {
+        CryptogramType::AuthorisationRequestCryptogram => {
+            connection.handle_2nd_generate_ac()? == CryptogramType::TransactionCertificate
+        }
+        CryptogramType::TransactionCertificate => true,
+        CryptogramType::ApplicationAuthenticationCryptogram => false,
+    };
+
+    Ok(Some(purchase_successful))
 }
 
 fn main() {

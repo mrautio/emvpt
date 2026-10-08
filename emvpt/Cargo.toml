@@ -7,6 +7,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dev-dependencies]
+log4rs = "1.4.0"
+# Test RSA private key operations only, the library has no OpenSSL dependency
+openssl = "0.10.81"
 
 [dependencies]
 iso7816-tlv = "0.4.4"
@@ -16,11 +19,10 @@ hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"
 log = "0.4.34"
-log4rs = "1.4.0"
 rand_chacha = "0.10.0"
 rand = "0.10.3"
-# NOTE: mingw pre built binaries here: https://bintray.com/vszakats/generic/openssl
-openssl-sys = "0.9.117"
-openssl = "0.10.81"
+# Pure Rust SHA-1 and RSA (EMV Book 2, B2.1) so that the library cross-compiles e.g. to Android without OpenSSL
+num-bigint = "0.4.6"
+sha1 = "0.10.6"
 chrono = "0.4.45"
 regex = "1.13.1"

@@ -34,19 +34,21 @@ pub fn bcd_to_ascii(bcd_data: &[u8]) -> Result<Vec<u8>, ()> {
 pub fn ascii_to_bcd_cn(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
     let mut bcd_output: Vec<u8> = Vec::with_capacity(size);
 
-    assert!(ascii_data.len() <= size * 2);
+    if ascii_data.len() > size * 2 {
+        return Err(());
+    }
 
     const ASCII_CHARACTER_0: u8 = 0x30;
 
     for i in (0..ascii_data.len()).step_by(2) {
-        let b1 = ascii_data[i] - ASCII_CHARACTER_0;
+        let b1 = ascii_data[i].wrapping_sub(ASCII_CHARACTER_0);
         if b1 > 0x9 {
             return Err(());
         }
 
         let mut b2 = 0xF;
         if i + 1 < ascii_data.len() {
-            b2 = ascii_data[i + 1] - ASCII_CHARACTER_0;
+            b2 = ascii_data[i + 1].wrapping_sub(ASCII_CHARACTER_0);
             if b2 > 0x9 {
                 return Err(());
             }
@@ -62,8 +64,6 @@ pub fn ascii_to_bcd_cn(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
         bcd_output.push(bcd_byte);
     }
 
-    assert_eq!(bcd_output.len(), size);
-
     Ok(bcd_output)
 }
 
@@ -71,7 +71,9 @@ pub fn ascii_to_bcd_cn(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
 pub fn ascii_to_bcd_n(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
     let mut bcd_output: Vec<u8> = Vec::with_capacity(size);
 
-    assert!(ascii_data.len() <= size * 2);
+    if ascii_data.len() > size * 2 {
+        return Err(());
+    }
 
     const ASCII_CHARACTER_0: u8 = 0x30;
 
@@ -87,12 +89,12 @@ pub fn ascii_to_bcd_n(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
     }
 
     for i in (0..ascii_data_aligned.len()).step_by(2) {
-        let b1 = ascii_data_aligned[i] - ASCII_CHARACTER_0;
+        let b1 = ascii_data_aligned[i].wrapping_sub(ASCII_CHARACTER_0);
         if b1 > 0x9 {
             return Err(());
         }
 
-        let b2 = ascii_data_aligned[i + 1] - ASCII_CHARACTER_0;
+        let b2 = ascii_data_aligned[i + 1].wrapping_sub(ASCII_CHARACTER_0);
         if b2 > 0x9 {
             return Err(());
         }
@@ -101,8 +103,6 @@ pub fn ascii_to_bcd_n(ascii_data: &[u8], size: usize) -> Result<Vec<u8>, ()> {
 
         bcd_output.push(bcd_byte);
     }
-
-    assert_eq!(bcd_output.len(), size);
 
     Ok(bcd_output)
 }
