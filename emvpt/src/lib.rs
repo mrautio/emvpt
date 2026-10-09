@@ -2697,10 +2697,12 @@ impl EmvConnection {
     }
 
     // EMV Book 3, 9.3: the ICC responds with the requested cryptogram type or a lower one. A higher one is an ICC logic error,
-    // the transaction is terminated after the first GENERATE AC and the cryptogram is treated as an AAC after the second one.
+    // the transaction is terminated after the first GENERATE AC and the cryptogram is treated as an AAC after the second one. A
+    // cryptogram that the ICC decided without a request, e.g. in a contactless GET PROCESSING OPTIONS response, has no requested
+    // type to compare with.
     fn validate_ac(
         &self,
-        requested_cryptogram_type: CryptogramType,
+        requested_cryptogram_type: Option<CryptogramType>,
         second_generate_ac: bool,
     ) -> Result<CryptogramType, EmvError> {
         let tag_9f27_cryptogram_information_data = self.require_tag("9F27")?;
@@ -2714,7 +2716,9 @@ impl EmvConnection {
             ))));
         };
 
-        if icc_cryptogram_type.level() > requested_cryptogram_type.level() {
+        if let Some(requested_cryptogram_type) = requested_cryptogram_type
+            .filter(|requested| icc_cryptogram_type.level() > requested.level())
+        {
             if self
                 .settings
                 .terminal
@@ -2839,7 +2843,7 @@ impl EmvConnection {
         }
 
         let icc_cryptogram_type =
-            self.validate_ac(requested_cryptogram_type, second_generate_ac)?;
+            self.validate_ac(Some(requested_cryptogram_type), second_generate_ac)?;
         if cda_failed {
             return Ok(CryptogramType::ApplicationAuthenticationCryptogram);
         }
@@ -2852,7 +2856,7 @@ impl EmvConnection {
     }
 
     /// First GENERATE AC requesting the cryptogram type. The cryptogram of a contactless GET PROCESSING OPTIONS response is
-    /// validated instead.
+    /// validated instead, the requested cryptogram type does not apply to it.
     pub fn first_generate_ac(
         &mut self,
         requested_cryptogram_type: CryptogramType,
@@ -2861,8 +2865,10 @@ impl EmvConnection {
 
         if self.contactless && self.get_tag_value("9F26").is_some() {
             debug!("Application Cryptogram returned in GET PROCESSING OPTIONS");
-            // ref. EMV Contactless Book C-3, A.2 Data Elements by Name - cryptogram returned in GET PROCESSING OPTIONS (Kernel 3, Visa)
-            return self.validate_ac(requested_cryptogram_type, false);
+            // ref. EMV Contactless Book C-3, A.2 Data Elements by Name - cryptogram returned in GET PROCESSING OPTIONS (Kernel 3, Visa).
+            // The ICC has decided the cryptogram before the terminal action analysis, it is the outcome of the ICC and not a response
+            // to a requested cryptogram type (EMV Book 3, 9.3 applies to GENERATE AC).
+            return self.validate_ac(None, false);
         }
 
         // ARQC continues with online processing and handle_2nd_generate_ac
@@ -4066,6 +4072,26 @@ impl EmvConnection {
     /// Cardholder Verification, EMV Book 3, 10.5: the CV Rules of the CVM List are processed in order with the PIN of
     /// pin_callback. The CVM Results are data object '9F34'.
     pub fn handle_card_verification_methods(&mut self) -> Result<(), EmvError> {
+        // EMV Book 3, 10.5: cardholder verification is performed only when the AIP indicates that the ICC supports it. Without the
+        // support it is not performed, which is not a failure in the TVR, and the CVM Results are 'No CVM performed' with an
+        // unknown result (EMV Book 4, A4).
+        if let Some(&aip_b1) = self.get_tag_value("82").and_then(|aip| aip.first()) {
+            if !get_bit!(aip_b1, 4) {
+                debug!("Cardholder verification is not supported by the ICC (AIP)");
+                self.process_tag_as_tlv("9F34", b"\x3F\x00\x00".to_vec());
+                return Ok(());
+            }
+
+            // EMV Book 3, 10.5: without the CVM List the terminal terminates cardholder verification without setting
+            // 'Cardholder verification was performed' in the TSI, the missing data is 'ICC data missing' in the TVR
+            if self.get_tag_value("8E").is_none() {
+                warn!("Cardholder verification is supported but the CVM List is missing");
+                self.state.tvr.icc_data_missing = true;
+                self.process_tag_as_tlv("9F34", b"\x3F\x00\x00".to_vec());
+                return Ok(());
+            }
+        }
+
         let purchase_amount = self.amount_authorised()?;
 
         // EMV Contactless Book C-2, 5: Kernel 2 has no VERIFY command, so offline PIN is not supported in a Kernel 2 transaction.
@@ -5833,5 +5859,80 @@ mod tests {
                 let _ = purchase(&mut connection);
             }
         }
+    }
+
+    #[test]
+    fn test_cardholder_verification_not_supported_by_icc() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Book 3, 10.5: the AIP of a qVSDC card without cardholder verification, e.g. '2000', the CVM List of the card is not
+        // processed and the terminal does not fail cardholder verification
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.process_tag_as_tlv("82", b"\x20\x00".to_vec());
+        connection.process_tag_as_tlv(
+            "8E",
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x41\x03\x1E\x03".to_vec(),
+        );
+        connection.process_application_data()?;
+        assert!(connection.icc.cvm_rules.is_empty());
+
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x00])
+        );
+        assert!(
+            !connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+        assert!(!connection.state.tsi.cardholder_verification_was_performed);
+
+        // Cardholder verification supported without the CVM List: ICC data missing, not performed
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.process_tag_as_tlv("82", b"\x30\x00".to_vec());
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x00])
+        );
+        assert!(connection.state.tvr.icc_data_missing);
+        assert!(
+            !connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+        assert!(!connection.state.tsi.cardholder_verification_was_performed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_contactless_cryptogram_of_get_processing_options() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Contactless Book C-3: the ICC has decided the ARQC in GET PROCESSING OPTIONS, an AAC of the terminal action
+        // analysis is not a requested cryptogram type to compare with. Without a card interface any APDU would fail.
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.contactless = true;
+        connection.process_tag_as_tlv("9F27", b"\x80".to_vec());
+        connection.process_tag_as_tlv("9F26", b"\x01\x02\x03\x04\x05\x06\x07\x08".to_vec());
+        connection.process_tag_as_tlv("9F36", b"\x00\x01".to_vec());
+        assert_eq!(
+            connection.first_generate_ac(CryptogramType::ApplicationAuthenticationCryptogram)?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+        assert!(connection.state.exchanges.is_empty());
+
+        // The cryptogram is still validated
+        connection.remove_tag("9F36");
+        assert!(matches!(
+            connection.first_generate_ac(CryptogramType::TransactionCertificate),
+            Err(EmvError::MissingData(_))
+        ));
+
+        Ok(())
     }
 }
