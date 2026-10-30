@@ -1,0 +1,171 @@
+censor_sensitive_fields: false
+configuration_files:
+  # Configuration files here have relative path from the caller, not from the settings file
+  # If path is not found, default settings (test CAs) will be used
+  emv_tags: 'emv_tags.yaml'
+  scheme_ca_public_keys: '../emvpt/src/config/scheme_ca_public_keys_production.yaml'
+  constants: 'constants.yaml'
+terminal:
+  use_random: true
+  capabilities:
+    sda: true
+    dda: true
+    cda: true
+    plaintext_pin: true
+    enciphered_pin: true
+    terminal_risk_management: true
+    issuer_authentication: false
+  # Signature and No CVM of a contact transaction, a contactless kernel has its own CVM capability
+  cvm_capability:
+    signature: true
+    no_cvm: true
+  # Terminal Action Codes (EMV Book 3, 10.7) as hex TVR values, empty is zeros. A contactless kernel may have its own.
+  terminal_action_codes:
+    denial: ''
+    online: ''
+    default: ''
+  tvr:
+    offline_data_authentication_was_not_performed: false
+    sda_failed: false
+    icc_data_missing: false
+    card_appears_on_terminal_exception_file: false
+    dda_failed: false
+    cda_failed: false
+    icc_and_terminal_have_different_application_versions: false
+    expired_application: false
+    application_not_yet_effective: false
+    requested_service_not_allowed_for_card_product: false
+    new_card: false
+    cardholder_verification_was_not_successful: false
+    unrecognised_cvm: false
+    pin_try_limit_exceeded: false
+    pin_entry_required_and_pin_pad_not_present_or_not_working: false
+    pin_entry_required_pin_pad_present_but_pin_was_not_entered: false
+    online_pin_entered: false
+    transaction_exceeds_floor_limit: false
+    lower_consecutive_offline_limit_exceeded: false
+    upper_consecutive_offline_limit_exceeded: false
+    transaction_selected_randomly_for_online_processing: false
+    merchant_forced_transaction_online: false
+    default_tdol_used: false
+    issuer_authentication_failed: false
+    script_processing_failed_before_final_generate_ac: false
+    script_processing_failed_after_final_generate_ac: false
+  tsi:
+    offline_data_authentication_was_performed: false
+    cardholder_verification_was_performed: false
+    card_risk_management_was_performed: false
+    issuer_authentication_was_performed: false
+    terminal_risk_management_was_performed: false
+    script_processing_was_performed: false
+  terminal_transaction_qualifiers:
+    # Mag-stripe mode advertised to see which cards offer a mag-stripe fallback, the transaction itself is EMV mode only
+    mag_stripe_mode_supported: true
+    emv_mode_supported: true
+    emv_contact_chip_supported: true
+    offline_only_reader: false
+    online_pin_supported: false
+    signature_supported: true
+    offline_data_authentication_for_online_authorizations_supported: true
+    online_cryptogram_required: false
+    cvm_required: false
+    contact_chip_offline_pin_supported: true
+    issuer_update_processing_supported: false
+    consumer_device_cvm_supported: true
+  c4_enhanced_contactless_reader_capabilities:
+    contact_mode_supported: true
+    contactless_mag_stripe_mode_supported: true
+    contactless_emv_full_online_mode_not_supported: false
+    contactless_emv_partial_online_mode_supported: false
+    contactless_mode_supported: true
+    try_another_interface_after_decline: true
+    mobile_cvm_supported: true
+    online_pin_supported: false
+    signature: true
+    plaintext_offline_pin: true
+    reader_is_offline_only: false
+    cvm_required: false
+    terminal_exempt_from_no_cvm_checks: false
+    delayed_authorisation_terminal: false
+    transit_terminal: false
+    c4_kernel_version: 3
+  cryptogram_type: 'AuthorisationRequestCryptogram'
+  cryptogram_type_arqc: 'TransactionCertificate'
+  # Authorisation Response Codes (tag '8A') that approve the transaction online, the second GENERATE AC requests a TC for them and an
+  # AAC for other codes. The value of 'Online approved' is acquirer specific (EMV Book 4, A6), '00' is approved in ISO 8583.
+  # 'Y3' and 'Z3' (unable to go online, offline approved / declined) are always handled. Without the list cryptogram_type_arqc is used.
+  #online_approved_authorisation_response_codes: ['00']
+  # Terminal list of AIDs selected one by one when the card has no PSE / PPSE (EMV Book 1, 12.3.3 Using a List of AIDs). An AID
+  # matches the card applications whose DF name begins with it.
+  application_identifiers:
+    - 'A0000000031010' # Visa credit or debit
+  # Terminal behaviour that deviates from the specifications, disabled by default except ignore_certificate_expiry
+  protocol_deviations:
+    # Accept an expired Issuer or ICC Public Key Certificate, the expiry is logged (EMV Book 2, 6.3 and 6.4 fail offline data
+    # authentication). Enabled by default for test cards with expired certificates.
+    ignore_certificate_expiry: true
+    # Accept a higher cryptogram type than requested in GENERATE AC (EMV Book 3, 9.3: ICC logic error)
+    accept_higher_cryptogram_type: false
+    # EXTERNAL AUTHENTICATE although the AIP does not indicate issuer authentication (EMV Book 3, 10.9)
+    external_authenticate_without_aip_support: false
+    # Offline PIN with VERIFY in a Kernel 2 transaction (EMV Contactless Book C-2 has no VERIFY command)
+    kernel_2_offline_pin: false
+    # Select the terminal list of AIDs when the PPSE selection of a contactless transaction fails (EMV Contactless Book B has
+    # PPSE selection only)
+    contactless_list_of_aids: false
+default_tags:
+  '9F1A': '0246'
+  '5F2A': 0978
+  '9C': '00' # Transaction Type: purchase
+  '9F35': '22' # Terminal Type: merchant, attended, offline with online capability
+  '9F03': '000000000000' # Amount, Other: no cashback
+  '9F15': '5999' # Merchant Category Code: miscellaneous retail
+  '9F4E': '454D5650542053494D554C41544F52204649' # Merchant Name and Location: 'EMVPT SIMULATOR FI'
+# Contactless kernel settings by the Kernel ID (hex) of the selected application, EMV Contactless Book B, 3.3.2.5: the Kernel
+# Identifier ('9F2A') of the PPSE entry, one byte for an international kernel and the first three bytes for a domestic kernel.
+# Without the Kernel Identifier the kernel is the one whose AIDs match the selected application (the longest match wins). Tags
+# are set over default_tags, cvm_required_tags over tags when the contactless amount exceeds reader_cvm_required_limit (minor
+# unit). A domestic kernel, e.g. girocard or Bancomat, is added under its Kernel ID with its AIDs and tags.
+kernels:
+  '02':
+    name: 'Mastercard (EMV Contactless Book C-2)'
+    aids: ['A000000004']
+    reader_cvm_required_limit: 5000
+    # Kernel Configuration: on device cardholder verification supported
+    on_device_cardholder_verification: true
+    # CVM Capability – CVM Required: signature, no online PIN without a PIN pad
+    cvm_capability_cvm_required:
+      signature: true
+      no_cvm: false
+    # CVM Capability – No CVM Required
+    cvm_capability_no_cvm_required:
+      signature: false
+      no_cvm: true
+    tags:
+      # Application Version Number (Reader)
+      '9F09': '0002'
+      # Terminal Risk Management Data: contactless signature, no CVM and CDCVM; contact signature, offline enciphered and
+      # plaintext PIN and no CVM; mag-stripe mode supported (byte 3 bit 8 unset) to see which cards offer a mag-stripe fallback
+      '9F1D': '2C3A000000000000'
+      # Mobile Support Indicator: mobile support
+      '9F7E': '01'
+    cvm_required_tags:
+      # Terminal Risk Management Data: CVM Limit exceeded
+      '9F1D': '2CBA000000000000'
+      # Mobile Support Indicator: mobile support, OD-CVM required
+      '9F7E': '03'
+  '03':
+    name: 'Visa (EMV Contactless Book C-3)'
+    aids: ['A000000003']
+  '04':
+    name: 'American Express (EMV Contactless Book C-4)'
+    aids: ['A000000025']
+  '05':
+    name: 'JCB (EMV Contactless Book C-5)'
+    aids: ['A000000065']
+  '06':
+    name: 'Discover (EMV Contactless Book C-6)'
+    aids: ['A000000152']
+  '07':
+    name: 'UnionPay (EMV Contactless Book C-7)'
+    aids: ['A000000333']
