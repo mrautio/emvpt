@@ -144,7 +144,7 @@ pub fn get_truncated_pan(pan: &str) -> String {
         .chars()
         .enumerate()
         .map(|(i, c)| {
-            if i >= uncensored_bin_prefix_length && i < pan.len() - 4 {
+            if i >= uncensored_bin_prefix_length && i < pan.len().saturating_sub(4) {
                 '*'
             } else {
                 c
@@ -153,6 +153,175 @@ pub fn get_truncated_pan(pan: &str) -> String {
         .collect();
 
     truncated_pan
+}
+
+/// Name with its letters and digits masked, the whitespace and the punctuation such as the '/' separator of the cardholder
+/// name kept
+pub fn get_censored_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_whitespace() || c.is_ascii_punctuation() {
+                c
+            } else {
+                '*'
+            }
+        })
+        .collect()
+}
+
+/// Masks all but the end of a track field that is padding ('F') or the end sentinel ('?')
+fn masked_track_field(field: &str) -> String {
+    let data_length = field.trim_end_matches(['F', '?']).chars().count();
+    "*".repeat(data_length) + &field.chars().skip(data_length).collect::<String>()
+}
+
+/// Track 1 data with the PAN truncated and the name and the discretionary data masked, the format code, the field separators,
+/// the expiry date and the service code kept, e.g. 'B43214321****4321^******/****^2609101******?'. The fields after the
+/// discretionary data are masked.
+pub fn get_censored_track1(track_data: &str) -> String {
+    let fields: Vec<&str> = track_data.split('^').collect();
+    if fields.len() < 3 {
+        return get_censored_name(track_data);
+    }
+
+    // '%' start sentinel and 'B' format code
+    let pan_start = fields[0]
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(fields[0].len());
+    let pan = format!(
+        "{}{}",
+        &fields[0][..pan_start],
+        get_truncated_pan(&fields[0][pan_start..])
+    );
+
+    // Expiry date (YYMM) and service code
+    let expiry_date_and_service_code_length = fields[2]
+        .chars()
+        .take(7)
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let expiry_date_and_service_code = format!(
+        "{}{}",
+        &fields[2][..expiry_date_and_service_code_length],
+        masked_track_field(&fields[2][expiry_date_and_service_code_length..])
+    );
+
+    let mut censored_fields = vec![
+        pan,
+        get_censored_name(fields[1]),
+        expiry_date_and_service_code,
+    ];
+    censored_fields.extend(fields[3..].iter().map(|field| masked_track_field(field)));
+    censored_fields.join("^")
+}
+
+/// Track 2 data in the ICC format ('D' field separator, 'F' padding) or in the human readable format (';', '=', '?') with
+/// the PAN truncated and the discretionary data masked, the separators, the expiry date and the service code kept, e.g.
+/// '43214321****4321D2612101************F'
+pub fn get_censored_track2(track_data: &str) -> String {
+    let Some(separator) = track_data.find(['D', '=']) else {
+        return masked_track_field(track_data);
+    };
+
+    let pan_start = if track_data.starts_with(';') { 1 } else { 0 };
+    let pan = &track_data[pan_start.min(separator)..separator];
+
+    // Expiry date (YYMM) and service code
+    let discretionary_data_start = (separator + 8).min(track_data.len());
+
+    format!(
+        "{}{}{}{}",
+        &track_data[..pan_start.min(separator)],
+        get_truncated_pan(pan),
+        &track_data[separator..discretionary_data_start],
+        masked_track_field(&track_data[discretionary_data_start..])
+    )
+}
+
+/// Hex of a data object value with the sensitive digits masked with '*', two characters for each byte
+fn censored_value_hex(emv_tag: Option<&EmvTag>, value: &[u8]) -> String {
+    let value_hex = hex::encode_upper(value);
+    let Some(sensitivity) = emv_tag.and_then(|tag| tag.sensitivity) else {
+        return value_hex;
+    };
+
+    // A text value is censored character by character, a masked character masks its byte
+    let text: String = value.iter().map(|&b| b as char).collect();
+    let censored_bytes = |censored_text: String| -> String {
+        value
+            .iter()
+            .zip(censored_text.chars())
+            .map(|(&b, c)| {
+                if c == '*' && b != b'*' {
+                    "**".to_string()
+                } else {
+                    format!("{:02X}", b)
+                }
+            })
+            .collect()
+    };
+
+    match sensitivity {
+        FieldSensitivity::PrimaryAccountNumber => match emv_tag.and_then(|tag| tag.format) {
+            Some(FieldFormat::Alphanumeric) | Some(FieldFormat::AlphanumericSpecial) => {
+                censored_bytes(get_truncated_pan(&text))
+            }
+            _ => {
+                let digits = value_hex.trim_end_matches('F');
+                get_truncated_pan(digits) + &value_hex[digits.len()..]
+            }
+        },
+        FieldSensitivity::Track2 => get_censored_track2(&value_hex),
+        FieldSensitivity::Track1 => censored_bytes(get_censored_track1(&text)),
+        FieldSensitivity::PersonallyIdentifiableInformation => {
+            censored_bytes(get_censored_name(&text))
+        }
+        FieldSensitivity::SensitiveAuthenticationData | FieldSensitivity::Sensitive => {
+            "*".repeat(value_hex.len())
+        }
+        FieldSensitivity::Public => value_hex,
+    }
+}
+
+/// Whether the data is a list of TLV data objects
+fn is_tlv(data: &[u8]) -> bool {
+    let mut read_buffer = data;
+    while !read_buffer.is_empty() {
+        let (tlv_data, leftover_buffer) = Tlv::parse(read_buffer);
+        if tlv_data.is_err() {
+            return false;
+        }
+        read_buffer = leftover_buffer;
+    }
+
+    !data.is_empty()
+}
+
+/// Hex digits as bytes separated by spaces, 16 bytes on a line
+fn hex_lines(hex: &str) -> String {
+    let bytes: Vec<&str> = (0..hex.len())
+        .step_by(2)
+        .map(|i| &hex[i..(i + 2).min(hex.len())])
+        .collect();
+    bytes
+        .chunks(16)
+        .map(|line| line.join(" "))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Hex of a command with the PIN data of a VERIFY or a PIN CHANGE/UNBLOCK command masked
+fn censored_command_hex(apdu: &[u8]) -> String {
+    const INS_VERIFY: u8 = 0x20;
+    const INS_PIN_CHANGE_UNBLOCK: u8 = 0x24;
+
+    let mut command_hex = hex::encode_upper(apdu);
+    if apdu.len() > 5 && (apdu[1] == INS_VERIFY || apdu[1] == INS_PIN_CHANGE_UNBLOCK) {
+        let data_end = (5 + apdu[4] as usize).min(apdu.len());
+        command_hex.replace_range(10..data_end * 2, &"*".repeat(data_end * 2 - 10));
+    }
+
+    hex_lines(&command_hex)
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +634,36 @@ pub struct Capabilities {
     pub enciphered_pin: bool,
     pub terminal_risk_management: bool,
     pub issuer_authentication: bool,
+    // EMV Contactless Book C-2, AIP byte 1 bit 2 (RFU in EMV Book 3): on device cardholder verification is supported
+    #[serde(default)]
+    pub on_device_cardholder_verification: bool,
+}
+
+/// CVMs of the Terminal Capabilities byte 2 (EMV Book 4, A2) that are not PIN, the PIN CVMs are the terminal Capabilities.
+/// Online PIN is not supported.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct CvmCapability {
+    pub signature: bool,
+    pub no_cvm: bool,
+}
+
+impl Default for CvmCapability {
+    fn default() -> CvmCapability {
+        CvmCapability {
+            signature: true,
+            no_cvm: true,
+        }
+    }
+}
+
+/// Terminal Action Codes (EMV Book 3, 10.7) as hex TVR values, an empty one is zeros. In EMV Contactless Book C-2 they are
+/// TAC – Denial 'DF8121', TAC – Online 'DF8122' and TAC – Default 'DF8120'.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct TerminalActionCodes {
+    pub denial: String,
+    pub online: String,
+    pub default: String,
 }
 
 #[derive(Debug)]
@@ -502,7 +701,6 @@ impl From<Vec<u8>> for UsageControl {
     }
 }
 
-#[derive(Debug)]
 pub struct Icc {
     pub capabilities: Capabilities,
     pub usage: UsageControl,
@@ -516,6 +714,29 @@ pub struct Icc {
     pub relay_resistance_data: Option<Vec<u8>>,
 }
 
+// The data to be authenticated has the records of the card, e.g. the PAN, so it is shown by its length. The AFL data
+// authentication log shows the data, censored when sensitive fields are censored.
+impl fmt::Debug for Icc {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Icc")
+            .field("capabilities", &self.capabilities)
+            .field("usage", &self.usage)
+            .field("cvm_rules", &self.cvm_rules)
+            .field("issuer_pk", &self.issuer_pk)
+            .field("icc_pk", &self.icc_pk)
+            .field("icc_pin_pk", &self.icc_pin_pk)
+            .field(
+                "data_authentication",
+                &self
+                    .data_authentication
+                    .as_ref()
+                    .map(|data| format!("{} bytes", data.len())),
+            )
+            .field("relay_resistance_data", &self.relay_resistance_data)
+            .finish()
+    }
+}
+
 impl Icc {
     fn new() -> Icc {
         let capabilities = Capabilities {
@@ -526,6 +747,7 @@ impl Icc {
             enciphered_pin: false,
             terminal_risk_management: false,
             issuer_authentication: false,
+            on_device_cardholder_verification: false,
         };
 
         let usage = UsageControl {
@@ -707,6 +929,11 @@ impl From<C4EnhancedContactlessReaderCapabilities> for Vec<u8> {
 pub struct Terminal {
     pub use_random: bool,
     pub capabilities: Capabilities,
+    // Signature and No CVM of the terminal, the CVM capability of a contactless kernel is set in its settings
+    #[serde(default)]
+    pub cvm_capability: CvmCapability,
+    #[serde(default)]
+    pub terminal_action_codes: TerminalActionCodes,
     pub tvr: TerminalVerificationResults,
     pub tsi: TransactionStatusInformation,
     pub cryptogram_type: CryptogramType,
@@ -743,6 +970,10 @@ pub struct ProtocolDeviations {
     // The expiry is logged. A certificate expiry date that is not a valid date still fails.
     #[serde(default = "default_ignore_certificate_expiry")]
     pub ignore_certificate_expiry: bool,
+    // Select the terminal list of AIDs when the PPSE selection of a contactless transaction fails, EMV Contactless Book B
+    // selects the application with the PPSE only
+    #[serde(default)]
+    pub contactless_list_of_aids: bool,
 }
 
 fn default_ignore_certificate_expiry() -> bool {
@@ -756,6 +987,7 @@ impl Default for ProtocolDeviations {
             external_authenticate_without_aip_support: false,
             kernel_2_offline_pin: false,
             ignore_certificate_expiry: default_ignore_certificate_expiry(),
+            contactless_list_of_aids: false,
         }
     }
 }
@@ -1164,6 +1396,37 @@ pub struct Settings {
     /// Terminal data objects (tag hex => value hex) set by process_settings
     #[serde(default)]
     pub default_tags: HashMap<String, String>,
+    /// Contactless kernel settings by the Kernel ID (hex) of the selected application, see EmvConnection::kernel_id
+    #[serde(default)]
+    pub kernels: HashMap<String, KernelSettings>,
+}
+
+/// Settings of a contactless kernel (EMV Contactless Book B), e.g. an international kernel of EMV Contactless Books C-2 to C-8
+/// or a domestic kernel
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct KernelSettings {
+    pub name: String,
+    /// AIDs (hex) of the kernel when the PPSE entry has no Kernel Identifier. An AID matches the selected application whose DF
+    /// name begins with it, e.g. a RID, and the longest matching AID of the kernels wins.
+    pub aids: Vec<String>,
+    /// Reader CVM Required Limit in the minor unit of the currency
+    pub reader_cvm_required_limit: Option<u64>,
+    /// Terminal data objects (tag hex => value hex) of the kernel, set by process_settings over the default tags
+    pub tags: HashMap<String, String>,
+    /// Terminal data objects (tag hex => value hex) set over the tags of the kernel before GET PROCESSING OPTIONS when the amount
+    /// exceeds the Reader CVM Required Limit
+    pub cvm_required_tags: HashMap<String, String>,
+    /// Kernel Configuration 'On device cardholder verification supported' (EMV Contactless Book C-2): the CVM List is not
+    /// processed when the AIP indicates on device cardholder verification
+    pub on_device_cardholder_verification: bool,
+    /// CVM Capability – CVM Required (EMV Contactless Book C-2), the CVMs of the terminal when the amount exceeds the Reader CVM
+    /// Required Limit. Without it the CVM capability of the terminal.
+    pub cvm_capability_cvm_required: Option<CvmCapability>,
+    /// CVM Capability – No CVM Required, the CVMs of the terminal up to the Reader CVM Required Limit
+    pub cvm_capability_no_cvm_required: Option<CvmCapability>,
+    /// Terminal Action Codes of the kernel instead of the terminal ones
+    pub terminal_action_codes: Option<TerminalActionCodes>,
 }
 
 /// Configuration of EmvConnection::from_configuration as YAML documents, the bundled configuration is used for a None
@@ -1225,12 +1488,25 @@ pub struct ApduExchange {
     pub response: Vec<u8>,
 }
 
+/// Outcome of the reader that overrides the cryptogram of the card, EMV Contactless Book A, 6.2: e.g. a Kernel 3 transaction
+/// whose fDDA or Consumer Device CVM fails after the card has returned its cryptogram in GET PROCESSING OPTIONS
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContactlessOutcome {
+    OnlineRequest,
+    Declined,
+    TryAnotherInterface,
+}
+
 /// Results of the transaction so far. The card data and terminal data objects of the transaction are EmvConnection::tags and
 /// the card capabilities and keys EmvConnection::icc.
 #[derive(Debug, Clone)]
 pub struct TransactionState {
     pub tvr: TerminalVerificationResults,
     pub tsi: TransactionStatusInformation,
+    /// Cryptogram type of the terminal action analysis, see handle_1st_generate_ac
+    pub terminal_action_analysis: Option<CryptogramType>,
+    /// Outcome of the reader over the cryptogram of the card, see first_generate_ac
+    pub contactless_outcome: Option<ContactlessOutcome>,
     /// APDUs exchanged with the card
     pub exchanges: Vec<ApduExchange>,
 }
@@ -1240,6 +1516,8 @@ impl TransactionState {
         TransactionState {
             tvr: terminal.tvr,
             tsi: terminal.tsi,
+            terminal_action_analysis: None,
+            contactless_outcome: None,
             exchanges: Vec::new(),
         }
     }
@@ -1435,7 +1713,7 @@ impl DataObjectList {
 
             if data_object.length > 0 && value.len() != data_object.length {
                 debug!(
-                    "tag {:?} value length {:02X} does not match tag list value length {:02X}",
+                    "tag {:?} value length {} does not match tag list value length {}",
                     data_object.emv_tag.tag,
                     value.len(),
                     data_object.length
@@ -1620,11 +1898,12 @@ impl EmvConnection {
         let old_tag = self.tags.get(tag_name);
         if old_tag.is_some() {
             if self.settings.censor_sensitive_fields {
+                let emv_tag = self.emv_tags.get(tag_name);
                 trace!(
-                    "Overriding tag {:?}. Old size: {}, new size: {}",
+                    "Overriding tag {:?} from {} to {}",
                     tag_name,
-                    old_tag.unwrap().len(),
-                    value.len()
+                    censored_value_hex(emv_tag, old_tag.unwrap()),
+                    censored_value_hex(emv_tag, &value)
                 );
             } else {
                 trace!(
@@ -1737,7 +2016,7 @@ impl EmvConnection {
         if command[..] != apdu[..] {
             debug!(
                 "APDU hook changed the command to:\n{}",
-                HexViewBuilder::new(&command).finish()
+                self.command_view(&command)
             );
         }
 
@@ -1750,7 +2029,7 @@ impl EmvConnection {
             if let Some(hook_response) = hook.on_response(&command, &response) {
                 debug!(
                     "APDU hook changed the response to:\n{}",
-                    HexViewBuilder::new(&hook_response).finish()
+                    self.response_view(&hook_response)
                 );
                 response = hook_response;
             }
@@ -1787,18 +2066,7 @@ impl EmvConnection {
             }
 
             // Send an APDU command.
-            if self.settings.censor_sensitive_fields {
-                debug!(
-                    "Sending APDU: {:02X?}... ({} bytes)",
-                    &apdu_command[0..apdu_command.len().min(5)],
-                    apdu_command.len()
-                );
-            } else {
-                debug!(
-                    "Sending APDU:\n{}",
-                    HexViewBuilder::new(&apdu_command).finish()
-                );
-            }
+            debug!("Sending APDU:\n{}", self.command_view(&apdu_command));
 
             let apdu_response = self.exchange_apdu(&apdu_command)?;
             if apdu_response.len() < 2 {
@@ -1829,7 +2097,7 @@ impl EmvConnection {
                 trace!(
                     "APDU response({} bytes):\n{}",
                     response_data.len(),
-                    HexViewBuilder::new(&response_data).finish()
+                    self.data_view(&response_data)
                 );
 
                 let mut available_data_length = response_trailer[1];
@@ -1846,7 +2114,7 @@ impl EmvConnection {
                 trace!(
                     "APDU response({} bytes):\n{}",
                     response_data.len(),
-                    HexViewBuilder::new(&response_data).finish()
+                    self.data_view(&response_data)
                 );
 
                 let available_data_length = response_trailer[1];
@@ -1866,15 +2134,11 @@ impl EmvConnection {
             }
         }
 
-        if self.settings.censor_sensitive_fields {
-            debug!("APDU response({} bytes)", response_data.len());
-        } else {
-            debug!(
-                "APDU response({} bytes):\n{}",
-                response_data.len(),
-                HexViewBuilder::new(&response_data).finish()
-            );
-        }
+        debug!(
+            "APDU response({} bytes):\n{}",
+            response_data.len(),
+            self.data_view(&response_data)
+        );
 
         if !response_data.is_empty() {
             debug!("APDU TLV parse:");
@@ -1894,6 +2158,88 @@ impl EmvConnection {
             command: command.to_string(),
             sw: response.sw,
         })
+    }
+
+    /// Hex of TLV data with the values of the sensitive data objects masked with '*', the tags, the lengths and the other
+    /// values kept, e.g. '5A 08 12 34 56 00 ** ** 56 08'. The data that does not parse as TLV is masked.
+    pub fn censored_tlv_hex(&self, data: &[u8]) -> String {
+        let mut censored_hex = String::new();
+        self.censor_tlv(data, &mut censored_hex);
+        hex_lines(&censored_hex)
+    }
+
+    fn censor_tlv(&self, data: &[u8], censored_hex: &mut String) {
+        let mut read_buffer = data;
+
+        while !read_buffer.is_empty() {
+            let (tlv_data, leftover_buffer) = Tlv::parse(read_buffer);
+            let Ok(tlv_data) = tlv_data else {
+                censored_hex.push_str(&"*".repeat(read_buffer.len() * 2));
+                return;
+            };
+
+            // The tag and the length as they were in the data
+            let tlv_length = read_buffer.len() - leftover_buffer.len();
+            let value_start = tlv_length - tlv_data.value().len_as_bytes();
+            censored_hex.push_str(&hex::encode_upper(&read_buffer[..value_start]));
+
+            let value = &read_buffer[value_start..tlv_length];
+            let tag_name = hex::encode_upper(tlv_data.tag().to_bytes());
+            let emv_tag = self.emv_tags.get(tag_name.as_str());
+            match tlv_data.value() {
+                Value::Constructed(_) => self.censor_tlv(value, censored_hex),
+                // An unknown data object of TLV data, e.g. a template with an incorrect tag, is censored as TLV
+                Value::Primitive(_) if emv_tag.is_none() && is_tlv(value) => {
+                    self.censor_tlv(value, censored_hex)
+                }
+                Value::Primitive(_) => {
+                    censored_hex.push_str(&censored_value_hex(emv_tag, value));
+                }
+            }
+
+            read_buffer = leftover_buffer;
+        }
+    }
+
+    /// PAN digits of an error, truncated when sensitive fields are censored
+    fn pan_view(&self, ascii_pan: &[u8]) -> String {
+        if self.settings.censor_sensitive_fields {
+            get_truncated_pan(&String::from_utf8_lossy(ascii_pan))
+        } else {
+            format!("{:02X?}", ascii_pan)
+        }
+    }
+
+    /// Hex view of TLV data, censored when sensitive fields are censored
+    fn data_view(&self, data: &[u8]) -> String {
+        if self.settings.censor_sensitive_fields {
+            self.censored_tlv_hex(data)
+        } else {
+            HexViewBuilder::new(data).finish().to_string()
+        }
+    }
+
+    /// Hex view of a command, the PIN data censored when sensitive fields are censored
+    fn command_view(&self, apdu: &[u8]) -> String {
+        if self.settings.censor_sensitive_fields {
+            censored_command_hex(apdu)
+        } else {
+            HexViewBuilder::new(apdu).finish().to_string()
+        }
+    }
+
+    /// Hex view of a response with the status word, the data censored when sensitive fields are censored
+    fn response_view(&self, response: &[u8]) -> String {
+        if self.settings.censor_sensitive_fields && response.len() >= 2 {
+            let (data, sw) = response.split_at(response.len() - 2);
+            format!(
+                "{}\n{}",
+                self.censored_tlv_hex(data),
+                hex_lines(&hex::encode_upper(sw))
+            )
+        } else {
+            HexViewBuilder::new(response).finish().to_string()
+        }
     }
 
     fn print_tag(&self, emv_tag: &EmvTag, level: u8) {
@@ -2055,15 +2401,11 @@ impl EmvConnection {
                         debug!("{}-data: {}", padding, truncated_pan);
                     }
                     Some(FieldSensitivity::Track2) => {
-                        value = match Track2::parse(&String::from_utf8_lossy(&v).to_string()) {
-                            Some(mut track2) => {
-                                track2.censor();
-                                format!("{}", track2)
-                            }
-                            None => value.replace(|_c: char| true, "*"),
-                        };
-
-                        debug!("{}-data: {}", padding, value);
+                        // The value is the human readable Track 2, or the ICC format when it is not in the format
+                        debug!("{}-data: {}", padding, get_censored_track2(&value));
+                    }
+                    Some(FieldSensitivity::Track1) => {
+                        debug!("{}-data: {}", padding, get_censored_track1(&value));
                     }
                     Some(
                         FieldSensitivity::SensitiveAuthenticationData | FieldSensitivity::Sensitive,
@@ -2072,19 +2414,19 @@ impl EmvConnection {
                     }
                     Some(FieldSensitivity::PersonallyIdentifiableInformation) => {
                         // allowing punctuation is primarily to see cardholder name which is separated by '/'
-                        debug!(
-                            "{}-data: {}",
-                            padding,
-                            value.replace(
-                                |c: char| !(c.is_ascii_whitespace() || c.is_ascii_punctuation()),
-                                "*"
-                            )
-                        );
+                        debug!("{}-data: {}", padding, get_censored_name(&value));
                     }
                     _ => {
                         debug!("{}-data: {:02X?} = {}", padding, v, value);
                     }
                 }
+            } else if is_tlv(v) {
+                // An unknown data object of TLV data, e.g. a template with an incorrect tag
+                debug!(
+                    "{}-data: {}",
+                    padding,
+                    self.censored_tlv_hex(v).replace('\n', " ")
+                );
             } else {
                 debug!("{}-data: {:02X?} = {}", padding, v, value);
             }
@@ -2103,11 +2445,20 @@ impl EmvConnection {
                 Ok(tlv) => tlv,
                 Err(err) => {
                     if leftover_buffer.len() > 0 {
-                        trace!(
-                            "Could not parse as TLV! error:{:?}, data: {:02X?}",
-                            err,
-                            read_buffer
-                        );
+                        if self.settings.censor_sensitive_fields {
+                            trace!(
+                                "Could not parse as TLV! error:{:?}, data ({} bytes):\n{}",
+                                err,
+                                read_buffer.len(),
+                                self.censored_tlv_hex(read_buffer)
+                            );
+                        } else {
+                            trace!(
+                                "Could not parse as TLV! error:{:?}, data: {:02X?}",
+                                err,
+                                read_buffer
+                            );
+                        }
                     }
 
                     break;
@@ -2176,8 +2527,112 @@ impl EmvConnection {
         }
     }
 
+    /// Kernel ID of the selected contactless application, EMV Contactless Book B, 3.3.2.5: the Kernel Identifier ('9F2A') of the
+    /// PPSE entry, its first byte for an international kernel and its first three bytes for a domestic kernel. Without it, or
+    /// with a short Kernel ID of zero, the kernel of the settings whose AID matches the selected application.
+    pub fn kernel_id(&self) -> Option<String> {
+        if !self.contactless {
+            return None;
+        }
+
+        if let Some(kernel_identifier) = self.kernel_identifier.as_deref() {
+            if let Some(&b1) = kernel_identifier.first() {
+                if b1 & 0b0011_1111 != 0 {
+                    let length = if b1 & 0b1100_0000 == 0 { 1 } else { 3 };
+                    return Some(hex::encode_upper(
+                        &kernel_identifier[..length.min(kernel_identifier.len())],
+                    ));
+                }
+            }
+        }
+
+        let df_name = hex::encode_upper(self.get_tag_value("84")?);
+        self.settings
+            .kernels
+            .iter()
+            .flat_map(|(kernel_id, kernel)| kernel.aids.iter().map(move |aid| (kernel_id, aid)))
+            .filter(|(_, aid)| df_name.starts_with(&aid.to_uppercase()))
+            .max_by_key(|(_, aid)| aid.len())
+            .map(|(kernel_id, _)| kernel_id.to_uppercase())
+    }
+
+    /// Settings of the kernel of the selected contactless application
+    pub fn kernel_settings(&self) -> Option<&KernelSettings> {
+        let kernel_id = self.kernel_id()?;
+        self.settings
+            .kernels
+            .iter()
+            .find(|(id, _)| id.to_uppercase() == kernel_id)
+            .map(|(_, kernel)| kernel)
+    }
+
+    /// Terminal data objects (tag hex => value hex) of the settings
+    fn set_tags_of_settings(
+        &mut self,
+        tags: &HashMap<String, String>,
+        description: &str,
+    ) -> Result<(), EmvError> {
+        for (tag_name, tag_value) in tags.iter() {
+            let value = hex::decode(tag_value).map_err(|_| {
+                EmvError::Configuration(format!("Invalid value of {} {}", description, tag_name))
+            })?;
+            self.set_tag(tag_name, value)?;
+        }
+
+        Ok(())
+    }
+
+    /// CVM required tags of the kernel set over its tags when the contactless amount exceeds the Reader CVM Required Limit of the
+    /// kernel, e.g. a CVM required bit of the terminal data that the card requests in its PDOL or CDOL
+    pub fn process_kernel_cvm_required_limit(&mut self) -> Result<(), EmvError> {
+        if !self.cvm_required_limit_exceeded()? {
+            return Ok(());
+        }
+        let Some(kernel) = self.kernel_settings().cloned() else {
+            return Ok(());
+        };
+
+        debug!(
+            "Amount exceeds the Reader CVM Required Limit {:?} of the kernel {:?}",
+            kernel.reader_cvm_required_limit, kernel.name
+        );
+        self.set_tags_of_settings(&kernel.cvm_required_tags, "CVM required tag")
+    }
+
+    /// The amount exceeds the Reader CVM Required Limit of the kernel, false without the limit or the amount
+    pub fn cvm_required_limit_exceeded(&self) -> Result<bool, EmvError> {
+        let Some(reader_cvm_required_limit) = self
+            .kernel_settings()
+            .and_then(|kernel| kernel.reader_cvm_required_limit)
+        else {
+            return Ok(false);
+        };
+        if self.get_tag_value("9F02").is_none() {
+            return Ok(false);
+        }
+
+        Ok(self.amount_authorised()? > reader_cvm_required_limit)
+    }
+
+    /// CVM capability of the transaction: of the kernel by the Reader CVM Required Limit (EMV Contactless Book C-2, CVM
+    /// Capability – CVM Required and CVM Capability – No CVM Required), otherwise of the terminal
+    fn cvm_capability(&self) -> Result<CvmCapability, EmvError> {
+        let terminal_cvm_capability = self.settings.terminal.cvm_capability;
+        let Some(kernel) = self.kernel_settings() else {
+            return Ok(terminal_cvm_capability);
+        };
+
+        let kernel_cvm_capability = if self.cvm_required_limit_exceeded()? {
+            kernel.cvm_capability_cvm_required
+        } else {
+            kernel.cvm_capability_no_cvm_required
+        };
+        Ok(kernel_cvm_capability.unwrap_or(terminal_cvm_capability))
+    }
+
     /// GET PROCESSING OPTIONS with the PDOL Related Data of the terminal data objects
     pub fn get_processing_options(&mut self) -> Result<ApduResponse, EmvError> {
+        self.process_kernel_cvm_required_limit()?;
         let pdol_data = self.pdol_data()?;
         self.send_get_processing_options(&pdol_data)
     }
@@ -2286,17 +2741,10 @@ impl EmvConnection {
         }
 
         if let Some(data_authentication) = &self.icc.data_authentication {
-            if self.settings.censor_sensitive_fields {
-                debug!(
-                    "AFL data authentication: {} bytes",
-                    data_authentication.len()
-                );
-            } else {
-                debug!(
-                    "AFL data authentication:\n{}",
-                    HexViewBuilder::new(data_authentication).finish()
-                );
-            }
+            debug!(
+                "AFL data authentication:\n{}",
+                self.data_view(data_authentication)
+            );
         }
 
         Ok(())
@@ -2347,7 +2795,9 @@ impl EmvConnection {
                 data_authentication.extend(record_data_authentication);
 
                 if self.settings.censor_sensitive_fields {
-                    trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{} bytes", short_file_identifier, data_authentication_records, record_index, entry.last_record, data_authentication.len());
+                    let data_authentication =
+                        self.icc.data_authentication.as_deref().unwrap_or_default();
+                    trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data ({} bytes):\n{}", short_file_identifier, data_authentication_records, record_index, entry.last_record, data_authentication.len(), self.censored_tlv_hex(data_authentication));
                 } else {
                     trace!("Data authentication building: short_file_identifier:{}, data_authentication_records:{}, record_index:{}/{}, data:{:02X?}", short_file_identifier, data_authentication_records, record_index, entry.last_record, data_authentication);
                 }
@@ -2389,7 +2839,8 @@ impl EmvConnection {
         self.icc.capabilities.terminal_risk_management = get_bit!(auc_b1, 3);
         // Issuer Authentication using the EXTERNAL AUTHENTICATE command is supported
         self.icc.capabilities.issuer_authentication = get_bit!(auc_b1, 2);
-        // bit 1 = RFU
+        // RFU in EMV Book 3, on device cardholder verification in EMV Contactless Book C-2
+        self.icc.capabilities.on_device_cardholder_verification = get_bit!(auc_b1, 1);
         self.icc.capabilities.cda = get_bit!(auc_b1, 0);
 
         if let Some(tag_9f07_application_usage_control) = self.get_tag_value("9F07") {
@@ -2850,9 +3301,25 @@ impl EmvConnection {
         Ok(icc_cryptogram_type)
     }
 
-    /// First GENERATE AC requesting the cryptogram type of the settings
+    /// First GENERATE AC requesting the cryptogram type of the terminal action analysis, at most the cryptogram type of the
+    /// settings (EMV Book 3, 9.3 hierarchy: AAC, ARQC, TC), e.g. the ARQC setting goes online instead of a TC. Without the
+    /// terminal action analysis the cryptogram type of the settings.
     pub fn handle_1st_generate_ac(&mut self) -> Result<CryptogramType, EmvError> {
-        self.first_generate_ac(self.settings.terminal.cryptogram_type)
+        let settings_cryptogram_type = self.settings.terminal.cryptogram_type;
+        let cryptogram_type = match self.state.terminal_action_analysis {
+            Some(recommended) if recommended.level() < settings_cryptogram_type.level() => {
+                recommended
+            }
+            _ => settings_cryptogram_type,
+        };
+        if let Some(recommended) = self.state.terminal_action_analysis {
+            debug!(
+                "Terminal action analysis recommends {:?}, the settings allow at most {:?} => {:?} requested",
+                recommended, settings_cryptogram_type, cryptogram_type
+            );
+        }
+
+        self.first_generate_ac(cryptogram_type)
     }
 
     /// First GENERATE AC requesting the cryptogram type. The cryptogram of a contactless GET PROCESSING OPTIONS response is
@@ -2868,7 +3335,33 @@ impl EmvConnection {
             // ref. EMV Contactless Book C-3, A.2 Data Elements by Name - cryptogram returned in GET PROCESSING OPTIONS (Kernel 3, Visa).
             // The ICC has decided the cryptogram before the terminal action analysis, it is the outcome of the ICC and not a response
             // to a requested cryptogram type (EMV Book 3, 9.3 applies to GENERATE AC).
-            return self.validate_ac(None, false);
+            let icc_cryptogram_type = self.validate_ac(None, false)?;
+
+            // The reader outcome of the fDDA or the Consumer Device CVM overrides the cryptogram of the card, e.g. a TC whose fDDA
+            // fails is sent online or declined (EMV Contactless Book C-3, 5)
+            return Ok(match self.state.contactless_outcome {
+                Some(ContactlessOutcome::Declined) => {
+                    info!(
+                        "Transaction declined by the reader, card cryptogram {:?}",
+                        icc_cryptogram_type
+                    );
+                    CryptogramType::ApplicationAuthenticationCryptogram
+                }
+                Some(ContactlessOutcome::TryAnotherInterface) => {
+                    info!(
+                        "Try Another Interface, card cryptogram {:?}",
+                        icc_cryptogram_type
+                    );
+                    CryptogramType::ApplicationAuthenticationCryptogram
+                }
+                Some(ContactlessOutcome::OnlineRequest)
+                    if icc_cryptogram_type == CryptogramType::TransactionCertificate =>
+                {
+                    info!("Online Request by the reader, the TC of the card is sent online");
+                    CryptogramType::AuthorisationRequestCryptogram
+                }
+                _ => icc_cryptogram_type,
+            });
         }
 
         // ARQC continues with online processing and handle_2nd_generate_ac
@@ -2910,10 +3403,21 @@ impl EmvConnection {
         let decision = self.online_authorisation_decision();
         if self.contactless {
             debug!(
-                "No second GENERATE AC in a contactless transaction, online authorisation decides the outcome: {:?}",
+                "No second GENERATE AC in a contactless transaction, the ARQC of the card is the Online Request outcome and \
+                 the online authorisation decides: {:?}",
                 decision
             );
             return Ok(decision);
+        }
+
+        // Without an Authorisation Response Code the terminal could not go online, EMV Book 4, A6: 'Y3' and 'Z3' are 'Unable
+        // to go online, offline approved / declined'
+        if self.get_tag_value("8A").is_none() {
+            let authorisation_response_code = match decision {
+                CryptogramType::TransactionCertificate => b"Y3",
+                _ => b"Z3",
+            };
+            self.process_tag_as_tlv("8A", authorisation_response_code.to_vec());
         }
 
         self.second_generate_ac(decision)
@@ -3233,11 +3737,25 @@ impl EmvConnection {
         Ok(())
     }
 
-    /// Candidate applications of the PSE / PPSE, or without them of the terminal list of AIDs (EMV Book 1, 12.3.2)
+    /// Candidate applications of the PSE / PPSE, or without them of the terminal list of AIDs (EMV Book 1, 12.3.2). A contactless
+    /// transaction has the PPSE only, see ProtocolDeviations::contactless_list_of_aids.
     pub fn candidate_applications(&mut self) -> Result<Vec<EmvApplication>, EmvError> {
         match self.handle_select_payment_system_environment() {
             Ok(applications) => Ok(applications),
             Err(EmvError::Interface(err)) => Err(EmvError::Interface(err)),
+            // EMV Contactless Book B: Entry Point selects the application with the PPSE only, a failed PPSE selection, e.g. a
+            // response cut by the card leaving the field, ends the transaction and the card is presented again
+            Err(err)
+                if self.contactless
+                    && !self
+                        .settings
+                        .terminal
+                        .protocol_deviations
+                        .contactless_list_of_aids =>
+            {
+                warn!("PPSE selection failed, present the card again");
+                Err(err)
+            }
             Err(_) => self.handle_select_list_of_aids(),
         }
     }
@@ -3258,11 +3776,16 @@ impl EmvConnection {
     /// Terminal data objects of the settings, and of the transaction date, time and Unpredictable Number when not set
     pub fn process_settings(&mut self) -> Result<(), EmvError> {
         let default_tags = self.settings.default_tags.clone();
-        for (tag_name, tag_value) in default_tags.iter() {
-            let value = hex::decode(tag_value).map_err(|_| {
-                EmvError::Configuration(format!("Invalid value of default tag {}", tag_name))
-            })?;
-            self.set_tag(&tag_name, value)?;
+        self.set_tags_of_settings(&default_tags, "default tag")?;
+
+        // The tags of the kernel of a contactless transaction are set over the default tags
+        if let Some(kernel) = self.kernel_settings().cloned() {
+            debug!(
+                "Kernel ID {:?} {:?}",
+                self.kernel_id().unwrap_or_default(),
+                kernel.name
+            );
+            self.set_tags_of_settings(&kernel.tags, "kernel tag")?;
         }
 
         let now = Utc::now().naive_utc();
@@ -3289,11 +3812,6 @@ impl EmvConnection {
             self.fill_random(&mut tag_9f37_unpredictable_number[..]);
 
             self.process_tag_as_tlv("9F37", tag_9f37_unpredictable_number.to_vec());
-        }
-
-        if !self.get_tag_value("8A").is_some() {
-            // ref. EMV Book 4, A6 Authorisation Response Code
-            self.process_tag_as_tlv("8A", b"\x59\x33".to_vec()); //Y3 = Unable to go online, offline approved
         }
 
         if !self.get_tag_value("9F66").is_some() {
@@ -3593,8 +4111,9 @@ impl EmvConnection {
             .map_err(|_| warned(EmvError::authentication("Certificate IIN is not BCD")))?;
         if ascii_pan.len() < ascii_iin.len() || ascii_iin != &ascii_pan[0..ascii_iin.len()] {
             return Err(warned(EmvError::authentication(format!(
-                "IIN mismatch! Cert IIN: {:02X?}, PAN: {:02X?}",
-                ascii_iin, ascii_pan
+                "IIN mismatch! Cert IIN: {:02X?}, PAN: {}",
+                ascii_iin,
+                self.pan_view(&ascii_pan)
             ))));
         }
 
@@ -3744,8 +4263,9 @@ impl EmvConnection {
             .map_err(|_| warned(EmvError::authentication("Certificate PAN is not BCD")))?;
         if icc_ascii_pan != ascii_pan {
             return Err(warned(EmvError::authentication(format!(
-                "PAN mismatch! Cert PAN: {:02X?}, PAN: {:02X?}",
-                icc_ascii_pan, ascii_pan
+                "PAN mismatch! Cert PAN: {}, PAN: {}",
+                self.pan_view(&icc_ascii_pan),
+                self.pan_view(&ascii_pan)
             ))));
         }
 
@@ -3791,9 +4311,21 @@ impl EmvConnection {
         }
     }
 
+    /// Signed Dynamic Application Data ('9F4B') of DDA and CDA, Signed Data Format '05' (EMV Book 2, 6.5.2), the ICC Dynamic
+    /// Data of it as the result
     pub fn validate_signed_dynamic_application_data(
         &self,
         auth_data: &[u8],
+    ) -> Result<Vec<u8>, EmvError> {
+        self.validate_signed_dynamic_application_data_of_format(auth_data, 0x05)
+    }
+
+    /// Signed Dynamic Application Data ('9F4B') of the Signed Data Format: '05' of DDA and CDA (EMV Book 2, 6.5.2), '95' of fDDA
+    /// (EMV Contactless Book C-3, Annex C)
+    fn validate_signed_dynamic_application_data_of_format(
+        &self,
+        auth_data: &[u8],
+        signed_data_format: u8,
     ) -> Result<Vec<u8>, EmvError> {
         let tag_9f4b_signed_data = self.require_tag("9F4B")?;
         trace!(
@@ -3817,10 +4349,11 @@ impl EmvConnection {
 
         let tag_9f4b_signed_data_decrypted = icc_pk.public_decrypt(&tag_9f4b_signed_data[..])?;
         let tag_9f4b_signed_data_decrypted_length = tag_9f4b_signed_data_decrypted.len();
-        if tag_9f4b_signed_data_decrypted[1] != 0x05 {
-            return Err(warned(EmvError::authentication(
-                "Unrecognized Signed Dynamic Application Data format",
-            )));
+        if tag_9f4b_signed_data_decrypted[1] != signed_data_format {
+            return Err(warned(EmvError::authentication(format!(
+                "Unrecognized Signed Dynamic Application Data format {:02X}, expected {:02X}",
+                tag_9f4b_signed_data_decrypted[1], signed_data_format
+            ))));
         }
 
         let tag_9f4b_signed_data_decrypted_hash_algo = tag_9f4b_signed_data_decrypted[2];
@@ -3905,7 +4438,8 @@ impl EmvConnection {
         checksum_data
             .extend_from_slice(&tag_93_ssad_decrypted[1..tag_93_ssad_decrypted.len() - 22]);
         checksum_data.extend_from_slice(data_authentication);
-        checksum_data.extend_from_slice(&self.static_data_authentication_tag_list_values()?);
+        let tag_list_values = self.static_data_authentication_tag_list_values()?;
+        checksum_data.extend_from_slice(&tag_list_values);
 
         let ssad_checksum_calculated = sha1(&checksum_data[..]);
 
@@ -3913,10 +4447,29 @@ impl EmvConnection {
             [tag_93_ssad_decrypted.len() - 22..tag_93_ssad_decrypted.len() - 1];
 
         if &ssad_checksum_calculated[..] != ssad_checksum {
-            warn!(
-                "Checksum input\n{}",
-                HexViewBuilder::new(&checksum_data[..]).finish()
-            );
+            if self.settings.censor_sensitive_fields {
+                // The recovered data, the records of the data to be authenticated and the tag list values
+                let data_authentication_start =
+                    checksum_data.len() - data_authentication.len() - tag_list_values.len();
+                let data_authentication_end = checksum_data.len() - tag_list_values.len();
+                warn!(
+                    "Checksum input\n{}\n{}\n{}",
+                    hex_lines(&hex::encode_upper(
+                        &checksum_data[..data_authentication_start]
+                    )),
+                    self.censored_tlv_hex(
+                        &checksum_data[data_authentication_start..data_authentication_end]
+                    ),
+                    hex_lines(&hex::encode_upper(
+                        &checksum_data[data_authentication_end..]
+                    ))
+                );
+            } else {
+                warn!(
+                    "Checksum input\n{}",
+                    HexViewBuilder::new(&checksum_data[..]).finish()
+                );
+            }
             warn!(
                 "Calculated checksum\n{}",
                 HexViewBuilder::new(&ssad_checksum_calculated[..]).finish()
@@ -3945,6 +4498,8 @@ impl EmvConnection {
         } else {
             None
         };
+        // Signed Data Format '95' of fDDA, '05' of DDA
+        let signed_data_format = if tag_9f69.is_some() { 0x95 } else { 0x05 };
         if let Some(tag_9f69_card_authentication_related_data) = tag_9f69 {
             // ref. EMV Contactless Book C-3, Annex C Fast Dynamic Data Authentication (fDDA)
             // ref. EMV Contactless Book C-7, Annex B Fast Dynamic Data Authentication (fDDA)
@@ -3980,8 +4535,11 @@ impl EmvConnection {
             self.internal_authenticate(&auth_data)?;
         }
 
-        let tag_9f4b_signed_data_decrypted_dynamic_data =
-            self.validate_signed_dynamic_application_data(&auth_data[..])?;
+        let tag_9f4b_signed_data_decrypted_dynamic_data = self
+            .validate_signed_dynamic_application_data_of_format(
+                &auth_data[..],
+                signed_data_format,
+            )?;
 
         // ICC Dynamic Data = ICC Dynamic Number length || ICC Dynamic Number, ref. EMV Book 2, 6.5.2
         let icc_dynamic_number_length = tag_9f4b_signed_data_decrypted_dynamic_data
@@ -4045,6 +4603,136 @@ impl EmvConnection {
 
         self.handle_public_keys(application)?;
 
+        self.handle_processing_restrictions()?;
+
+        Ok(())
+    }
+
+    /// Date YYMMDD (n6) as YYYYMMDD, a year 50-99 is 1950-1999 and 00-49 is 2000-2049
+    fn emv_date(&self, tag_name: &str) -> Result<Option<u32>, EmvError> {
+        let Some(value) = self.get_tag_value(tag_name) else {
+            return Ok(None);
+        };
+
+        let date = bcdutil::bcd_to_ascii(value)
+            .ok()
+            .filter(|ascii| ascii.len() == 6)
+            .and_then(|ascii| str::from_utf8(&ascii).ok()?.parse::<u32>().ok())
+            .ok_or_else(|| {
+                warned(EmvError::invalid(format!(
+                    "Invalid date {} {:02X?}",
+                    tag_name, value
+                )))
+            })?;
+
+        let century = if date / 10000 < 50 {
+            20000000
+        } else {
+            19000000
+        };
+        Ok(Some(century + date))
+    }
+
+    /// Application Usage Control check of EMV Book 3, 10.4.2, true when the card allows the transaction
+    fn application_usage_allowed(&self) -> bool {
+        let usage = &self.icc.usage;
+
+        // EMV Book 4, A1: an ATM is the Terminal Type '14', '15' or '16'
+        let atm = matches!(
+            self.get_tag_value("9F35").and_then(|t| t.first()),
+            Some(0x14) | Some(0x15) | Some(0x16)
+        );
+        if (atm && !usage.atms) || (!atm && !usage.terminals_other_than_atms) {
+            debug!(
+                "Application Usage Control: not valid at this terminal (ATM: {})",
+                atm
+            );
+            return false;
+        }
+
+        // Domestic and international checks need the Issuer Country Code
+        let (Some(issuer_country_code), Some(terminal_country_code)) =
+            (self.get_tag_value("5F28"), self.get_tag_value("9F1A"))
+        else {
+            return true;
+        };
+        let domestic = issuer_country_code == terminal_country_code;
+
+        // Transaction Type, the first two digits of the ISO 8583:1987 Processing Code: '01' cash, '00' purchase and '09' purchase
+        // with cashback. The terminal does not distinguish goods from services, a purchase is allowed for either.
+        let transaction_type = self.get_tag_value("9C").and_then(|t| t.first().copied());
+        let cash = transaction_type == Some(0x01);
+        let purchase = matches!(transaction_type, None | Some(0x00) | Some(0x09));
+        let cashback = transaction_type == Some(0x09)
+            || self
+                .get_tag_value("9F03")
+                .is_some_and(|amount_other| amount_other.iter().any(|b| *b != 0));
+
+        let allowed = if domestic {
+            (!cash || usage.domestic_cash_transactions)
+                && (!purchase || usage.domestic_goods || usage.domestic_services)
+                && (!cashback || usage.domestic_cashback)
+        } else {
+            (!cash || usage.international_cash_transactions)
+                && (!purchase || usage.international_goods || usage.international_services)
+                && (!cashback || usage.international_cashback)
+        };
+        if !allowed {
+            debug!(
+                "Application Usage Control: transaction type {:02X?} is not allowed (domestic: {})",
+                transaction_type, domestic
+            );
+        }
+
+        allowed
+    }
+
+    /// Processing Restrictions, EMV Book 3, 10.4: the Application Version Numbers of the ICC ('9F08') and the terminal ('9F09'),
+    /// the Application Usage Control ('9F07') and the Application Effective ('5F25') and Expiration ('5F24') Dates against the
+    /// Transaction Date ('9A'). The results are in the TVR.
+    pub fn handle_processing_restrictions(&mut self) -> Result<(), EmvError> {
+        if let (Some(icc_version), Some(terminal_version)) =
+            (self.get_tag_value("9F08"), self.get_tag_value("9F09"))
+        {
+            if icc_version != terminal_version {
+                debug!(
+                    "Application Version Numbers of the ICC {:02X?} and the terminal {:02X?} differ",
+                    icc_version, terminal_version
+                );
+                self.state
+                    .tvr
+                    .icc_and_terminal_have_different_application_versions = true;
+            }
+        }
+
+        if self.get_tag_value("9F07").is_some() && !self.application_usage_allowed() {
+            self.state
+                .tvr
+                .requested_service_not_allowed_for_card_product = true;
+        }
+
+        let Some(transaction_date) = self.emv_date("9A")? else {
+            return Err(warned(EmvError::missing("9A (Transaction Date)")));
+        };
+        if let Some(effective_date) = self.emv_date("5F25")? {
+            if transaction_date < effective_date {
+                debug!(
+                    "Application is not yet effective, effective date {}",
+                    effective_date
+                );
+                self.state.tvr.application_not_yet_effective = true;
+            }
+        }
+        if let Some(expiration_date) = self.emv_date("5F24")? {
+            if transaction_date > expiration_date {
+                debug!(
+                    "Application is expired, expiration date {}",
+                    expiration_date
+                );
+                self.state.tvr.expired_application = true;
+            }
+        }
+
         Ok(())
     }
 
@@ -4072,6 +4760,34 @@ impl EmvConnection {
     /// Cardholder Verification, EMV Book 3, 10.5: the CV Rules of the CVM List are processed in order with the PIN of
     /// pin_callback. The CVM Results are data object '9F34'.
     pub fn handle_card_verification_methods(&mut self) -> Result<(), EmvError> {
+        // EMV Contactless Book C-2, CVM Selection: with on device cardholder verification of the AIP and of the kernel the CVM List
+        // is not processed. Above the Reader CVM Required Limit the CVM is the on device cardholder verification of the card (CVM
+        // Results '010002', Outcome CVM 'Confirmation Code Verified'), otherwise no CVM ('3F0002').
+        if self.icc.capabilities.on_device_cardholder_verification
+            && self
+                .kernel_settings()
+                .is_some_and(|kernel| kernel.on_device_cardholder_verification)
+        {
+            let cvm_results = if self.cvm_required_limit_exceeded()? {
+                debug!("On device cardholder verification, the CVM List is not processed");
+                b"\x01\x00\x02"
+            } else {
+                debug!("On device cardholder verification is not required below the Reader CVM Required Limit");
+                b"\x3F\x00\x02"
+            };
+            self.process_tag_as_tlv("9F34", cvm_results.to_vec());
+            self.state.tsi.cardholder_verification_was_performed = true;
+            return Ok(());
+        }
+
+        // EMV Contactless Book C-3, 5: the Kernel 3 CVM is of the Card Transaction Qualifiers, not of the AIP and the CVM List.
+        // Without the CTQ the AIP and the CVM List apply.
+        if self.kernel_id().as_deref() == Some("03") {
+            if let Some(ctq) = self.get_tag_value("9F6C").cloned() {
+                return self.handle_kernel_3_card_verification(&ctq);
+            }
+        }
+
         // EMV Book 3, 10.5: cardholder verification is performed only when the AIP indicates that the ICC supports it. Without the
         // support it is not performed, which is not a failure in the TVR, and the CVM Results are 'No CVM performed' with an
         // unknown result (EMV Book 4, A4).
@@ -4095,8 +4811,8 @@ impl EmvConnection {
         let purchase_amount = self.amount_authorised()?;
 
         // EMV Contactless Book C-2, 5: Kernel 2 has no VERIFY command, so offline PIN is not supported in a Kernel 2 transaction.
-        // Kernel 2 is identified by Kernel Identifier '02' of the PPSE directory entry.
-        let kernel_2 = self.contactless && self.kernel_identifier.as_deref() == Some(&[0x02][..]);
+        // Kernel 2 is Kernel ID '02', see kernel_id.
+        let kernel_2 = self.kernel_id().as_deref() == Some("02");
         let offline_pin_supported = !kernel_2
             || self
                 .settings
@@ -4106,6 +4822,8 @@ impl EmvConnection {
         if kernel_2 && offline_pin_supported {
             warn!("Offline PIN in a Kernel 2 transaction, a protocol deviation");
         }
+
+        let cvm_capability = self.cvm_capability()?;
 
         let cvm_rules = self.icc.cvm_rules.clone();
         for rule in cvm_rules {
@@ -4171,9 +4889,22 @@ impl EmvConnection {
                         | Ok(CvmCode::EncipheredPinOfflineAndSignature) => true,
                         _ => false,
                     };
+                    let with_signature = matches!(
+                        rule.code,
+                        Ok(CvmCode::PlaintextPinAndSignature)
+                            | Ok(CvmCode::EncipheredPinOfflineAndSignature)
+                    );
 
                     if !offline_pin_supported {
                         debug!("Offline PIN is not supported in a Kernel 2 transaction");
+
+                        if skip_if_not_supported {
+                            continue;
+                        }
+
+                        success = false;
+                    } else if with_signature && !cvm_capability.signature {
+                        debug!("Signature is not supported by the terminal");
 
                         if skip_if_not_supported {
                             continue;
@@ -4203,8 +4934,21 @@ impl EmvConnection {
                         continue;
                     }
                 }
-                Ok(CvmCode::Signature) | Ok(CvmCode::NoCvm) => {
-                    success = true;
+                Ok(code @ CvmCode::Signature) | Ok(code @ CvmCode::NoCvm) => {
+                    let supported = match code {
+                        CvmCode::Signature => cvm_capability.signature,
+                        _ => cvm_capability.no_cvm,
+                    };
+
+                    if !supported {
+                        debug!("{:?} is not supported by the terminal", code);
+
+                        if skip_if_not_supported {
+                            continue;
+                        }
+                    }
+
+                    success = supported;
                 }
             }
 
@@ -4249,6 +4993,27 @@ impl EmvConnection {
     pub fn handle_offline_data_authentication(&mut self) -> Result<(), EmvError> {
         //ref. EMV 4.3 Book 3 - 10.3 Offline Data Authentication
 
+        // EMV Contactless Book C-3, 5: Kernel 3 performs fDDA for an ARQC of the card only when the reader supports ODA for Online
+        // Authorizations (TTQ byte 1 bit 1)
+        let kernel_3 = self.kernel_id().as_deref() == Some("03");
+        let ttq_b1 = self
+            .get_tag_value("9F66")
+            .and_then(|ttq| ttq.first())
+            .copied()
+            .unwrap_or(0);
+        let icc_cryptogram_type = self
+            .get_tag_value("9F27")
+            .and_then(|cid| cid.first())
+            .and_then(|cid| CryptogramType::try_from(*cid).ok());
+        if kernel_3
+            && icc_cryptogram_type == Some(CryptogramType::AuthorisationRequestCryptogram)
+            && !get_bit!(ttq_b1, 0)
+        {
+            debug!("fDDA is not performed for an ARQC without ODA for Online Authorizations (TTQ)");
+            self.state.tvr.offline_data_authentication_was_not_performed = true;
+            return Ok(());
+        }
+
         if self.settings.terminal.capabilities.cda && self.icc.capabilities.cda {
             // CDA is completed in GENERATE AC, the ICC Public Key retrieval of it is done here (EMV Book 2, 6.6.1). Without the
             // key CDA fails.
@@ -4256,22 +5021,139 @@ impl EmvConnection {
                 warn!("ICC public key could not be retrieved for CDA");
                 self.state.tvr.cda_failed = true;
             }
-        } else {
-            if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
-                if let Err(_) = self.handle_dynamic_data_authentication() {
-                    self.state.tvr.dda_failed = true;
-                }
-            } else if self.settings.terminal.capabilities.sda && self.icc.capabilities.sda {
-                let data_authentication = self.icc.data_authentication.clone().unwrap_or_default();
-                if let Err(_) = self.handle_signed_static_application_data(&data_authentication[..])
-                {
-                    self.state.tvr.sda_failed = true;
-                }
+        } else if self.settings.terminal.capabilities.dda && self.icc.capabilities.dda {
+            if let Err(_) = self.handle_dynamic_data_authentication() {
+                self.state.tvr.dda_failed = true;
             }
+        } else if self.settings.terminal.capabilities.sda && self.icc.capabilities.sda {
+            let data_authentication = self.icc.data_authentication.clone().unwrap_or_default();
+            if let Err(_) = self.handle_signed_static_application_data(&data_authentication[..]) {
+                self.state.tvr.sda_failed = true;
+            }
+        } else {
+            // EMV Book 3, 10.3: no method supported by both the terminal and the card, the TSI is not set
+            debug!("Offline data authentication was not performed, no method supported by both the terminal and the card");
+            self.state.tvr.offline_data_authentication_was_not_performed = true;
+            return Ok(());
         }
 
         self.state.tsi.offline_data_authentication_was_performed = true;
 
+        if kernel_3 && self.state.tvr.dda_failed {
+            let outcome = self.kernel_3_oda_failure_outcome();
+            warn!("fDDA failed, outcome {:?}", outcome);
+            self.state.contactless_outcome = Some(outcome);
+        }
+
+        Ok(())
+    }
+
+    /// Outcome of a failed fDDA by the Card Transaction Qualifiers ('9F6C') of the card, EMV Contactless Book C-3, 5: online when
+    /// the card asks for it and the reader is online capable, another interface when the card asks for it and the reader has a
+    /// contact chip interface, otherwise declined
+    fn kernel_3_oda_failure_outcome(&self) -> ContactlessOutcome {
+        let ctq_b1 = self
+            .get_tag_value("9F6C")
+            .and_then(|ctq| ctq.first())
+            .copied()
+            .unwrap_or(0);
+        let ttq_b1 = self
+            .get_tag_value("9F66")
+            .and_then(|ttq| ttq.first())
+            .copied()
+            .unwrap_or(0);
+
+        // CTQ byte 1 b6 'Go Online if Offline Data Authentication Fails and Reader is online capable', b5 'Switch Interface if
+        // Offline Data Authentication fails and Reader supports contact chip'; TTQ byte 1 b4 'Offline-only reader', b5 'EMV contact
+        // chip supported'
+        if get_bit!(ctq_b1, 5) && !get_bit!(ttq_b1, 3) {
+            ContactlessOutcome::OnlineRequest
+        } else if get_bit!(ctq_b1, 4) && get_bit!(ttq_b1, 4) {
+            ContactlessOutcome::TryAnotherInterface
+        } else {
+            ContactlessOutcome::Declined
+        }
+    }
+
+    /// Kernel 3 CVM of the Card Transaction Qualifiers ('9F6C'), EMV Contactless Book C-3, 5: Online PIN, Consumer Device CVM or
+    /// signature in this order, each when the card asks for it and the reader supports it (TTQ). A Consumer Device CVM is
+    /// accepted when the CTQ in the Card Authentication Related Data ('9F69') that fDDA has verified is the same, the CVM Results
+    /// ('9F34') of it are '010002' like the Confirmation Code Verified of EMV Contactless Book C-2.
+    fn handle_kernel_3_card_verification(&mut self, ctq: &[u8]) -> Result<(), EmvError> {
+        let ctq_b1 = ctq.first().copied().unwrap_or(0);
+        let ctq_b2 = ctq.get(1).copied().unwrap_or(0);
+        let ttq = self.get_tag_value("9F66").cloned().unwrap_or_default();
+        let ttq_b1 = ttq.first().copied().unwrap_or(0);
+        let ttq_b2 = ttq.get(1).copied().unwrap_or(0);
+        let ttq_b3 = ttq.get(2).copied().unwrap_or(0);
+
+        // CTQ byte 1 b8 'Online PIN Required', b7 'Signature Required', byte 2 b8 'Consumer Device CVM Performed'; TTQ byte 1 b3
+        // 'Online PIN supported', b2 'Signature supported', byte 2 b7 'CVM Required', byte 3 b7 'Consumer Device CVM supported'
+        let online_pin_required = get_bit!(ctq_b1, 7);
+        let signature_required = get_bit!(ctq_b1, 6);
+        let consumer_device_cvm_performed = get_bit!(ctq_b2, 7);
+        let cvm_required = get_bit!(ttq_b2, 6);
+
+        if online_pin_required && get_bit!(ttq_b1, 2) {
+            warn!("Online PIN required by the card (CTQ), online PIN entry is not supported");
+        } else if online_pin_required {
+            debug!("Online PIN required by the card (CTQ), the reader does not support online PIN (TTQ)");
+        }
+
+        if consumer_device_cvm_performed && get_bit!(ttq_b3, 6) {
+            // fDDA signs the CTQ of the Card Authentication Related Data, a CTQ that differs from it is not of the card
+            let fdda_verified = self.state.tsi.offline_data_authentication_was_performed
+                && !self.state.tvr.dda_failed;
+            let signed_ctq = self
+                .get_tag_value("9F69")
+                .filter(|data| data.len() >= 7)
+                .map(|data| data[5..7].to_vec());
+            match signed_ctq {
+                Some(signed_ctq) if fdda_verified && signed_ctq[..] != ctq[..ctq.len().min(2)] => {
+                    warn!(
+                        "Consumer Device CVM: CTQ {:02X?} differs from the CTQ {:02X?} signed in fDDA, declined",
+                        ctq, signed_ctq
+                    );
+                    self.state.tvr.cardholder_verification_was_not_successful = true;
+                    self.process_tag_as_tlv("9F34", b"\x3F\x00\x01".to_vec());
+                    self.state.contactless_outcome = Some(ContactlessOutcome::Declined);
+                    return Ok(());
+                }
+                _ if fdda_verified => {
+                    debug!("Consumer Device CVM performed, the CTQ is verified by fDDA");
+                }
+                _ => {
+                    debug!("Consumer Device CVM performed, the CTQ is not verified offline, the issuer verifies it");
+                }
+            }
+            self.process_tag_as_tlv("9F34", b"\x01\x00\x02".to_vec());
+            self.state.tsi.cardholder_verification_was_performed = true;
+            return Ok(());
+        } else if consumer_device_cvm_performed {
+            debug!("Consumer Device CVM performed by the card (CTQ), the reader does not support it (TTQ)");
+        }
+
+        if signature_required && get_bit!(ttq_b1, 1) {
+            debug!("Signature required by the card (CTQ)");
+            self.process_tag_as_tlv("9F34", b"\x1E\x00\x00".to_vec());
+            self.state.tsi.cardholder_verification_was_performed = true;
+            return Ok(());
+        }
+
+        // The CVM that the card requires or the reader requires above its CVM Required Limit is not done
+        if online_pin_required || cvm_required {
+            warn!(
+                "No CVM of the card (CTQ {:02X?}) is supported by the reader, declined",
+                ctq
+            );
+            self.state.tvr.cardholder_verification_was_not_successful = true;
+            self.process_tag_as_tlv("9F34", b"\x3F\x00\x01".to_vec());
+            self.state.contactless_outcome = Some(ContactlessOutcome::Declined);
+            return Ok(());
+        }
+
+        debug!("No CVM required (CTQ {:02X?})", ctq);
+        self.process_tag_as_tlv("9F34", b"\x3F\x00\x00".to_vec());
         Ok(())
     }
 
@@ -4329,39 +5211,84 @@ impl EmvConnection {
             None => action_one.clone(),
         };
 
-        let terminal_action_code_denial: TerminalVerificationResults = action_zero.clone();
-        let terminal_action_code_online: TerminalVerificationResults = action_zero.clone();
-        let terminal_action_code_default: TerminalVerificationResults = action_zero.clone();
+        let terminal_action_codes = self
+            .kernel_settings()
+            .and_then(|kernel| kernel.terminal_action_codes.clone())
+            .unwrap_or_else(|| self.settings.terminal.terminal_action_codes.clone());
+        let terminal_action_code =
+            |name: &str, value: &str| -> Result<TerminalVerificationResults, EmvError> {
+                if value.is_empty() {
+                    return Ok(action_zero.clone());
+                }
+                match hex::decode(value) {
+                    Ok(tac) if tac.len() == tvr_len => {
+                        let tac: TerminalVerificationResults = tac.into();
+                        debug!("Terminal Action Code - {}: {:?}", name, tac);
+                        Ok(tac)
+                    }
+                    _ => Err(EmvError::Configuration(format!(
+                        "Invalid Terminal Action Code - {} {:?}",
+                        name, value
+                    ))),
+                }
+            };
+        let terminal_action_code_denial =
+            terminal_action_code("Denial", &terminal_action_codes.denial)?;
+        let terminal_action_code_online =
+            terminal_action_code("Online", &terminal_action_codes.online)?;
+        let terminal_action_code_default =
+            terminal_action_code("Default", &terminal_action_codes.default)?;
+
+        // EMV Book 4, A1 Terminal Type: the operational control is the second digit, '1' and '4' are online only, '2' and '5'
+        // offline with online capability and '3' and '6' offline only. Without the Terminal Type the terminal is online capable.
+        let operational_control = self
+            .get_tag_value("9F35")
+            .and_then(|terminal_type| terminal_type.first())
+            .map(|terminal_type| terminal_type & 0x0F);
+        let online_only = matches!(operational_control, Some(1) | Some(4));
+        let offline_only = matches!(operational_control, Some(3) | Some(6));
 
         // The result is a recommendation, the cryptogram type of the first GENERATE AC is chosen by the caller (first_generate_ac)
-        // or the settings (handle_1st_generate_ac)
+        // or by handle_1st_generate_ac with the settings
         let cryptogram_type = if TerminalVerificationResults::action_code_matches(
             &self.state.tvr,
             &tag_9f0e_issuer_action_code_denial,
             &terminal_action_code_denial,
         ) {
-            debug!("Action Code - Denial matches => GENERATE AC AAC needed");
+            debug!("Action Code - Denial matches => AAC recommended");
             CryptogramType::ApplicationAuthenticationCryptogram
+        } else if offline_only {
+            // The Action Codes - Default are used instead of the Action Codes - Online by an offline-only terminal
+            if TerminalVerificationResults::action_code_matches(
+                &self.state.tvr,
+                &tag_9f0d_issuer_action_code_default,
+                &terminal_action_code_default,
+            ) {
+                debug!(
+                    "Action Code - Default matches in an offline-only terminal => AAC recommended"
+                );
+                CryptogramType::ApplicationAuthenticationCryptogram
+            } else {
+                debug!("Action Codes vs. TVR are OK in an offline-only terminal => TC recommended");
+                CryptogramType::TransactionCertificate
+            }
+        } else if online_only {
+            debug!("Online-only terminal => ARQC recommended");
+            CryptogramType::AuthorisationRequestCryptogram
         } else if TerminalVerificationResults::action_code_matches(
             &self.state.tvr,
             &tag_9f0f_issuer_action_code_online,
             &terminal_action_code_online,
         ) {
-            // online action codes for online capable terminals
-            debug!("Action Code - Online matches => GENERATE AC ARQC needed");
+            debug!("Action Code - Online matches => ARQC recommended");
             CryptogramType::AuthorisationRequestCryptogram
-        } else if TerminalVerificationResults::action_code_matches(
-            &self.state.tvr,
-            &tag_9f0d_issuer_action_code_default,
-            &terminal_action_code_default,
-        ) {
-            // TODO: offline-only terminals or if online authorization is not possible this is to be done
-            debug!("Action Code - Default matches => GENERATE AC AAC needed");
-            CryptogramType::ApplicationAuthenticationCryptogram
         } else {
-            debug!("Action Codes vs. TVR are OK => GENERATE AC TC needed");
+            // The Action Codes - Default of an online capable terminal are for a transaction that could not go online
+            debug!("Action Codes vs. TVR are OK => TC recommended");
             CryptogramType::TransactionCertificate
         };
+
+        self.state.terminal_action_analysis = Some(cryptogram_type);
 
         Ok(cryptogram_type)
     }
@@ -4419,6 +5346,7 @@ pub enum FieldSensitivity {
     Public,
     SensitiveAuthenticationData,
     Sensitive,
+    Track1,
     Track2,
     PrimaryAccountNumber,
     PersonallyIdentifiableInformation,
@@ -4648,7 +5576,8 @@ pub fn is_success_response(response_trailer: &Vec<u8>) -> bool {
 fn parse_tlv(raw_data: &[u8]) -> Option<Tlv> {
     let (tlv_data, leftover_buffer) = Tlv::parse(raw_data);
     if leftover_buffer.len() > 0 {
-        trace!("Could not parse as TLV: {:02X?}", leftover_buffer);
+        // The data is shown by its length, the APDU response log shows it censored when sensitive fields are censored
+        trace!("Could not parse as TLV: {} bytes", leftover_buffer.len());
     }
 
     let tlv_data: Option<Tlv> = match tlv_data {
@@ -4669,10 +5598,12 @@ fn find_tlv_tag(buf: &[u8], tag: &str) -> Option<Tlv> {
             Ok(tlv) => tlv,
             Err(err) => {
                 if leftover_buffer.len() > 0 {
+                    // The data is shown by its length, the APDU response log shows it censored when sensitive fields are
+                    // censored
                     trace!(
-                        "Could not parse as TLV! error:{:?}, data: {:02X?}",
+                        "Could not parse as TLV! error:{:?}, data: {} bytes",
                         err,
-                        read_buffer
+                        read_buffer.len()
                     );
                 }
 
@@ -5254,6 +6185,94 @@ mod tests {
     }
 
     #[test]
+    fn test_censored_tracks() {
+        // The separators, the expiry date, the service code and the padding are kept
+        assert_eq!(
+            get_censored_track2("4321432143214321D2612101123456789123F"),
+            "43214321****4321D2612101************F"
+        );
+        assert_eq!(
+            get_censored_track2(";4321432143214321=2612101123456789123?"),
+            ";43214321****4321=2612101************?"
+        );
+        assert_eq!(
+            get_censored_track2("432143214321432D2612101F"),
+            "432143*****1432D2612101F"
+        );
+        assert_eq!(get_censored_track2("1234567890"), "**********");
+
+        assert_eq!(
+            get_censored_track1("%B4321432143214321^Mc'Doe/JOHN^2609101123456789012345678901234?"),
+            "%B43214321****4321^**'***/****^2609101************************?"
+        );
+        // Track 1 Data of the card (tag '56') has no sentinels
+        assert_eq!(
+            get_censored_track1("B4321432143214321^ /^260910112345"),
+            "B43214321****4321^ /^2609101*****"
+        );
+        assert_eq!(
+            get_censored_track1("B4321432143214321"),
+            "*****************"
+        );
+    }
+
+    #[test]
+    fn test_censored_tlv_hex() -> Result<(), EmvError> {
+        let connection = EmvConnection::new(SETTINGS_FILE)?;
+
+        // Record of the test card: Track 2 Equivalent Data, Cardholder Name and Track 1 Discretionary Data
+        let record = hex::decode(
+            "704D57131234560012345608D18112211229424900200F5F201A34353337\
+             46492F56455341454C454354524F4E454C4F4B3331369F1F183132323934\
+             30303030303230303030323439303030303030",
+        )
+        .unwrap();
+        assert_eq!(
+            connection.censored_tlv_hex(&record),
+            "70 4D 57 13 12 34 56 00 ** ** 56 08 D1 81 12 21\n\
+             ** ** ** ** ** ** *F 5F 20 1A ** ** ** ** ** **\n\
+             2F ** ** ** ** ** ** ** ** ** ** ** ** ** ** **\n\
+             ** ** ** ** 9F 1F 18 ** ** ** ** ** ** ** ** **\n\
+             ** ** ** ** ** ** ** ** ** ** ** ** ** ** **"
+        );
+
+        // PAN with padding, a public data object, the data that does not parse as TLV is masked
+        let data = hex::decode("5A0812345678901234565F2403261231").unwrap();
+        assert_eq!(
+            connection.censored_tlv_hex(&data),
+            "5A 08 12 34 56 78 ** ** 34 56 5F 24 03 26 12 31"
+        );
+        let data = hex::decode("5A08123456789012345F").unwrap();
+        assert_eq!(
+            connection.censored_tlv_hex(&data),
+            "5A 08 12 34 56 ** ** *2 34 5F"
+        );
+        // Unknown data object of TLV data, e.g. a record template with an incorrect tag
+        let data = hex::decode("810A5A081234567890123456").unwrap();
+        assert_eq!(
+            connection.censored_tlv_hex(&data),
+            "81 0A 5A 08 12 34 56 78 ** ** 34 56"
+        );
+        let data = hex::decode("5F2403261231705A5A0812").unwrap();
+        assert_eq!(
+            connection.censored_tlv_hex(&data),
+            "5F 24 03 26 12 31 ** ** ** ** **"
+        );
+
+        // PIN data of VERIFY
+        assert_eq!(
+            censored_command_hex(&hex::decode("0020008008241234FFFFFFFFFF").unwrap()),
+            "00 20 00 80 08 ** ** ** ** ** ** ** **"
+        );
+        assert_eq!(
+            censored_command_hex(&hex::decode("00B2010C00").unwrap()),
+            "00 B2 01 0C 00"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_bcd_conversion() -> Result<(), EmvError> {
         let empty1: Vec<u8> = [].to_vec();
         assert_eq!(
@@ -5377,6 +6396,74 @@ mod tests {
             hex::encode_upper(dol.get_tag_list_tag_values(&connection)),
             "34112233443600"
         );
+    }
+
+    #[test]
+    fn test_kernel_id() {
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x00\x04\x10\x10".to_vec());
+
+        // Kernel ID of a contact transaction
+        assert_eq!(connection.kernel_id(), None);
+
+        // Without the Kernel Identifier the kernel of the matching AID, the longest match wins
+        connection.contactless = true;
+        assert_eq!(connection.kernel_id().as_deref(), Some("02"));
+        connection.settings.kernels.insert(
+            "C1A2B3".to_string(),
+            KernelSettings {
+                aids: vec!["A0000000041010".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(connection.kernel_id().as_deref(), Some("C1A2B3"));
+
+        // Kernel Identifier of the PPSE entry: international kernel, short Kernel ID zero and domestic kernel
+        connection.kernel_identifier = Some(b"\x03".to_vec());
+        assert_eq!(connection.kernel_id().as_deref(), Some("03"));
+        connection.kernel_identifier = Some(b"\x00".to_vec());
+        assert_eq!(connection.kernel_id().as_deref(), Some("C1A2B3"));
+        connection.kernel_identifier = Some(b"\xC1\xA2\xB3\xC4".to_vec());
+        assert_eq!(connection.kernel_id().as_deref(), Some("C1A2B3"));
+
+        // No matching kernel
+        connection.kernel_identifier = None;
+        connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x09\x99\x10\x10".to_vec());
+        assert_eq!(connection.kernel_id(), None);
+    }
+
+    #[test]
+    fn test_kernel_tags() -> Result<(), EmvError> {
+        let kernel_tags = |amount: &[u8]| -> Result<(String, String), EmvError> {
+            let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+            connection.contactless = true;
+            connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x00\x04\x10\x10".to_vec());
+            connection.process_settings()?;
+            connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(amount, 6).unwrap());
+            connection.process_kernel_cvm_required_limit()?;
+            Ok((
+                hex::encode_upper(connection.get_tag_value("9F1D").unwrap()),
+                hex::encode_upper(connection.get_tag_value("9F7E").unwrap()),
+            ))
+        };
+
+        // Tags of the Kernel 2 settings, and its CVM required tags above the Reader CVM Required Limit
+        assert_eq!(
+            kernel_tags(b"5000")?,
+            ("2C3A800000000000".to_string(), "01".to_string())
+        );
+        assert_eq!(
+            kernel_tags(b"5001")?,
+            ("2CBA800000000000".to_string(), "03".to_string())
+        );
+
+        // No kernel tags in a contact transaction
+        let mut connection = EmvConnection::new(SETTINGS_FILE).unwrap();
+        connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x00\x04\x10\x10".to_vec());
+        connection.process_settings()?;
+        assert!(connection.get_tag_value("9F1D").is_none());
+
+        Ok(())
     }
 
     #[test]
@@ -5932,6 +7019,559 @@ mod tests {
             connection.first_generate_ac(CryptogramType::TransactionCertificate),
             Err(EmvError::MissingData(_))
         ));
+
+        Ok(())
+    }
+
+    /// Contactless Kernel 3 transaction of a DDA card (AIP '2060') whose GET PROCESSING OPTIONS returns the cryptogram, the Card
+    /// Transaction Qualifiers and the Card Authentication Related Data with the CTQ that fDDA signs
+    fn kernel_3_connection(
+        cid: u8,
+        ctq: &[u8],
+        signed_ctq: &[u8],
+    ) -> Result<EmvConnection, EmvError> {
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.contactless = true;
+        connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x00\x03\x10\x10".to_vec());
+        connection.process_settings()?;
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(b"100", 6).unwrap());
+        connection.process_tag_as_tlv("82", b"\x20\x60".to_vec());
+        connection.process_tag_as_tlv("9F27", vec![cid]);
+        connection.process_tag_as_tlv("9F26", b"\x01\x02\x03\x04\x05\x06\x07\x08".to_vec());
+        connection.process_tag_as_tlv("9F36", b"\x00\x01".to_vec());
+        connection.process_tag_as_tlv("9F6C", ctq.to_vec());
+        let mut card_authentication_related_data = b"\x01\x11\x22\x33\x44".to_vec();
+        card_authentication_related_data.extend_from_slice(signed_ctq);
+        connection.process_tag_as_tlv("9F69", card_authentication_related_data);
+        connection.process_application_data()?;
+        Ok(connection)
+    }
+
+    #[test]
+    fn test_kernel_3_fdda_failure_outcome() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Contactless Book C-3, 5: without the ICC public key fDDA fails, the CTQ of the card decides the outcome over its
+        // cryptogram. CTQ '0080' of the Visa tokens asks neither for online nor for another interface: declined.
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        connection.handle_offline_data_authentication()?;
+        assert!(connection.state.tvr.dda_failed);
+        assert!(
+            connection
+                .state
+                .tsi
+                .offline_data_authentication_was_performed
+        );
+        assert_eq!(
+            connection.state.contactless_outcome,
+            Some(ContactlessOutcome::Declined)
+        );
+        assert_eq!(
+            connection.first_generate_ac(CryptogramType::AuthorisationRequestCryptogram)?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        );
+
+        // 'Go Online if Offline Data Authentication Fails': the TC of the card is sent online
+        let mut connection = kernel_3_connection(0x40, b"\x20\x00", b"\x20\x00")?;
+        connection.handle_offline_data_authentication()?;
+        assert_eq!(
+            connection.state.contactless_outcome,
+            Some(ContactlessOutcome::OnlineRequest)
+        );
+        assert_eq!(
+            connection.first_generate_ac(CryptogramType::TransactionCertificate)?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+
+        // 'Switch Interface if Offline Data Authentication fails' with the contact chip of the reader
+        let mut connection = kernel_3_connection(0x80, b"\x10\x00", b"\x10\x00")?;
+        connection.handle_offline_data_authentication()?;
+        assert_eq!(
+            connection.state.contactless_outcome,
+            Some(ContactlessOutcome::TryAnotherInterface)
+        );
+        assert_eq!(
+            connection.first_generate_ac(CryptogramType::AuthorisationRequestCryptogram)?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        );
+
+        // An ARQC without ODA for Online Authorizations in TTQ: fDDA is not performed and does not fail
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        connection.process_tag_as_tlv("9F66", b"\x32\x20\x40\x00".to_vec());
+        connection.handle_offline_data_authentication()?;
+        assert!(
+            connection
+                .state
+                .tvr
+                .offline_data_authentication_was_not_performed
+        );
+        assert!(!connection.state.tvr.dda_failed);
+        assert!(
+            !connection
+                .state
+                .tsi
+                .offline_data_authentication_was_performed
+        );
+        assert_eq!(connection.state.contactless_outcome, None);
+
+        Ok(())
+    }
+
+    /// Signed Dynamic Application Data of the Signed Data Format for the ICC public key of the exponent 1 (the recovered data is
+    /// the signed data) over the fDDA data: ICC Dynamic Number '0003' and the hash of the Unpredictable Number, the amount, the
+    /// currency and the Card Authentication Related Data (EMV Contactless Book C-3, Annex C)
+    fn sign_fdda(connection: &mut EmvConnection, signed_data_format: u8) {
+        let modulus_length = 128;
+        connection.icc.icc_pk = Some(RsaPublicKey::new(&[0xFF; 128], &[0x01], false));
+
+        let mut signed_data = vec![0x6A, signed_data_format, 0x01, 0x03, 0x02, 0x00, 0x03];
+        signed_data.resize(modulus_length - 21, 0xBB);
+        let mut hash_data = signed_data[1..].to_vec();
+        for tag in ["9F37", "9F02", "5F2A", "9F69"] {
+            hash_data.extend_from_slice(connection.get_tag_value(tag).unwrap());
+        }
+        signed_data.extend_from_slice(&sha1(&hash_data[..])[..]);
+        signed_data.push(0xBC);
+        connection.process_tag_as_tlv("9F4B", signed_data);
+    }
+
+    #[test]
+    fn test_kernel_3_fdda_signed_data_format() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Contactless Book C-3, Annex C: fDDA of the Signed Data Format '95', e.g. the Visa tokens of Apple Pay and Google Pay.
+        // The CTQ that fDDA verifies is the Consumer Device CVM of the transaction.
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        sign_fdda(&mut connection, 0x95);
+        connection.handle_offline_data_authentication()?;
+        assert!(!connection.state.tvr.dda_failed);
+        assert!(
+            connection
+                .state
+                .tsi
+                .offline_data_authentication_was_performed
+        );
+        assert_eq!(connection.state.contactless_outcome, None);
+        assert_eq!(connection.get_tag_value("9F4C"), Some(&vec![0x00, 0x03]));
+
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x01, 0x00, 0x02])
+        );
+        assert_eq!(
+            connection.first_generate_ac(CryptogramType::AuthorisationRequestCryptogram)?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+
+        // The Signed Data Format '05' of DDA is not fDDA
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        sign_fdda(&mut connection, 0x05);
+        connection.handle_offline_data_authentication()?;
+        assert!(connection.state.tvr.dda_failed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_3_card_verification() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Contactless Book C-3, 5: Consumer Device CVM performed (CTQ '0080') and the CTQ verified by fDDA
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        connection
+            .state
+            .tsi
+            .offline_data_authentication_was_performed = true;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x01, 0x00, 0x02])
+        );
+        assert!(connection.state.tsi.cardholder_verification_was_performed);
+        assert_eq!(connection.state.contactless_outcome, None);
+
+        // The CTQ differs from the CTQ signed in fDDA, e.g. a relay that sets 'Consumer Device CVM Performed': declined
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x00")?;
+        connection
+            .state
+            .tsi
+            .offline_data_authentication_was_performed = true;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x01])
+        );
+        assert!(
+            connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+        assert_eq!(
+            connection.state.contactless_outcome,
+            Some(ContactlessOutcome::Declined)
+        );
+
+        // Without fDDA the CTQ is not verified offline, the issuer verifies the Consumer Device CVM
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x00")?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x01, 0x00, 0x02])
+        );
+
+        // A reader without Consumer Device CVM in TTQ, no CVM required
+        let mut connection = kernel_3_connection(0x80, b"\x00\x80", b"\x00\x80")?;
+        connection.process_tag_as_tlv("9F66", b"\x33\x20\x00\x00".to_vec());
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x00])
+        );
+        assert_eq!(connection.state.contactless_outcome, None);
+
+        // Signature required (CTQ '4000') with signature in TTQ
+        let mut connection = kernel_3_connection(0x80, b"\x40\x00", b"\x40\x00")?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x1E, 0x00, 0x00])
+        );
+
+        // Online PIN required (CTQ '8000') is not supported: declined
+        let mut connection = kernel_3_connection(0x80, b"\x80\x00", b"\x80\x00")?;
+        connection.handle_card_verification_methods()?;
+        assert!(
+            connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+        assert_eq!(
+            connection.state.contactless_outcome,
+            Some(ContactlessOutcome::Declined)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_offline_data_authentication_not_performed() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Book 3, 10.3: a card without SDA, DDA and CDA in the AIP, 'Offline data authentication was not performed' in TVR and
+        // the TSI is not set
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.process_tag_as_tlv("82", b"\x00\x00".to_vec());
+        connection.process_application_data()?;
+        connection.handle_offline_data_authentication()?;
+        assert!(
+            connection
+                .state
+                .tvr
+                .offline_data_authentication_was_not_performed
+        );
+        assert!(
+            !connection
+                .state
+                .tsi
+                .offline_data_authentication_was_performed
+        );
+
+        Ok(())
+    }
+
+    /// Contactless Kernel 2 transaction of the amount with the AIP and the CVM List of the card
+    fn kernel_2_connection(
+        amount: &[u8],
+        aip: &[u8],
+        cvm_list: &str,
+    ) -> Result<EmvConnection, EmvError> {
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.contactless = true;
+        connection.process_tag_as_tlv("84", b"\xA0\x00\x00\x00\x04\x10\x10".to_vec());
+        connection.process_settings()?;
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(amount, 6).unwrap());
+        connection.process_tag_as_tlv("82", aip.to_vec());
+        connection.process_tag_as_tlv("8E", hex::decode(cvm_list).unwrap());
+        connection.process_application_data()?;
+        Ok(connection)
+    }
+
+    #[test]
+    fn test_kernel_2_on_device_cardholder_verification() -> Result<(), EmvError> {
+        init_logging();
+
+        // EMV Contactless Book C-2: the CVM List of a mobile device with on device cardholder verification (AIP '1B80') is not
+        // processed, below the Reader CVM Required Limit no CVM and above it on device cardholder verification
+        let cvm_list = "000000000000000042011E031F03";
+        let mut connection = kernel_2_connection(b"100", b"\x1B\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x02])
+        );
+
+        let mut connection = kernel_2_connection(b"5001", b"\x1B\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x01, 0x00, 0x02])
+        );
+        assert!(
+            !connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+
+        // Without the kernel support the CVM List is processed
+        let mut connection = kernel_2_connection(b"100", b"\x1B\x80", cvm_list)?;
+        connection
+            .settings
+            .kernels
+            .get_mut("02")
+            .unwrap()
+            .on_device_cardholder_verification = false;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x1F, 0x03, 0x02])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kernel_2_cvm_capability() -> Result<(), EmvError> {
+        init_logging();
+
+        // Online PIN and No CVM if the terminal supports them: No CVM up to the Reader CVM Required Limit
+        let cvm_list = "000000000000000042031F03";
+        let mut connection = kernel_2_connection(b"5000", b"\x19\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x1F, 0x03, 0x02])
+        );
+
+        // Above the limit the terminal supports neither, cardholder verification fails and the Issuer Action Code - Denial of the
+        // card declines the transaction
+        let mut connection = kernel_2_connection(b"5001", b"\x19\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x3F, 0x00, 0x01])
+        );
+        assert!(
+            connection
+                .state
+                .tvr
+                .cardholder_verification_was_not_successful
+        );
+        connection.process_tag_as_tlv("9F0E", b"\x00\x00\x80\x00\x00".to_vec());
+        assert_eq!(
+            connection.handle_terminal_action_analysis()?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        );
+
+        // Signature is supported above the limit only
+        let cvm_list = "00000000000000001E031F03";
+        let mut connection = kernel_2_connection(b"100", b"\x19\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x1F, 0x03, 0x02])
+        );
+        let mut connection = kernel_2_connection(b"5001", b"\x19\x80", cvm_list)?;
+        connection.handle_card_verification_methods()?;
+        assert_eq!(
+            connection.get_tag_value("9F34"),
+            Some(&vec![0x1E, 0x03, 0x00])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_processing_restrictions() -> Result<(), EmvError> {
+        init_logging();
+
+        // Data objects (tag, hex value) of the card and the terminal on the transaction date 2026-10-30 at a Finnish terminal
+        let restrictions =
+            |tags: &[(&str, &str)]| -> Result<TerminalVerificationResults, EmvError> {
+                let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+                connection.process_settings()?;
+                connection.process_tag_as_tlv("9A", b"\x26\x10\x30".to_vec());
+                for (tag, value) in tags {
+                    connection.process_tag_as_tlv(tag, hex::decode(value).unwrap());
+                }
+                connection.process_tag_as_tlv("82", b"\x19\x80".to_vec());
+                connection.process_application_data()?;
+                connection.handle_processing_restrictions()?;
+                Ok(connection.state.tvr)
+            };
+
+        // The effective date 2049-12-31 of a mobile device token is not yet effective, the expiration date is valid on its day
+        let tvr = restrictions(&[("5F25", "491231"), ("5F24", "291130")])?;
+        assert!(tvr.application_not_yet_effective);
+        assert!(!tvr.expired_application);
+        let tvr = restrictions(&[("5F25", "261030"), ("5F24", "261030")])?;
+        assert!(!tvr.application_not_yet_effective);
+        assert!(!tvr.expired_application);
+        assert!(restrictions(&[("5F24", "261029")])?.expired_application);
+        assert!(matches!(
+            restrictions(&[("5F24", "2A1029")]),
+            Err(EmvError::InvalidCardData(_))
+        ));
+
+        // Application Version Numbers of the ICC and the terminal
+        assert!(
+            !restrictions(&[("9F08", "0002"), ("9F09", "0002")])?
+                .icc_and_terminal_have_different_application_versions
+        );
+        assert!(
+            restrictions(&[("9F08", "0002"), ("9F09", "008C")])?
+                .icc_and_terminal_have_different_application_versions
+        );
+
+        // Application Usage Control '3DC0': goods, services and cashback, no cash and not at ATMs
+        let not_allowed = |tags: &[(&str, &str)]| -> Result<bool, EmvError> {
+            let mut card = vec![("9F07", "3DC0"), ("5F28", "0246")];
+            card.extend_from_slice(tags);
+            Ok(restrictions(&card)?.requested_service_not_allowed_for_card_product)
+        };
+        assert!(!not_allowed(&[])?);
+        assert!(!not_allowed(&[("9C", "09"), ("9F03", "000000000500")])?);
+        assert!(not_allowed(&[("9C", "01")])?);
+        assert!(not_allowed(&[("9F35", "14")])?);
+        // Domestic goods and services only, '29', at a Finnish terminal for a US card
+        assert!(not_allowed(&[("9F07", "2900"), ("5F28", "0840")])?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_action_analysis_of_terminal_type() -> Result<(), EmvError> {
+        init_logging();
+
+        // TVR 'Expired application' with the Issuer Action Codes and the Terminal Action Code - Default (hex)
+        let analysis = |terminal_type: u8,
+                        iac: &[u8],
+                        tac_default: &str|
+         -> Result<CryptogramType, EmvError> {
+            let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+            connection.settings.terminal.terminal_action_codes.default = tac_default.to_string();
+            connection.process_tag_as_tlv("9F35", vec![terminal_type]);
+            connection.process_tag_as_tlv("9F0D", iac.to_vec());
+            connection.process_tag_as_tlv("9F0E", b"\x00\x00\x00\x00\x00".to_vec());
+            connection.process_tag_as_tlv("9F0F", iac.to_vec());
+            connection.state.tvr.expired_application = true;
+            connection.handle_terminal_action_analysis()
+        };
+
+        // Issuer Action Codes - Default and - Online: online capable terminals go online, an offline-only one declines
+        let iac = b"\x00\x40\x00\x00\x00";
+        assert_eq!(
+            analysis(0x22, iac, "")?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+        assert_eq!(
+            analysis(0x25, iac, "")?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+        assert_eq!(
+            analysis(0x23, iac, "")?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        );
+
+        // Terminal Action Code - Default only: used by an offline-only terminal, an online capable terminal approves offline
+        // and an online-only terminal goes online
+        let no_iac = b"\x00\x00\x00\x00\x00";
+        assert_eq!(
+            analysis(0x23, no_iac, "0040000000")?,
+            CryptogramType::ApplicationAuthenticationCryptogram
+        );
+        assert_eq!(
+            analysis(0x22, no_iac, "0040000000")?,
+            CryptogramType::TransactionCertificate
+        );
+        assert_eq!(
+            analysis(0x21, no_iac, "0040000000")?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+
+        assert!(matches!(
+            analysis(0x22, no_iac, "00"),
+            Err(EmvError::Configuration(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_first_generate_ac_of_terminal_action_analysis() -> Result<(), EmvError> {
+        init_logging();
+
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.interface = Some(test_card());
+        setup_connection(&mut connection)?;
+        let application = connection.select_payment_application()?;
+        start_transaction(&mut connection, &application)?;
+        connection.process_tag_as_tlv("9F02", ascii_to_bcd_n(b"1", 6).unwrap());
+        connection.handle_terminal_action_analysis()?;
+
+        // A TC recommendation is capped to the ARQC of the settings
+        connection.state.terminal_action_analysis = Some(CryptogramType::TransactionCertificate);
+        assert_eq!(
+            connection.handle_1st_generate_ac()?,
+            CryptogramType::AuthorisationRequestCryptogram
+        );
+
+        // An AAC recommendation is requested, the test card has no response to it
+        connection.state.terminal_action_analysis =
+            Some(CryptogramType::ApplicationAuthenticationCryptogram);
+        let exchanges = connection.state.exchanges.len();
+        assert!(matches!(
+            connection.handle_1st_generate_ac(),
+            Err(EmvError::CardStatus { .. })
+        ));
+        assert_eq!(
+            connection.state.exchanges[exchanges].command[0..4],
+            [0x80, 0xAE, 0x00, 0x00]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_contactless_without_list_of_aids() -> Result<(), EmvError> {
+        init_logging();
+
+        // The test card has no PPSE: a contactless transaction ends without the terminal list of AIDs (EMV Contactless Book B),
+        // unless the protocol deviation allows it
+        let card = || {
+            modified_card(vec![(
+                "00 A4 04 00 05 AF FF FF FF FF 00",
+                "6F 39 84 07 AF FF FF FF FF 12 34 A5 2E 50 0D 56 45 53 41 20 45 4C 45 43 54 52 4F 4E 5F 2D 02 65 6E 87 01 01 9F 12 10 56 45 53 41 20 20 20 20 20 20 20 20 20 20 20 20 9F 11 01 01 90 00",
+            )])
+        };
+        let mut connection = EmvConnection::new(SETTINGS_FILE)?;
+        connection.interface = Some(Box::new(card()));
+        connection.contactless = true;
+        connection.settings.terminal.application_identifiers = vec!["AFFFFFFFFF".to_string()];
+        assert!(connection.select_payment_application().is_err());
+        assert_eq!(connection.state.exchanges.len(), 1);
+
+        connection.interface = Some(Box::new(card()));
+        connection
+            .settings
+            .terminal
+            .protocol_deviations
+            .contactless_list_of_aids = true;
+        let application = connection.select_payment_application()?;
+        assert_eq!(application.aid, b"\xAF\xFF\xFF\xFF\xFF\x12\x34".to_vec());
 
         Ok(())
     }

@@ -1,10 +1,13 @@
 use clap::{Parser, ValueEnum};
 use hex;
-use log::{debug, error, info, warn};
+use log::{debug, info, log, warn, Level, LevelFilter};
 use log4rs;
+use log4rs::append::file::FileAppender;
+use log4rs::config::{Appender, Config, Root};
+use log4rs::encode::pattern::PatternEncoder;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_ATR_SIZE, MAX_BUFFER_SIZE};
 use regex::Regex;
-use std::io::{self};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +18,27 @@ use emvpt::*;
 
 static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static PIN_OPTION: OnceLock<Option<String>> = OnceLock::new();
+static LOG_TO_FILE: AtomicBool = AtomicBool::new(false);
+
+/// Log the transaction outcome, echoing it to the terminal when logs are written to a file
+fn report_outcome(level: Level, message: &str) {
+    log!(level, "{}", message);
+
+    if LOG_TO_FILE.load(Ordering::Relaxed) {
+        if level == Level::Error {
+            eprintln!("{}", message);
+        } else {
+            println!("{}", message);
+        }
+    }
+}
+
+fn print_prompt() -> Result<(), EmvError> {
+    print!("> ");
+    io::stdout()
+        .flush()
+        .map_err(|err| EmvError::Callback(err.to_string()))
+}
 
 pub enum ReaderError {
     ReaderConnectionFailed(String),
@@ -205,7 +229,7 @@ fn pse_application_select(applications: &[EmvApplication]) -> Result<EmvApplicat
             );
         }
 
-        print!("> ");
+        print_prompt()?;
 
         let mut stdin_buffer = String::new();
         io::stdin()
@@ -232,7 +256,7 @@ fn pin_entry() -> Result<String, EmvError> {
 
     if user_interactive {
         println!("Enter PIN:");
-        print!("> ");
+        print_prompt()?;
 
         return rpassword::read_password()
             .map(|pin| pin.trim().to_string())
@@ -247,7 +271,7 @@ fn amount_entry() -> Result<u64, EmvError> {
 
     if user_interactive {
         println!("Enter amount:");
-        print!("> ");
+        print_prompt()?;
         let mut stdin_buffer = String::new();
         io::stdin()
             .read_line(&mut stdin_buffer)
@@ -306,12 +330,43 @@ struct Args {
     /// Card interface, auto deduces it from the card reader name
     #[arg(long, value_enum, default_value_t = CardInterface::Auto)]
     interface: CardInterface,
+
+    /// Write logs to a file instead of stdout
+    #[arg(long = "log-file", value_name = "log file")]
+    log_file: Option<PathBuf>,
+}
+
+fn init_logging(log_file: Option<&PathBuf>) -> Result<(), String> {
+    let Some(log_file) = log_file else {
+        return log4rs::init_file("config/log4rs.yaml", Default::default())
+            .map_err(|err| err.to_string());
+    };
+
+    let file_appender = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(
+            "{d(%Y-%m-%d %H:%M:%S%.6f %Z)} {l} {t} - {m}{n}",
+        )))
+        .build(log_file)
+        .map_err(|err| format!("{}: {}", log_file.display(), err))?;
+
+    let config = Config::builder()
+        .appender(Appender::builder().build("file", Box::new(file_appender)))
+        .build(Root::builder().appender("file").build(LevelFilter::Trace))
+        .map_err(|err| err.to_string())?;
+
+    log4rs::init_config(config)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 fn run() -> Result<Option<String>, String> {
-    log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
-
     let args = Args::parse();
+
+    if let Err(err) = init_logging(args.log_file.as_ref()) {
+        eprintln!("Failed to initialize logging: {}", err);
+        std::process::exit(1);
+    }
+    LOG_TO_FILE.store(args.log_file.is_some(), Ordering::Relaxed);
 
     INTERACTIVE.store(args.interactive, Ordering::Relaxed);
     let _ = PIN_OPTION.set(args.pin);
@@ -333,8 +388,12 @@ fn run() -> Result<Option<String>, String> {
         let tlv_hex_data = print_tlv
             .unwrap()
             .replace(|c: char| !(c.is_ascii_alphanumeric()), "");
-        info!("input TLV: {}", tlv_hex_data);
         let tlv_data = hex::decode(&tlv_hex_data).map_err(|err| err.to_string())?;
+        if censor_sensitive_fields {
+            info!("input TLV:\n{}", connection.censored_tlv_hex(&tlv_data));
+        } else {
+            info!("input TLV: {}", tlv_hex_data);
+        }
         connection.process_tlv(&tlv_data[..], 0);
         return Ok(None);
     }
@@ -375,12 +434,46 @@ fn run() -> Result<Option<String>, String> {
     connection.contactless = smart_card_connection.contactless;
     connection.interface = Some(Box::new(smart_card_connection));
 
-    let purchase_successful = purchase(&mut connection, purchase_amount, stop_after_read)
+    let outcome = purchase(&mut connection, purchase_amount, stop_after_read)
         .map_err(|err| format!("Transaction terminated: {}", err))?;
 
-    match purchase_successful {
-        Some(true) => info!("Purchase successful!"),
-        Some(false) => warn!("Purchase unsuccessful!"),
+    match outcome {
+        // The ARQC of a contactless card is the Online Request outcome, without an authorisation host the online authorisation
+        // decision is simulated
+        Some(PurchaseOutcome {
+            online_authorisation: Some(decision),
+            ..
+        }) => match decision {
+            CryptogramType::TransactionCertificate => report_outcome(
+                Level::Info,
+                "Purchase approved by the simulated online authorisation! Application cryptogram: ARQC (Authorisation Request Cryptogram)",
+            ),
+            _ => report_outcome(
+                Level::Warn,
+                "Purchase declined by the simulated online authorisation! Application cryptogram: ARQC (Authorisation Request Cryptogram)",
+            ),
+        },
+        Some(PurchaseOutcome {
+            card_cryptogram_type: CryptogramType::TransactionCertificate,
+            ..
+        }) => report_outcome(
+            Level::Info,
+            "Purchase successful! Application cryptogram: TC (Transaction Certificate)",
+        ),
+        Some(PurchaseOutcome {
+            card_cryptogram_type: CryptogramType::ApplicationAuthenticationCryptogram,
+            ..
+        }) => report_outcome(
+            Level::Warn,
+            "Purchase unsuccessful! Application cryptogram: AAC (Application Authentication Cryptogram)",
+        ),
+        Some(PurchaseOutcome {
+            card_cryptogram_type: CryptogramType::AuthorisationRequestCryptogram,
+            ..
+        }) => report_outcome(
+            Level::Warn,
+            "Purchase unsuccessful! Application cryptogram: ARQC (Authorisation Request Cryptogram)",
+        ),
         None => (),
     }
 
@@ -391,12 +484,19 @@ fn run() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Outcome of the purchase: the final cryptogram type of the card and the decision of the simulated online authorisation of a
+/// contactless ARQC, which has no second GENERATE AC
+struct PurchaseOutcome {
+    card_cryptogram_type: CryptogramType,
+    online_authorisation: Option<CryptogramType>,
+}
+
 /// Purchase sequence made of the transaction steps of the library, None when stopped after reading the card data
 fn purchase(
     connection: &mut EmvConnection,
     purchase_amount: u64,
     stop_after_read: bool,
-) -> Result<Option<bool>, EmvError> {
+) -> Result<Option<PurchaseOutcome>, EmvError> {
     let application = connection.select_payment_application()?;
 
     connection.process_settings()?;
@@ -414,32 +514,47 @@ fn purchase(
 
     connection.handle_public_keys(&application)?;
 
+    // EMV Book 3, 10.3: SDA, DDA or fDDA (EMV Contactless Book C-3, Annex C) here, CDA in GENERATE AC. A failure is set in TVR.
+    connection.handle_offline_data_authentication()?;
+
+    connection.handle_processing_restrictions()?;
+
     connection.handle_card_verification_methods()?;
 
     connection.handle_terminal_risk_management()?;
 
     connection.handle_terminal_action_analysis()?;
 
-    let purchase_successful = match connection.handle_1st_generate_ac()? {
-        CryptogramType::AuthorisationRequestCryptogram => {
-            connection.handle_2nd_generate_ac()? == CryptogramType::TransactionCertificate
+    let card_cryptogram_type = connection.handle_1st_generate_ac()?;
+    let outcome = match card_cryptogram_type {
+        CryptogramType::AuthorisationRequestCryptogram if connection.contactless => {
+            PurchaseOutcome {
+                card_cryptogram_type: card_cryptogram_type,
+                online_authorisation: Some(connection.handle_2nd_generate_ac()?),
+            }
         }
-        CryptogramType::TransactionCertificate => true,
-        CryptogramType::ApplicationAuthenticationCryptogram => false,
+        CryptogramType::AuthorisationRequestCryptogram => PurchaseOutcome {
+            card_cryptogram_type: connection.handle_2nd_generate_ac()?,
+            online_authorisation: None,
+        },
+        _ => PurchaseOutcome {
+            card_cryptogram_type: card_cryptogram_type,
+            online_authorisation: None,
+        },
     };
 
-    Ok(Some(purchase_successful))
+    Ok(Some(outcome))
 }
 
 fn main() {
     std::process::exit(match run() {
         Ok(None) => 0,
         Ok(msg) => {
-            warn!("{:?}", msg);
+            report_outcome(Level::Warn, &format!("{:?}", msg));
             0
         }
         Err(err) => {
-            error!("{:?}", err);
+            report_outcome(Level::Error, &err);
             1
         }
     });

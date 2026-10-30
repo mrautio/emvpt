@@ -15,6 +15,15 @@ terminal:
     enciphered_pin: true
     terminal_risk_management: true
     issuer_authentication: false
+  # Signature and No CVM of a contact transaction, a contactless kernel has its own CVM capability
+  cvm_capability:
+    signature: true
+    no_cvm: true
+  # Terminal Action Codes (EMV Book 3, 10.7) as hex TVR values, empty is zeros. A contactless kernel may have its own.
+  terminal_action_codes:
+    denial: ''
+    online: ''
+    default: ''
   tvr:
     offline_data_authentication_was_not_performed: false
     sda_failed: false
@@ -61,7 +70,7 @@ terminal:
     cvm_required: false
     contact_chip_offline_pin_supported: true
     issuer_update_processing_supported: false
-    consumer_device_cvm_supported: false
+    consumer_device_cvm_supported: true
   c4_enhanced_contactless_reader_capabilities:
     contact_mode_supported: true
     contactless_mag_stripe_mode_supported: true
@@ -73,7 +82,7 @@ terminal:
     online_pin_supported: false
     signature: true
     plaintext_offline_pin: true
-    reader_is_offline_only: true
+    reader_is_offline_only: false
     cvm_required: false
     terminal_exempt_from_no_cvm_checks: false
     delayed_authorisation_terminal: false
@@ -100,8 +109,62 @@ terminal:
     external_authenticate_without_aip_support: false
     # Offline PIN with VERIFY in a Kernel 2 transaction (EMV Contactless Book C-2 has no VERIFY command)
     kernel_2_offline_pin: false
+    # Select the terminal list of AIDs when the PPSE selection of a contactless transaction fails (EMV Contactless Book B has
+    # PPSE selection only)
+    contactless_list_of_aids: false
 default_tags:
   '9F1A': '0246'
   '5F2A': 0978
-  '9C': '21'
-  '9F35': '23'
+  '9C': '00' # Transaction Type: purchase
+  '9F35': '22' # Terminal Type: merchant, attended, offline with online capability
+  '9F03': '000000000000' # Amount, Other: no cashback
+  '9F15': '5999' # Merchant Category Code: miscellaneous retail
+  '9F4E': '454D5650542053494D554C41544F52204649' # Merchant Name and Location: 'EMVPT SIMULATOR FI'
+# Contactless kernel settings by the Kernel ID (hex) of the selected application, EMV Contactless Book B, 3.3.2.5: the Kernel
+# Identifier ('9F2A') of the PPSE entry, one byte for an international kernel and the first three bytes for a domestic kernel.
+# Without the Kernel Identifier the kernel is the one whose AIDs match the selected application (the longest match wins). Tags
+# are set over default_tags, cvm_required_tags over tags when the contactless amount exceeds reader_cvm_required_limit (minor
+# unit). A domestic kernel, e.g. girocard or Bancomat, is added under its Kernel ID with its AIDs and tags.
+kernels:
+  '02':
+    name: 'Mastercard (EMV Contactless Book C-2)'
+    aids: ['A000000004']
+    reader_cvm_required_limit: 5000
+    # Kernel Configuration: on device cardholder verification supported
+    on_device_cardholder_verification: true
+    # CVM Capability – CVM Required: signature, no online PIN without a PIN pad
+    cvm_capability_cvm_required:
+      signature: true
+      no_cvm: false
+    # CVM Capability – No CVM Required
+    cvm_capability_no_cvm_required:
+      signature: false
+      no_cvm: true
+    tags:
+      # Application Version Number (Reader)
+      '9F09': '0002'
+      # Terminal Risk Management Data: contactless signature, no CVM and CDCVM; contact signature, offline enciphered and
+      # plaintext PIN and no CVM; mag-stripe mode not supported
+      '9F1D': '2C3A800000000000'
+      # Mobile Support Indicator: mobile support
+      '9F7E': '01'
+    cvm_required_tags:
+      # Terminal Risk Management Data: CVM Limit exceeded
+      '9F1D': '2CBA800000000000'
+      # Mobile Support Indicator: mobile support, OD-CVM required
+      '9F7E': '03'
+  '03':
+    name: 'Visa (EMV Contactless Book C-3)'
+    aids: ['A000000003']
+  '04':
+    name: 'American Express (EMV Contactless Book C-4)'
+    aids: ['A000000025']
+  '05':
+    name: 'JCB (EMV Contactless Book C-5)'
+    aids: ['A000000065']
+  '06':
+    name: 'Discover (EMV Contactless Book C-6)'
+    aids: ['A000000152']
+  '07':
+    name: 'UnionPay (EMV Contactless Book C-7)'
+    aids: ['A000000333']

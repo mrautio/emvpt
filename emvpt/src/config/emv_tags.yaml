@@ -12,6 +12,26 @@
   format: 'Track2'
   max: 19
   source: 'Icc'
+'56':
+  tag: '56'
+  name: 'Track 1 Data'
+  sensitivity: 'Track1'
+  format: 'AlphanumericSpecial'
+  max: 76
+  source: 'Icc'
+'9F6B':
+  tag: '9F6B'
+  name: 'Track 2 Data'
+  sensitivity: 'Track2'
+  format: 'Track2'
+  max: 19
+  source: 'Icc'
+'9F20':
+  tag: '9F20'
+  name: 'Track 2 Discretionary Data'
+  sensitivity: 'SensitiveAuthenticationData'
+  format: 'CompressedNumeric'
+  source: 'Icc'
 '61':
   tag: '61'
   name: 'Application Template'
@@ -115,6 +135,21 @@
   source: 'Icc'
   min: 2
   max: 26
+'9F0B':
+  tag: '9F0B'
+  name: 'Cardholder Name Extended'
+  sensitivity: 'PersonallyIdentifiableInformation'
+  format: 'AlphanumericSpecial'
+  source: 'Icc'
+  min: 27
+  max: 45
+'5F53':
+  tag: '5F53'
+  name: 'International Bank Account Number (IBAN)'
+  sensitivity: 'PrimaryAccountNumber'
+  format: 'Alphanumeric'
+  source: 'Icc'
+  max: 34
 '9F1F':
   tag: '9F1F'
   name: 'Track 1 Discretionary Data'
@@ -240,7 +275,46 @@
   format: 'Binary'
   source: 'Terminal'
   min: 1
-  max: 5
+  max: 8
+'9F7E':
+  tag: '9F7E'
+  name: 'Mobile Support Indicator'
+  format: 'Binary'
+  source: 'Terminal'
+  min: 1
+  max: 1
+'9F15':
+  tag: '9F15'
+  name: 'Merchant Category Code'
+  format: 'Numeric'
+  source: 'Terminal'
+  min: 2
+  max: 2
+'9F16':
+  tag: '9F16'
+  name: 'Merchant Identifier'
+  format: 'AlphanumericSpecial'
+  source: 'Terminal'
+  min: 15
+  max: 15
+'9F1C':
+  tag: '9F1C'
+  name: 'Terminal Identification'
+  format: 'Alphanumeric'
+  source: 'Terminal'
+  min: 8
+  max: 8
+'9F4E':
+  tag: '9F4E'
+  name: 'Merchant Name and Location'
+  format: 'AlphanumericSpecial'
+  source: 'Terminal'
+'9F6E':
+  tag: '9F6E'
+  # Kernel specific: Third Party Data of a Kernel 2 card, Form Factor Indicator of a Kernel 3 card and Enhanced Contactless
+  # Reader Capabilities of a Kernel 4 terminal
+  name: 'Third Party Data / Form Factor Indicator / Enhanced Contactless Reader Capabilities'
+  format: 'Binary'
 '5F28':
   tag: '5F28'
   name: 'Issuer Country Code'
